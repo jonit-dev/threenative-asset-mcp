@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Build and test output
+dist/
+coverage/
+*.tsbuildinfo
+outputs/*.tgz
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Local browser and tool state
+work/
+.playwright-mcp/
+.agents/
+.codex/
+
+# Logs and editor/OS files
+*.log
+.DS_Store
+.idea/
+.vscode/
