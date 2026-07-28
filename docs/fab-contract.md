@@ -113,6 +113,44 @@ must come from explicit upstream data.
 - No bypass behavior was attempted and no user Chrome cookies, local storage,
   session storage, profile files, or authorization values were inspected.
 
+2026-07-28 follow-up (same day, later): the challenge decision tracks the
+client TLS/HTTP fingerprint. Node `fetch` is always challenged; headless
+Chromium never clears the interstitial; a headed Chromium-family browser
+loads pages but its `/i/*` XHRs are challenged. The same anonymous requests
+through a curl-impersonate Chrome fingerprint (`curl_chrome146`) returned
+`200` JSON for search, detail, asset-formats, and download-info. Challenges
+still appear intermittently under request bursts, so the impersonated
+transport paces requests, keeps a dedicated cookie jar, and retries
+challenges with backoff before any browser fallback. The browser click flow
+remains the documented last resort; the server still never solves an
+interactive challenge.
+
+## Confirmed free-file download contract (2026-07-28)
+
+Anonymous direct download of fully free listings (`isFree: true` on the
+detail payload, for example a CC-BY license at price 0):
+
+1. `GET /i/listings/{uid}?currency=USD` — detail; `isFree` gates the flow and
+   `assetFormats[].assetFormatType.code` lists available format codes.
+2. `GET /i/listings/{uid}/asset-formats/{code}` — per-format file list;
+   `files[]` entries carry `uid`, `name`, `size`, `status` (`ready`),
+   `fileType` (`source`/`generated`). GLB/OBJ conversions live under the
+   `converted-files` code and are selected by file extension.
+3. `GET /i/listings/{uid}/asset-formats/{code}/files/{fileUid}/download-info` —
+   returns `downloadInfo[0].downloadUrl`, a signed URL with a `cf_token` query
+   and an `expires` timestamp (observed lifetime about one hour). The
+   distribution host rotates across Epic-controlled domains (observed:
+   `content-download-emp.distro.on.epicgames.com`,
+   `emp-fastly-stitched.epicgamescdn.com`); validation must match the
+   Epic/Fab domain families, not a single host.
+4. `GET {downloadUrl}` — the signed URL is self-authorizing and was observed
+   to succeed from any TLS client without cookies.
+
+Listings with any paid tier return `403` JSON (`"Must be logged in to
+download a paid listing"`) at step 3; the MCP maps this to
+`FAB_ACQUISITION_REQUIRED` and does not start an acquisition, login, or
+library flow.
+
 Run the repeatable probe:
 
 ```bash

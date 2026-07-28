@@ -130,13 +130,38 @@ wishlists, signs in, or overwrites an existing download.
 | `FAB_BROWSER_PROFILE_DIR`       | OS state directory under `fab-mcp/browser-profile` | MCP-owned browser state.                                 |
 | `FAB_DOWNLOAD_DIR`              | `~/Downloads/fab-mcp`                              | Dedicated directory for free-file downloads.             |
 | `FAB_MAX_DOWNLOAD_BYTES`        | `2147483648`                                       | Maximum accepted download size in bytes.                 |
+| `FAB_DOWNLOAD_TIMEOUT_MS`       | `600000`                                           | Total timeout for one file download.                     |
+| `FAB_CURL_IMPERSONATE`          | auto-detected on `PATH`                            | curl-impersonate wrapper override; `0`/`off` disables.   |
+| `FAB_MIN_REQUEST_INTERVAL_MS`   | `1000`                                             | Minimum spacing between direct upstream requests.        |
 | `FAB_LOG_LEVEL`                 | `warn`                                             | `debug`, `info`, `warn`, or `error`.                     |
 | `FAB_LOG_QUERIES`               | `false`                                            | Set to `1` only if query text may be written to logs.    |
 
-Direct requests are limited to one start every 750 ms. Only HTTP 429, 502, 503,
-and 504 are retried, at most twice, with backoff and `Retry-After` support.
-Challenges, access denial, invalid input, missing listings, and schema drift are
-never retried.
+Direct requests are spaced at least `FAB_MIN_REQUEST_INTERVAL_MS` apart. Only
+HTTP 429, 502, 503, and 504 are retried, at most twice, with backoff and
+`Retry-After` support. Challenges, access denial, invalid input, missing
+listings, and schema drift are never retried by the transport; a
+curl-impersonate challenge response is additionally retried inside the
+impersonation wrapper with longer, jittered waits before the browser fallback
+is engaged.
+
+## Browser-fingerprint TLS (curl-impersonate)
+
+Fab's `/i/*` JSON routes sit behind Cloudflare bot management that challenges
+Node's default TLS fingerprint — including plain `fetch` from this MCP and
+headless Chromium — while real browser fingerprints pass. When a
+[curl-impersonate](https://github.com/lwthiker/curl-impersonate) wrapper (for
+example `curl_chrome146`) is available on the host `PATH`, the server performs
+all anonymous JSON reads through it and no browser is needed for search,
+detail, or download resolution. Set `FAB_CURL_IMPERSONATE=0` to force the old
+behavior (plain Node fetch plus the Playwright fallback), or point it at a
+specific wrapper binary.
+
+Downloads of free files resolve entirely through the anonymous JSON contract
+when possible: listing detail → `asset-formats/{format}` file listing →
+`download-info` signed URL → guarded file write. The signed distribution URL
+is validated against an exact Epic distribution-host allowlist before use.
+Only when the direct path is challenged does the server fall back to the
+guarded browser click flow below.
 
 Process-local cache TTLs are five minutes for search, fifteen minutes for
 listing details, six hours for taxonomy data, and ten minutes for promotions.
@@ -182,9 +207,11 @@ or returned to the model.
 ## Troubleshooting
 
 `FAB_CHALLENGE` or `FAB_BROWSER_ATTENTION_REQUIRED`
-: Fab asked for browser verification. Use the headed dedicated-profile step
-above. If verification continues to fail, stop; do not copy a signed-in
-browser session.
+: Fab asked for browser verification. First check whether a curl-impersonate
+wrapper is installed (`FAB_LOG_LEVEL=info` logs `fab_impersonate_enabled`
+when active). Otherwise use the headed dedicated-profile step above. If
+verification continues to fail, stop; do not copy a signed-in browser
+session.
 
 `FAB_RATE_LIMITED`
 : Wait for `retryAfterSeconds` when present. The MCP already applied its bounded

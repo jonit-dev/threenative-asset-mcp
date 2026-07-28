@@ -1,8 +1,18 @@
 import { FabClientError, nullFabLogger, type FabLogger } from "./errors.js";
 
 const FAB_ORIGIN = "https://www.fab.com";
-const LISTING_DETAIL_PATH =
-  /^\/i\/listings\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const LISTING_ID =
+  "[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
+const LISTING_DETAIL_PATH = new RegExp(`^/i/listings/${LISTING_ID}$`, "i");
+const ASSET_FORMAT_CODE = "[a-z0-9][a-z0-9-]{0,39}";
+const ASSET_FORMATS_PATH = new RegExp(
+  `^/i/listings/${LISTING_ID}/asset-formats/${ASSET_FORMAT_CODE}$`,
+  "i",
+);
+const DOWNLOAD_INFO_PATH = new RegExp(
+  `^/i/listings/${LISTING_ID}/asset-formats/${ASSET_FORMAT_CODE}/files/${LISTING_ID}/download-info$`,
+  "i",
+);
 const ALLOWED_PUBLIC_API_PATHS = new Set([
   "/i/listings/search",
   "/i/public/taxonomy",
@@ -73,9 +83,41 @@ export function assertAllowedFabApiUrl(url: URL): void {
     url.protocol !== "https:" ||
     url.origin !== FAB_ORIGIN ||
     (!ALLOWED_PUBLIC_API_PATHS.has(url.pathname) &&
-      !LISTING_DETAIL_PATH.test(url.pathname))
+      !LISTING_DETAIL_PATH.test(url.pathname) &&
+      !ASSET_FORMATS_PATH.test(url.pathname) &&
+      !DOWNLOAD_INFO_PATH.test(url.pathname))
   ) {
     throw new FabClientError("FAB_INTERNAL", "Refused a non-Fab upstream URL.");
+  }
+}
+
+/**
+ * Signed download URLs are self-authorizing (token in the query string) but
+ * must still point at an Epic-controlled distribution domain over TLS. The
+ * observed pool rotates across providers (for example
+ * `content-download-emp.distro.on.epicgames.com` and
+ * `emp-fastly-stitched.epicgamescdn.com`), so the allowlist matches the
+ * registrable Epic/Fab domain families rather than exact hosts.
+ */
+const ALLOWED_DOWNLOAD_DOMAIN_FAMILIES = [
+  "fab.com",
+  "epicgames.com",
+  "epicgamescdn.com",
+  "unrealengine.com",
+];
+
+export function assertAllowedFabDownloadUrl(url: URL): void {
+  const hostname = url.hostname.toLowerCase();
+  const allowed =
+    url.protocol === "https:" &&
+    ALLOWED_DOWNLOAD_DOMAIN_FAMILIES.some(
+      (family) => hostname === family || hostname.endsWith(`.${family}`),
+    );
+  if (!allowed) {
+    throw new FabClientError(
+      "FAB_UPSTREAM_CHANGED",
+      "Fab returned a download URL outside the approved distribution hosts.",
+    );
   }
 }
 

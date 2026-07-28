@@ -40,6 +40,19 @@ const EnvironmentSchema = z.object({
     .default(2_147_483_648),
   FAB_LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("warn"),
   FAB_LOG_QUERIES: BooleanEnvironmentValue.default(false),
+  FAB_CURL_IMPERSONATE: z.string().trim().min(1).optional(),
+  FAB_MIN_REQUEST_INTERVAL_MS: z.coerce
+    .number()
+    .int()
+    .min(0)
+    .max(10_000)
+    .default(1_000),
+  FAB_DOWNLOAD_TIMEOUT_MS: z.coerce
+    .number()
+    .int()
+    .min(10_000)
+    .max(3_600_000)
+    .default(600_000),
 });
 
 export interface FabConfig {
@@ -52,6 +65,13 @@ export interface FabConfig {
   maxDownloadBytes: number;
   logLevel: "debug" | "info" | "warn" | "error";
   logQueries: boolean;
+  /**
+   * Explicit curl-impersonate wrapper override; "0"/"off"/"false" disables
+   * impersonation. Resolution against PATH happens in the client.
+   */
+  curlImpersonate?: string;
+  minRequestIntervalMs: number;
+  downloadTimeoutMs: number;
 }
 
 function isInside(path: string, parent: string): boolean {
@@ -151,5 +171,10 @@ export function loadFabConfig(
     maxDownloadBytes: parsed.FAB_MAX_DOWNLOAD_BYTES,
     logLevel: parsed.FAB_LOG_LEVEL,
     logQueries: parsed.FAB_LOG_QUERIES,
+    ...(parsed.FAB_CURL_IMPERSONATE
+      ? { curlImpersonate: parsed.FAB_CURL_IMPERSONATE }
+      : {}),
+    minRequestIntervalMs: parsed.FAB_MIN_REQUEST_INTERVAL_MS,
+    downloadTimeoutMs: parsed.FAB_DOWNLOAD_TIMEOUT_MS,
   };
 }

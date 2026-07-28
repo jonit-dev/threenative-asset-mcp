@@ -1,4 +1,6 @@
 import type { SearchInput, SearchOutput } from "../tools/search-assets.js";
+import { dirname, join } from "node:path";
+
 import type {
   FilterGroups,
   FilterKind,
@@ -10,6 +12,7 @@ import type {
   ListLimitedTimeFreeOutput,
 } from "../tools/list-limited-time-free.js";
 import { loadFabConfig } from "../config.js";
+import { downloadFreeAssetViaApi, nodeDownloadToFile } from "./api-download.js";
 import { BrowserFabTransport } from "./browser-transport.js";
 import { TtlLruCache } from "./cache.js";
 import {
@@ -21,6 +24,11 @@ import {
   type FabTransport,
 } from "./direct-transport.js";
 import { createStderrLogger, nullFabLogger, type FabLogger } from "./errors.js";
+import {
+  createImpersonateFetch,
+  impersonateDownloadToFile,
+  resolveImpersonateCommand,
+} from "./impersonate-fetch.js";
 
 const FAB_ORIGIN = "https://www.fab.com";
 const SEARCH_PATH = "/i/listings/search";
@@ -554,6 +562,14 @@ export function buildSearchUrl(input: SearchInput): URL {
   return url;
 }
 
+interface ApiDownloadConfig {
+  downloadDir: string;
+  maxBytes: number;
+  timeoutMs: number;
+  impersonateCommand?: string;
+  cookieJarPath: string;
+}
+
 export class FabClient {
   private readonly directTransport: FabTransport;
   private readonly browserTransport: FabTransport | undefined;
@@ -561,6 +577,7 @@ export class FabClient {
   private readonly cache: TtlLruCache<unknown>;
   private readonly logger: FabLogger;
   private readonly now: () => number;
+  private readonly apiDownload: ApiDownloadConfig | undefined;
 
   constructor(
     directTransport?: FabTransport,
@@ -574,6 +591,7 @@ export class FabClient {
       this.directTransport = directTransport;
       this.browserTransport = browserTransport;
       this.logger = discovery.logger ?? nullFabLogger;
+      this.apiDownload = undefined;
       return;
     }
     const config = loadFabConfig();
@@ -581,11 +599,39 @@ export class FabClient {
       level: config.logLevel,
       logQueries: config.logQueries,
     });
+    const impersonateCommand = resolveImpersonateCommand(process.env);
+    const cookieJarPath = join(
+      dirname(config.browserProfileDir),
+      "curl-cookie-jar.txt",
+    );
     this.directTransport = new DirectFabTransport({
       timeoutMs: config.directTimeoutMs,
+      minimumIntervalMs: config.minRequestIntervalMs,
+      ...(impersonateCommand
+        ? {
+            fetch: createImpersonateFetch({
+              command: impersonateCommand,
+              cookieJarPath,
+              timeoutMs: config.directTimeoutMs,
+              logger: this.logger,
+            }),
+          }
+        : {}),
       logger: this.logger,
     });
     this.browserTransport = BrowserFabTransport.fromConfig(config);
+    this.apiDownload = {
+      downloadDir: config.downloadDir,
+      maxBytes: config.maxDownloadBytes,
+      timeoutMs: config.downloadTimeoutMs,
+      ...(impersonateCommand ? { impersonateCommand } : {}),
+      cookieJarPath,
+    };
+    if (impersonateCommand) {
+      this.logger.log("info", "fab_impersonate_enabled", {
+        command: impersonateCommand,
+      });
+    }
   }
 
   private async withChallengeFallback(
@@ -751,18 +797,11 @@ export class FabClient {
   ): Promise<FabDownloadResult> {
     const startedAt = this.now();
     try {
-      if (!this.browserTransport?.downloadFreeAsset) {
-        throw new FabClientError(
-          "FAB_UPSTREAM_UNAVAILABLE",
-          "The configured Fab browser cannot download public files.",
-        );
-      }
-      const result =
-        await this.browserTransport.downloadFreeAsset(request);
+      const result = await this.downloadApiFirst(request);
       this.logger.log("info", "fab_tool_complete", {
         tool: "fab_download_free_asset",
         durationMs: this.now() - startedAt,
-        transport: this.browserTransport.name,
+        transport: result.transport,
         format: request.format,
         sizeBytes: result.sizeBytes,
         alreadyExisted: result.alreadyExisted,
@@ -778,6 +817,87 @@ export class FabClient {
       });
       throw error;
     }
+  }
+
+  /**
+   * Resolves the file through Fab's anonymous JSON contract first (no
+   * browser needed when the host has a browser-fingerprint TLS client) and
+   * falls back to the guarded browser click flow when Cloudflare challenges
+   * the direct path.
+   */
+  private async downloadApiFirst(
+    request: FabDownloadRequest,
+  ): Promise<FabDownloadResult & { transport: FabTransport["name"] }> {
+    if (this.apiDownload) {
+      try {
+        const result = await downloadFreeAssetViaApi({
+          request,
+          fetchJson: (url) => this.directJson(url),
+          downloader: (url, destinationPath) =>
+            this.downloadFromDistribution(url, destinationPath),
+          downloadDir: this.apiDownload.downloadDir,
+          maxBytes: this.apiDownload.maxBytes,
+          logger: this.logger,
+        });
+        return { ...result, transport: this.directTransport.name };
+      } catch (error) {
+        if (
+          !(error instanceof FabClientError) ||
+          error.code !== "FAB_CHALLENGE"
+        ) {
+          throw error;
+        }
+        this.logger.log("debug", "fab_api_download_challenge_fallback", {
+          listingId: request.listingId,
+          format: request.format,
+        });
+      }
+    }
+    if (!this.browserTransport?.downloadFreeAsset) {
+      throw new FabClientError(
+        "FAB_UPSTREAM_UNAVAILABLE",
+        "The configured Fab browser cannot download public files.",
+      );
+    }
+    const result = await this.browserTransport.downloadFreeAsset(request);
+    return { ...result, transport: this.browserTransport.name };
+  }
+
+  private async directJson(url: URL): Promise<unknown> {
+    if (!this.directTransport.request) {
+      throw new FabClientError(
+        "FAB_INTERNAL",
+        "The configured Fab transport cannot load this public resource.",
+      );
+    }
+    return this.directTransport.request(url);
+  }
+
+  private async downloadFromDistribution(
+    url: URL,
+    destinationPath: string,
+  ): Promise<void> {
+    if (!this.apiDownload) {
+      throw new FabClientError(
+        "FAB_INTERNAL",
+        "The Fab download path is not configured.",
+      );
+    }
+    if (this.apiDownload.impersonateCommand) {
+      await impersonateDownloadToFile({
+        command: this.apiDownload.impersonateCommand,
+        cookieJarPath: this.apiDownload.cookieJarPath,
+        timeoutMs: this.apiDownload.timeoutMs,
+        url: url.toString(),
+        destinationPath,
+        maxBytes: this.apiDownload.maxBytes,
+      });
+      return;
+    }
+    await nodeDownloadToFile(url, destinationPath, {
+      timeoutMs: this.apiDownload.timeoutMs,
+      maxBytes: this.apiDownload.maxBytes,
+    });
   }
 
   async request(url: URL): Promise<unknown> {
