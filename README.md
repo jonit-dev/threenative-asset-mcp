@@ -1,17 +1,18 @@
 # Fab MCP
 
-An unofficial, read-only [Model Context Protocol](https://modelcontextprotocol.io/)
-server for finding public assets on [Fab](https://www.fab.com/). It gives AI
-clients structured marketplace search, listing details, filter discovery, and a
-separate limited-time-free surface.
+An unofficial [Model Context Protocol](https://modelcontextprotocol.io/) server
+for finding public assets on [Fab](https://www.fab.com/). It gives AI clients
+structured marketplace search, listing details, filter discovery, a separate
+limited-time-free surface, and guarded downloads for directly available free
+files.
 
 `fab_search_assets` defaults to free assets. This means Fab reported at least
 one free or effectively free license; it does not imply every license tier is
 free. Use `fab_get_asset` before making license or price claims.
 
 > Status: experimental. Fab's `/i/*` JSON routes are undocumented and can
-> change or restrict automated access. Complete legal/product review before
-> publishing or operating this integration broadly.
+> change or restrict automated access. Review Fab's terms and each asset's
+> license before operating this integration broadly.
 
 ## Requirements
 
@@ -20,9 +21,15 @@ free. Use `fab_get_asset` before making license or price claims.
   browser verification
 - No Epic or Fab login is required or automated
 
-## Install and build
+## Install
 
-This workspace is not published to npm yet:
+An MCP host can launch the published package with:
+
+```bash
+npx -y @threenative/fab-mcp
+```
+
+For a local checkout:
 
 ```bash
 npm ci
@@ -32,10 +39,6 @@ npm test
 npm run build
 node dist/index.js
 ```
-
-After publication, an MCP host can use `npx -y fab-mcp`. For a local checkout,
-replace the `npx` command in the examples below with `node` and set `args` to
-the absolute path to `dist/index.js`.
 
 Playwright does not download Chromium as part of a normal package install. Run
 `npx -p playwright@1.62.0 playwright install chromium` once on the MCP host
@@ -50,7 +53,7 @@ Add this to `~/.codex/config.toml`:
 ```toml
 [mcp_servers.fab]
 command = "npx"
-args = ["-y", "fab-mcp"]
+args = ["-y", "@threenative/fab-mcp"]
 ```
 
 For a local build:
@@ -70,7 +73,7 @@ Add a server entry to the Claude Desktop configuration:
   "mcpServers": {
     "fab": {
       "command": "npx",
-      "args": ["-y", "fab-mcp"]
+      "args": ["-y", "@threenative/fab-mcp"]
     }
   }
 }
@@ -86,7 +89,7 @@ Create `.vscode/mcp.json`:
     "fab": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "fab-mcp"]
+      "args": ["-y", "@threenative/fab-mcp"]
     }
   }
 }
@@ -107,9 +110,14 @@ Restart the MCP host after changing its configuration.
   Fab's public `/limited-time-free` page through the dedicated browser, then
   resolves them through the normal detail client; it never substitutes general
   `is_free=1` search.
+- `fab_download_free_asset` — downloads one directly available free file into
+  the dedicated download directory after explicit Fab EULA acknowledgement. It
+  refuses purchase, acquisition, library-only, ambiguous, and unsafe-path
+  flows.
 
-Every tool is annotated read-only, non-destructive, and idempotent. There are no
-purchase, cart, library, wishlist, acquisition, login, or download operations.
+The discovery tools are read-only. The download tool writes only within its
+dedicated local directory and never purchases, adds to cart or library,
+wishlists, signs in, or overwrites an existing download.
 
 ## Configuration
 
@@ -120,6 +128,8 @@ purchase, cart, library, wishlist, acquisition, login, or download operations.
 | `FAB_BROWSER_MANUAL_TIMEOUT_MS` | `10000`                                            | Headed-mode grace period for visible verification.       |
 | `FAB_BROWSER_HEADLESS`          | `true`                                             | Set to `0` temporarily for manual verification.          |
 | `FAB_BROWSER_PROFILE_DIR`       | OS state directory under `fab-mcp/browser-profile` | MCP-owned browser state.                                 |
+| `FAB_DOWNLOAD_DIR`              | `~/Downloads/fab-mcp`                              | Dedicated directory for free-file downloads.             |
+| `FAB_MAX_DOWNLOAD_BYTES`        | `2147483648`                                       | Maximum accepted download size in bytes.                 |
 | `FAB_LOG_LEVEL`                 | `warn`                                             | `debug`, `info`, `warn`, or `error`.                     |
 | `FAB_LOG_QUERIES`               | `false`                                            | Set to `1` only if query text may be written to logs.    |
 

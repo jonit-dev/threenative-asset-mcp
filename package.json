@@ -1,13 +1,12 @@
 {
-  "name": "fab-mcp",
+  "name": "@threenative/fab-mcp",
   "version": "0.1.0",
-  "private": true,
-  "description": "Read-only MCP server for searching public Fab assets.",
+  "description": "Unofficial MCP server for searching public Fab assets and downloading directly available free files.",
   "type": "module",
   "main": "./dist/index.js",
   "exports": "./dist/index.js",
   "bin": {
-    "fab-mcp": "./dist/index.js"
+    "fab-mcp": "dist/index.js"
   },
   "files": [
     "dist",
@@ -16,9 +15,21 @@
   "keywords": [
     "fab",
     "mcp",
-    "model-context-protocol"
+    "model-context-protocol",
+    "threenative"
   ],
   "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jonit-dev/fab-mcp.git"
+  },
+  "homepage": "https://github.com/jonit-dev/fab-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/jonit-dev/fab-mcp/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "engines": {
     "node": ">=20.19.0"
   },
@@ -31,7 +42,8 @@
     "test": "vitest run",
     "test:live": "tsx scripts/probe-fab.ts",
     "typecheck": "tsc --noEmit",
-    "inspect": "npx --yes @modelcontextprotocol/inspector --cli node dist/index.js --method tools/list"
+    "inspect": "npx --yes @modelcontextprotocol/inspector --cli node dist/index.js --method tools/list",
+    "prepublishOnly": "npm run typecheck && npm test"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.0.0",

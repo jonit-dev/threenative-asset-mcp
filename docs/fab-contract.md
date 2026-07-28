@@ -4,7 +4,8 @@ Captured: 2026-07-28
 
 ## Decision
 
-**Conditional go** for an unofficial, local, read-only MCP.
+**Conditional go** for an unofficial, local MCP with read-only discovery and
+guarded downloads of directly available free files.
 
 Fab exposes public browsing without requiring acquisition or account access, and
 `GET https://www.fab.com/i/listings/search` was observed returning anonymous
@@ -14,8 +15,11 @@ may use the undocumented read paths only while it:
 
 - sends no Cookie or Authorization header;
 - never imports or attaches to a user's browser profile;
-- performs no acquisition, library, wishlist, cart, checkout, or download
-  action;
+- performs no acquisition, library, wishlist, cart, checkout, or login action;
+- downloads only a format exposed as directly available from the public listing
+  UI, after explicit EULA acknowledgement, into a dedicated local directory;
+- refuses purchase, acquisition, library-only, ambiguous, oversized, and
+  unsafe-path download flows and never overwrites an existing file;
 - accepts only JSON from allow-listed `https://www.fab.com/i/...` URLs;
 - classifies challenges and never attempts to bypass CAPTCHA or fingerprinting;
 - keeps the browser fallback optional and returns
