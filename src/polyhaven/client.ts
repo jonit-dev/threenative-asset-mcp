@@ -221,7 +221,7 @@ export class PolyHavenClient {
   ) {
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.userAgent =
-      options.userAgent ?? "threenative-asset-mcp/0.2.0 (MCP asset browser)";
+      options.userAgent ?? "threenative-asset-mcp/0.4.0 (MCP asset browser)";
   }
 
   private async request(path: string, ttlMs: number): Promise<unknown> {

@@ -1,7 +1,7 @@
 {
   "name": "threenative-asset-mcp",
-  "version": "0.2.0",
-  "description": "MCP server for discovering assets from Fab and Poly Haven, including guarded downloads and official file data.",
+  "version": "0.4.0",
+  "description": "MCP server for discovering and safely downloading 3D and game-audio assets from curated public sources.",
   "type": "module",
   "main": "./dist/index.js",
   "exports": "./dist/index.js",
@@ -15,6 +15,11 @@
   "keywords": [
     "fab",
     "polyhaven",
+    "ambientcg",
+    "smithsonian",
+    "sketchfab",
+    "audio-assets",
+    "game-audio",
     "3d-assets",
     "mcp",
     "model-context-protocol",
@@ -43,12 +48,15 @@
     "probe:fab": "tsx scripts/probe-fab.ts",
     "test": "vitest run",
     "test:live": "tsx scripts/probe-fab.ts",
+    "test:providers:live": "npm run build && tsx scripts/probe-providers.ts",
     "typecheck": "tsc --noEmit",
     "inspect": "npx --yes @modelcontextprotocol/inspector --cli node dist/index.js --method tools/list",
     "prepublishOnly": "npm run typecheck && npm test"
   },
   "dependencies": {
+    "@gltf-transform/core": "4.4.2",
     "@modelcontextprotocol/server": "2.0.0",
+    "@zip.js/zip.js": "2.8.34",
     "playwright": "1.62.0",
     "zod": "4.4.3"
   },

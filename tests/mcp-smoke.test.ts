@@ -113,7 +113,7 @@ async function startInitializedServer(): Promise<{
     result: {
       serverInfo: {
         name: "threenative-asset-mcp",
-        version: "0.2.0",
+        version: "0.4.0",
       },
     },
   });
@@ -253,6 +253,29 @@ describe("built stdio package", () => {
       "polyhaven_get_asset",
       "polyhaven_list_categories",
       "polyhaven_list_files",
+      "ambientcg_search_assets",
+      "ambientcg_get_asset",
+      "ambientcg_list_categories",
+      "ambientcg_list_files",
+      "smithsonian_search_assets",
+      "smithsonian_get_asset",
+      "smithsonian_list_files",
+      "sketchfab_search_models",
+      "sketchfab_get_model",
+      "sketchfab_list_categories",
+      "sketchfab_get_downloads",
+      "audio_list_sources",
+      "audio_search_assets",
+      "audio_download_asset",
+      "itch_list_downloads",
+      "itch_download_asset",
+      "asset_list_bundle_entries",
+      "asset_download_bundle_entry",
+      "asset_list_bundle_animations",
+      "asset_download_bundle_animation",
+      "asset_list_sources",
+      "asset_search_sources",
+      "asset_download_file",
     ]);
 
     const called = jsonResponse(child, 3);

@@ -1,10 +1,19 @@
 # threenative-asset-mcp
 
 A [Model Context Protocol](https://modelcontextprotocol.io/) server for finding
-3D assets across [Fab](https://www.fab.com/) and
-[Poly Haven](https://polyhaven.com/). It gives AI clients provider-scoped,
+3D assets across [Fab](https://www.fab.com/),
+[Poly Haven](https://polyhaven.com/), [ambientCG](https://ambientcg.com/),
+[Smithsonian 3D](https://3d.si.edu/), [Sketchfab](https://sketchfab.com/), and a
+curated game-audio catalog spanning Sonniss, Kenney, Tallbeard, Scott Buckley,
+itch.io, Mixkit, Pixabay, Freesound, OpenGameArt, and Abstraction. It gives AI clients provider-scoped,
 structured search, asset metadata, category/filter discovery, downloadable file
 data, and guarded Fab downloads for directly available free files.
+
+The audio tools separate **source discovery** from **verified direct downloads**.
+All ten sources are described with license caveats and official browse pages;
+only packs with stable official URLs and known license metadata appear in the
+direct-download catalog. The initial downloadable set is Kenney Interface
+Sounds, Kenney Music Jingles, and all five Sonniss GDC 2026 archives.
 
 `fab_search_assets` defaults to free assets. This means Fab reported at least
 one free or effectively free license; it does not imply every license tier is
@@ -17,6 +26,7 @@ dependency relationships with pagination and resolution/format filters.
 > Status: experimental. Fab's `/i/*` JSON routes are undocumented and can
 > change or restrict automated access. Poly Haven provides a documented public
 > API, but clients must send a unique User-Agent and visibly credit Poly Haven.
+> Sketchfab licenses vary per model and download URLs require a user API token.
 > Review each provider's terms and each asset's license.
 
 ## Requirements
@@ -135,9 +145,107 @@ Poly Haven:
   and dependency relationships. Use `resolution` and `format` to select usable
   variants; follow `nextCursor` until absent to retrieve every matching file.
 
-All discovery and Poly Haven tools are read-only. The Fab download tool writes
-only within its dedicated local directory and never purchases, adds to cart or
-library, wishlists, signs in, or overwrites an existing download.
+ambientCG:
+
+- `ambientcg_search_assets` — searches CC0 materials, HDRIs, substances,
+  decals, atlases, 3D models, images, brushes, terrains, and HDRI elements.
+- `ambientcg_get_asset` — returns metadata, maps, technique, dimensions,
+  statistics, and CC0 licensing.
+- `ambientcg_list_categories` — lists typed categories and asset counts.
+- `ambientcg_list_files` — returns official archives with variant attributes,
+  extensions, URLs, and byte sizes.
+
+Smithsonian 3D:
+
+- `smithsonian_search_assets` — searches Open Access models by text, format,
+  quality, owning unit, Draco compression, and glTF orientation compliance.
+- `smithsonian_get_asset` — groups the file-centric API response into one model
+  summary.
+- `smithsonian_list_files` — returns direct model files with format, quality,
+  compression, and orientation metadata.
+
+Sketchfab:
+
+- `sketchfab_search_models` — anonymously searches public models, defaulting to
+  downloadable results, and preserves author, geometry, archive, and license
+  metadata.
+- `sketchfab_get_model` — returns public detail and explicit Creative Commons
+  requirements.
+- `sketchfab_list_categories` — lists public category names and slugs.
+- `sketchfab_get_downloads` — uses `SKETCHFAB_API_TOKEN` to retrieve temporary
+  download URLs. It never stores the token or returns it in tool output.
+
+Game audio:
+
+- `audio_list_sources` — lists the ten supported audio libraries, best uses,
+  official browse pages, license/attribution cautions, and honest download
+  capability (`curated-direct` or `provider-page`).
+- `audio_search_assets` — searches only the curated packs with stable official
+  direct URLs. Results preserve license, commercial-use, attribution, source,
+  size (when known), and redistribution metadata.
+- `audio_download_asset` — downloads a catalog asset by ID after
+  `acceptLicense: true`. It uses an HTTPS host allowlist, validates every
+  redirect, streams with a byte cap, writes atomically without overwrite, and
+  returns the local path, byte size, and SHA-256.
+
+Curated itch.io packs:
+
+- `itch_list_downloads` — resolves a fresh no-account download page and lists
+  upload IDs, filenames, sizes, CC0 terms, and pack-specific cautions without
+  exposing the signed page token.
+- `itch_download_asset` — resolves a fresh 60-second signed file URL and streams
+  the selected upload into guarded storage after `acceptLicense: true`. Signed
+  URLs are not returned. The initial catalog covers Tallbeard Music Loop
+  Bundle, Quaternius Universal Animation Libraries 1 and 2, Brackeys VFX
+  Bundle, and KayKit Platformer.
+- `asset_list_bundle_entries` — reads the remote ZIP directory with HTTP byte
+  ranges and returns individual paths and sizes without downloading the archive.
+- `asset_download_bundle_entry` — range-fetches and extracts one selected file,
+  caches it with a SHA-256 sidecar, and never downloads unrelated bundle files.
+- `asset_list_bundle_animations` — range-fetches only an aggregate GLB and lists
+  its named animation clips. For Quaternius, it automatically prefers the
+  standard non-root-motion GLB.
+- `asset_download_bundle_animation` — exports one named animation as a valid
+  animation-only GLB, removing unrelated clips, meshes, materials, and textures.
+  The cached aggregate GLB is reused across requests.
+
+Unified source and download routing:
+
+- `asset_list_sources` — returns only **agent-ready sources by default** across
+  3D, textures, HDRIs, animations, VFX, 2D, UI, icons, fonts, and audio. An
+  agent-ready source has an MCP download tool and requires no manual browser,
+  login, checkout, donation prompt, or paywall. Pass `agentReadyOnly: false` to
+  inspect the broader research directory, including package-manager, Git, and
+  provider-page sources that are not yet integrated.
+- `asset_search_sources` — filters that directory by text, category, access
+  mode, and license tag (`cc0`, `cc-by`, `mit`, and others), while preserving
+  the same agent-ready-only default.
+- `asset_download_file` — streams a direct URL previously returned by
+  `polyhaven_list_files`, `ambientcg_list_files`, `smithsonian_list_files`, or
+  the Game-icons.net bulk archive or Kenney Particle Pack entry into guarded
+  local storage. Provider hosts and URL shapes are allowlisted, redirects are
+  revalidated, existing files are never overwritten, and the result includes
+  SHA-256.
+
+Recommended agent flow:
+
+1. Call `asset_search_sources` with the requested category/query. Its default
+   result set is guaranteed to contain only agent-ready sources.
+2. Call the returned `searchTool` or `detailTool` when present.
+3. Resolve variants with the returned `filesTool`.
+4. Call the returned `downloadTool` with `acceptLicense: true`.
+5. For aggregate Quaternius animation libraries, skip whole-pack download:
+   `itch_list_downloads` → `asset_list_bundle_animations` →
+   `asset_download_bundle_animation`.
+
+This is intentionally a short MCP tool chain rather than a fake universal URL:
+each provider keeps its real search/variant semantics, while source routing and
+the no-manual-flow guarantee stay uniform.
+
+All discovery tools are read-only. Download tools write only within their
+dedicated local directories and never purchase, add to cart or library,
+wishlist, sign in, or overwrite an existing download. Audio packs remain
+subject to their source license; raw redistribution is not implied by download.
 
 ## Configuration
 
@@ -155,6 +263,13 @@ library, wishlists, signs in, or overwrites an existing download.
 | `FAB_MIN_REQUEST_INTERVAL_MS`   | `1000`                                             | Minimum spacing between direct upstream requests.        |
 | `FAB_LOG_LEVEL`                 | `warn`                                             | `debug`, `info`, `warn`, or `error`.                     |
 | `FAB_LOG_QUERIES`               | `false`                                            | Set to `1` only if query text may be written to logs.    |
+| `SKETCHFAB_API_TOKEN`           | unset                                              | User token for temporary Sketchfab download URLs.        |
+| `AUDIO_DOWNLOAD_DIR`            | `~/Downloads/threenative-asset-mcp/audio`          | Dedicated directory for curated audio downloads.         |
+| `AUDIO_MAX_DOWNLOAD_BYTES`      | `10737418240`                                      | Maximum accepted bytes per audio archive (10 GiB).       |
+| `AUDIO_DOWNLOAD_TIMEOUT_MS`     | `1800000`                                          | Total timeout for one audio download (30 minutes).       |
+| `ASSET_DOWNLOAD_DIR`            | `~/Downloads/threenative-asset-mcp/assets`         | Dedicated directory for direct provider downloads.       |
+| `ASSET_MAX_DOWNLOAD_BYTES`      | `10737418240`                                      | Maximum accepted bytes per provider file (10 GiB).       |
+| `ASSET_DOWNLOAD_TIMEOUT_MS`     | `1800000`                                          | Total timeout for one provider download (30 minutes).    |
 
 Direct requests are spaced at least `FAB_MIN_REQUEST_INTERVAL_MS` apart. Only
 HTTP 429, 502, 503, and 504 are retried, at most twice, with backoff and
@@ -200,6 +315,37 @@ includes `provider`, `license`, and `attribution` fields so downstream clients
 can preserve that distinction. See the
 [official API page](https://polyhaven.com/our-api) and
 [API documentation](https://api.polyhaven.com/).
+
+## Other provider behavior
+
+ambientCG uses its anonymous, read-only v3 API. Its files are CC0 and its API
+exposes searchable metadata, categories, and downloadable variants.
+
+Smithsonian uses the anonymous Smithsonian 3D file-search API. Files exposed by
+that API are part of Smithsonian Open Access; the MCP retains direct source
+URLs and format/quality metadata.
+
+Sketchfab public search, categories, and model detail do not require a token.
+The download endpoint requires a token belonging to the user, configured
+through `SKETCHFAB_API_TOKEN`. The token is sent only in the Sketchfab
+`Authorization` header, is never logged or persisted, and is not included in
+MCP responses. Sketchfab models use different Creative Commons licenses; always
+inspect `license.requirements` before use.
+
+Audio direct downloads are catalog-ID based; the MCP does not accept arbitrary
+URLs. Official Kenney downloads are restricted to `kenney.nl` and Sonniss GDC
+downloads to `downloads.sonniss.com`, including redirect revalidation. Sources
+without a stable, verified direct contract remain discoverable as
+`provider-page` instead of being falsely presented as one-click downloads.
+
+The generic direct downloader is intentionally narrower than an arbitrary URL
+fetcher. It accepts only official Poly Haven, ambientCG, Smithsonian,
+Game-icons.net, and curated Kenney URL contracts. The itch.io downloader uses
+fresh signed mirror URLs internally but never exposes them. Sketchfab signed
+downloads are exposed through `sketchfab_get_downloads` but are not persisted
+by the generic downloader because their temporary CDN hosts vary and require
+the user's token-backed session. Provider-page-only sources stay provider-page-only until a stable,
+license-safe download contract is verified.
 
 ## Dedicated browser profile and privacy
 
@@ -273,6 +419,7 @@ npm test
 npm run build
 npm pack --dry-run
 npm run inspect
+npm run test:providers:live
 ```
 
 Live checks are opt-in because they contact Fab:
@@ -286,3 +433,9 @@ contract probe. It exits nonzero when Fab challenges the clean browser or the
 required contract cannot be verified. Live verification must remain anonymous,
 concurrency-one, capped and paced. It must never acquire, purchase, wishlist,
 download, or automatically solve a challenge.
+
+`npm run test:providers:live` launches the compiled stdio MCP and exercises live
+search, detail, categories, and file discovery for ambientCG, Smithsonian 3D,
+and Sketchfab. If `SKETCHFAB_API_TOKEN` is configured it also verifies the
+authenticated download endpoint; otherwise it verifies the explicit
+authentication-required response.

@@ -279,7 +279,7 @@ export class DirectFabTransport implements FabTransport {
         headers: {
           accept: "application/json",
           "user-agent":
-            "threenative-asset-mcp/0.2.0 (read-only Fab public search)",
+            "threenative-asset-mcp/0.4.0 (read-only Fab public search)",
         },
         redirect: "manual",
         signal: AbortSignal.timeout(this.timeoutMs),
