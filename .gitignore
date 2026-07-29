@@ -11,6 +11,7 @@ outputs/*.tgz
 .env
 .env.*
 !.env.example
+.npmrc
 
 # Local browser and tool state
 work/
