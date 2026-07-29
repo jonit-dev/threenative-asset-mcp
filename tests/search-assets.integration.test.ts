@@ -62,7 +62,7 @@ async function callSearch(
   await request(1, "initialize", {
     protocolVersion: LATEST_PROTOCOL_VERSION,
     capabilities: {},
-    clientInfo: { name: "fab-mcp-test", version: "1.0.0" },
+    clientInfo: { name: "threenative-asset-mcp-test", version: "1.0.0" },
   });
   await clientSide.send({
     jsonrpc: "2.0",

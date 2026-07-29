@@ -278,7 +278,8 @@ export class DirectFabTransport implements FabTransport {
       return await this.fetchImpl(url, {
         headers: {
           accept: "application/json",
-          "user-agent": "fab-mcp/0.1.0 (read-only public search)",
+          "user-agent":
+            "threenative-asset-mcp/0.2.0 (read-only Fab public search)",
         },
         redirect: "manual",
         signal: AbortSignal.timeout(this.timeoutMs),

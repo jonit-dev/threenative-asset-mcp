@@ -22,7 +22,9 @@ afterEach(async () => {
 });
 
 async function scratchDir(): Promise<string> {
-  const directory = await mkdtemp(join(tmpdir(), "fab-mcp-impersonate-"));
+  const directory = await mkdtemp(
+    join(tmpdir(), "threenative-asset-mcp-fab-impersonate-"),
+  );
   temporaryDirectories.push(directory);
   return directory;
 }

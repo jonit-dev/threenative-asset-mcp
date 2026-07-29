@@ -1,18 +1,23 @@
-# Fab MCP
+# threenative-asset-mcp
 
-An unofficial [Model Context Protocol](https://modelcontextprotocol.io/) server
-for finding public assets on [Fab](https://www.fab.com/). It gives AI clients
-structured marketplace search, listing details, filter discovery, a separate
-limited-time-free surface, and guarded downloads for directly available free
-files.
+A [Model Context Protocol](https://modelcontextprotocol.io/) server for finding
+3D assets across [Fab](https://www.fab.com/) and
+[Poly Haven](https://polyhaven.com/). It gives AI clients provider-scoped,
+structured search, asset metadata, category/filter discovery, downloadable file
+data, and guarded Fab downloads for directly available free files.
 
 `fab_search_assets` defaults to free assets. This means Fab reported at least
 one free or effectively free license; it does not imply every license tier is
 free. Use `fab_get_asset` before making license or price claims.
 
+Poly Haven results are CC0 and explicitly labelled `Powered by Poly Haven`.
+`polyhaven_list_files` exposes official download URLs, hashes, sizes, and
+dependency relationships with pagination and resolution/format filters.
+
 > Status: experimental. Fab's `/i/*` JSON routes are undocumented and can
-> change or restrict automated access. Review Fab's terms and each asset's
-> license before operating this integration broadly.
+> change or restrict automated access. Poly Haven provides a documented public
+> API, but clients must send a unique User-Agent and visibly credit Poly Haven.
+> Review each provider's terms and each asset's license.
 
 ## Requirements
 
@@ -26,7 +31,7 @@ free. Use `fab_get_asset` before making license or price claims.
 An MCP host can launch the published package with:
 
 ```bash
-npx -y @threenative/fab-mcp
+npx -y threenative-asset-mcp
 ```
 
 For a local checkout:
@@ -51,17 +56,17 @@ before relying on the browser fallback.
 Add this to `~/.codex/config.toml`:
 
 ```toml
-[mcp_servers.fab]
+[mcp_servers.assets]
 command = "npx"
-args = ["-y", "@threenative/fab-mcp"]
+args = ["-y", "threenative-asset-mcp"]
 ```
 
 For a local build:
 
 ```toml
-[mcp_servers.fab]
+[mcp_servers.assets]
 command = "node"
-args = ["/absolute/path/to/fab-mcp/dist/index.js"]
+args = ["/absolute/path/to/threenative-asset-mcp/dist/index.js"]
 ```
 
 ### Claude Desktop
@@ -71,9 +76,9 @@ Add a server entry to the Claude Desktop configuration:
 ```json
 {
   "mcpServers": {
-    "fab": {
+    "assets": {
       "command": "npx",
-      "args": ["-y", "@threenative/fab-mcp"]
+      "args": ["-y", "threenative-asset-mcp"]
     }
   }
 }
@@ -86,10 +91,10 @@ Create `.vscode/mcp.json`:
 ```json
 {
   "servers": {
-    "fab": {
+    "assets": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@threenative/fab-mcp"]
+      "args": ["-y", "threenative-asset-mcp"]
     }
   }
 }
@@ -97,7 +102,9 @@ Create `.vscode/mcp.json`:
 
 Restart the MCP host after changing its configuration.
 
-## Tools
+## MCP tools
+
+Fab:
 
 - `fab_search_assets` — searches public listings. `priceMode` defaults to
   `free`; use `any` or `range` explicitly for paid results.
@@ -115,9 +122,22 @@ Restart the MCP host after changing its configuration.
   refuses purchase, acquisition, library-only, ambiguous, and unsafe-path
   flows.
 
-The discovery tools are read-only. The download tool writes only within its
-dedicated local directory and never purchases, adds to cart or library,
-wishlists, signs in, or overwrites an existing download.
+Poly Haven:
+
+- `polyhaven_search_assets` — searches HDRIs, textures, and models by text,
+  type, and category, with relevance/popularity/date/name sorting and cursor
+  pagination.
+- `polyhaven_get_asset` — returns normalized metadata, attributes, authors,
+  dimensions, resolution, and CC0 licensing for one asset.
+- `polyhaven_list_categories` — returns category labels and counts for one
+  asset type.
+- `polyhaven_list_files` — returns the official file URLs, sizes, MD5 hashes,
+  and dependency relationships. Use `resolution` and `format` to select usable
+  variants; follow `nextCursor` until absent to retrieve every matching file.
+
+All discovery and Poly Haven tools are read-only. The Fab download tool writes
+only within its dedicated local directory and never purchases, adds to cart or
+library, wishlists, signs in, or overwrites an existing download.
 
 ## Configuration
 
@@ -127,8 +147,8 @@ wishlists, signs in, or overwrites an existing download.
 | `FAB_BROWSER_TIMEOUT_MS`        | `30000`                                            | Dedicated browser request timeout.                       |
 | `FAB_BROWSER_MANUAL_TIMEOUT_MS` | `10000`                                            | Headed-mode grace period for visible verification.       |
 | `FAB_BROWSER_HEADLESS`          | `true`                                             | Set to `0` temporarily for manual verification.          |
-| `FAB_BROWSER_PROFILE_DIR`       | OS state directory under `fab-mcp/browser-profile` | MCP-owned browser state.                                 |
-| `FAB_DOWNLOAD_DIR`              | `~/Downloads/fab-mcp`                              | Dedicated directory for free-file downloads.             |
+| `FAB_BROWSER_PROFILE_DIR`       | OS state directory under `threenative-asset-mcp/fab-browser-profile` | MCP-owned Fab browser state.                    |
+| `FAB_DOWNLOAD_DIR`              | `~/Downloads/threenative-asset-mcp/fab`            | Dedicated directory for Fab free-file downloads.         |
 | `FAB_MAX_DOWNLOAD_BYTES`        | `2147483648`                                       | Maximum accepted download size in bytes.                 |
 | `FAB_DOWNLOAD_TIMEOUT_MS`       | `600000`                                           | Total timeout for one file download.                     |
 | `FAB_CURL_IMPERSONATE`          | auto-detected on `PATH`                            | curl-impersonate wrapper override; `0`/`off` disables.   |
@@ -167,6 +187,20 @@ Process-local cache TTLs are five minutes for search, fifteen minutes for
 listing details, six hours for taxonomy data, and ten minutes for promotions.
 The shared LRU is capped at 500 entries and is cleared on process exit.
 
+## Poly Haven API behavior
+
+Poly Haven requests go only to `https://api.polyhaven.com`, with the required
+`threenative-asset-mcp` User-Agent. Asset lists are cached for 15 minutes and
+details, categories, and file trees are cached for up to one hour. Returned file
+URLs are accepted only from `https://dl.polyhaven.org`.
+
+The live API is free for personal and commercial use, but use of the API
+requires a visible Poly Haven credit. The assets themselves are CC0. This MCP
+includes `provider`, `license`, and `attribution` fields so downstream clients
+can preserve that distinction. See the
+[official API page](https://polyhaven.com/our-api) and
+[API documentation](https://api.polyhaven.com/).
+
 ## Dedicated browser profile and privacy
 
 When a direct anonymous request receives a Cloudflare challenge, the server may
@@ -186,13 +220,13 @@ Browser process startup is capped at ten seconds. On a host without a working
 graphical session, headed mode returns `FAB_UPSTREAM_UNAVAILABLE` instead of
 hanging an MCP call; run the manual release gate on a graphical host.
 
-To clear browser-owned Fab state, stop every `fab-mcp` process and move only the
-dedicated directory reported by your configuration out of service. The default
-on Linux can be cleared recoverably with:
+To clear browser-owned Fab state, stop every `threenative-asset-mcp` process and
+move only the dedicated directory reported by your configuration out of
+service. The default on Linux can be cleared recoverably with:
 
 ```bash
-mv -- "${XDG_STATE_HOME:-$HOME/.local/state}/fab-mcp/browser-profile" \
-  "${XDG_STATE_HOME:-$HOME/.local/state}/fab-mcp/browser-profile.cleared"
+mv -- "${XDG_STATE_HOME:-$HOME/.local/state}/threenative-asset-mcp/fab-browser-profile" \
+  "${XDG_STATE_HOME:-$HOME/.local/state}/threenative-asset-mcp/fab-browser-profile.cleared"
 ```
 
 Do not point `FAB_BROWSER_PROFILE_DIR` at a normal browser profile. The server

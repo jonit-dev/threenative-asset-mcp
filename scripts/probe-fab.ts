@@ -7,7 +7,7 @@ import { chromium, type BrowserContext, type Page } from "playwright";
 const FAB_ORIGIN = "https://www.fab.com";
 const SEARCH_PATH =
   "/i/listings/search?q=forest&is_free=1&sort_by=-relevance&count=2&currency=USD";
-const USER_AGENT = "fab-mcp-contract-probe/0.0.0";
+const USER_AGENT = "threenative-asset-mcp-fab-contract-probe/0.2.0";
 const TIMEOUT_MS = 30_000;
 const MINIMUM_REQUEST_INTERVAL_MS = 750;
 const HEADLESS = process.env.FAB_PROBE_HEADED !== "1";
@@ -264,7 +264,7 @@ async function initializeAnonymousPage(
 
 async function probeBrowser(): Promise<SafeResult> {
   const profilePath = await mkdtemp(
-    path.join(tmpdir(), "fab-mcp-anonymous-probe-"),
+    path.join(tmpdir(), "threenative-asset-mcp-fab-anonymous-probe-"),
   );
   let context: BrowserContext | undefined;
   try {

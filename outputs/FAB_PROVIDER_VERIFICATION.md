@@ -1,10 +1,11 @@
-# Fab MCP implementation and verification
+# Fab provider implementation and verification
 
 Date: 2026-07-28
 
 ## Outcome
 
-`fab-mcp` 0.1.0 is implemented as a local, unofficial, read-only stdio MCP.
+The Fab provider was originally implemented for the 0.1.0 release and is now
+part of the `threenative-asset-mcp` multi-provider stdio MCP.
 The deterministic implementation review passes. Release remains gated on a
 successful clean anonymous browser/detail canary because Fab currently applies
 intermittent Cloudflare challenges.

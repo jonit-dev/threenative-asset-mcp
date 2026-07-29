@@ -19,7 +19,8 @@ Complexity score:
 
 **Assumptions:**
 
-- This is a greenfield TypeScript project named `fab-mcp`.
+- This was the original Fab-provider scope and is now implemented inside
+  `threenative-asset-mcp`.
 - Version 1 is a local stdio MCP, not a hosted multi-user service.
 - Version 1 is read-only. Purchasing, adding to library/cart/wishlist, downloading, and account/library inspection are out of scope.
 - Search and public listing details must work without an Epic account.
@@ -374,7 +375,7 @@ Pin exact versions and commit the lockfile. Reconfirm these versions when implem
 
 ```mermaid
 flowchart LR
-    A["AI / MCP host"] -->|stdio| S["Fab MCP server"]
+    A["AI / MCP host"] -->|stdio| S["threenative-asset-mcp server"]
     S --> T["Tool handlers + Zod schemas"]
     T --> C["FabClient"]
     C --> D["Direct anonymous transport"]
@@ -489,7 +490,7 @@ None. Version 1 has no database or migration.
 ```mermaid
 sequenceDiagram
     participant A as AI client
-    participant M as Fab MCP
+    participant M as Asset MCP
     participant D as Direct transport
     participant B as Browser transport
     participant F as Fab
@@ -518,7 +519,7 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant A as AI client
-    participant M as Fab MCP
+    participant M as Asset MCP
     participant F as FabClient
 
     A->>M: fab_get_asset(UUID or Fab URL)
@@ -533,7 +534,7 @@ sequenceDiagram
 
 **How will this feature be reached?**
 
-- [x] Entry point: `fab-mcp` executable over stdio.
+- [x] Entry point: `threenative-asset-mcp` executable over stdio.
 - [x] Caller: an MCP host launches `dist/index.js`.
 - [x] Registration/wiring: `src/server.ts` registers all four tools.
 
@@ -790,7 +791,7 @@ FAB_LIVE_TESTS=1 npm run test:live -- filters promotions
 
 - [ ] Add rate pacing, bounded retry, TTL cache, and request timeout.
 - [ ] Add stderr structured logs and query redaction.
-- [ ] Add `fab-mcp` binary mapping to `dist/index.js`.
+- [x] Add `threenative-asset-mcp` binary mapping to `dist/index.js`.
 - [ ] Document dedicated browser profile behavior and how to clear it.
 - [ ] Document that the integration is unofficial and read-only.
 - [ ] Include Codex/Claude Desktop/VS Code stdio configuration examples.

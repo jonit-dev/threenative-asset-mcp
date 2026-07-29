@@ -138,7 +138,7 @@ export function loadFabConfig(
 
   const browserProfileDir = canonicalPath(
     parsed.FAB_BROWSER_PROFILE_DIR ??
-      join(stateRoot, "fab-mcp", "browser-profile"),
+      join(stateRoot, "threenative-asset-mcp", "fab-browser-profile"),
   );
   if (
     normalBrowserProfileRoots(environment).some((root) =>
@@ -150,7 +150,8 @@ export function loadFabConfig(
     );
   }
   const downloadDir = canonicalPath(
-    parsed.FAB_DOWNLOAD_DIR ?? join(homedir(), "Downloads", "fab-mcp"),
+    parsed.FAB_DOWNLOAD_DIR ??
+      join(homedir(), "Downloads", "threenative-asset-mcp", "fab"),
   );
   if (
     downloadDir === canonicalPath(homedir()) ||

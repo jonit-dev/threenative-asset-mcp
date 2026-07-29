@@ -80,7 +80,9 @@ async function startInitializedServer(): Promise<{
   child: ChildProcessWithoutNullStreams;
   stdout: string[];
 }> {
-  const profileDir = await mkdtemp(join(tmpdir(), "fab-mcp-smoke-"));
+  const profileDir = await mkdtemp(
+    join(tmpdir(), "threenative-asset-mcp-smoke-"),
+  );
   temporaryDirectories.push(profileDir);
   const child = spawn(process.execPath, [resolve("dist/index.js")], {
     cwd: resolve("."),
@@ -104,10 +106,17 @@ async function startInitializedServer(): Promise<{
     params: {
       protocolVersion: LATEST_PROTOCOL_VERSION,
       capabilities: {},
-      clientInfo: { name: "fab-mcp-smoke", version: "1.0.0" },
+      clientInfo: { name: "threenative-asset-mcp-smoke", version: "1.0.0" },
     },
   });
-  expect(await initialized).toHaveProperty("result");
+  expect(await initialized).toMatchObject({
+    result: {
+      serverInfo: {
+        name: "threenative-asset-mcp",
+        version: "0.2.0",
+      },
+    },
+  });
   send(child, {
     jsonrpc: "2.0",
     method: "notifications/initialized",
@@ -240,6 +249,10 @@ describe("built stdio package", () => {
       "fab_list_filters",
       "fab_list_limited_time_free",
       "fab_download_free_asset",
+      "polyhaven_search_assets",
+      "polyhaven_get_asset",
+      "polyhaven_list_categories",
+      "polyhaven_list_files",
     ]);
 
     const called = jsonResponse(child, 3);

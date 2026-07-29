@@ -1,12 +1,12 @@
 {
-  "name": "@threenative/fab-mcp",
-  "version": "0.1.0",
-  "description": "Unofficial MCP server for searching public Fab assets and downloading directly available free files.",
+  "name": "threenative-asset-mcp",
+  "version": "0.2.0",
+  "description": "MCP server for discovering assets from Fab and Poly Haven, including guarded downloads and official file data.",
   "type": "module",
   "main": "./dist/index.js",
   "exports": "./dist/index.js",
   "bin": {
-    "fab-mcp": "dist/index.js"
+    "threenative-asset-mcp": "dist/index.js"
   },
   "files": [
     "dist",
@@ -14,6 +14,8 @@
   ],
   "keywords": [
     "fab",
+    "polyhaven",
+    "3d-assets",
     "mcp",
     "model-context-protocol",
     "threenative"
@@ -21,11 +23,11 @@
   "license": "UNLICENSED",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/jonit-dev/fab-mcp.git"
+    "url": "git+https://github.com/jonit-dev/threenative-asset-mcp.git"
   },
-  "homepage": "https://github.com/jonit-dev/fab-mcp#readme",
+  "homepage": "https://github.com/jonit-dev/threenative-asset-mcp#readme",
   "bugs": {
-    "url": "https://github.com/jonit-dev/fab-mcp/issues"
+    "url": "https://github.com/jonit-dev/threenative-asset-mcp/issues"
   },
   "publishConfig": {
     "access": "public"

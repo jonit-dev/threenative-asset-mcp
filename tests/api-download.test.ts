@@ -79,7 +79,9 @@ function routeJson(routes: Record<string, unknown | FabClientError>) {
 }
 
 async function setup(routes: Record<string, unknown | FabClientError>) {
-  const downloadDir = await mkdtemp(join(tmpdir(), "fab-mcp-api-dl-"));
+  const downloadDir = await mkdtemp(
+    join(tmpdir(), "threenative-asset-mcp-fab-api-dl-"),
+  );
   temporaryDirectories.push(downloadDir);
   const downloader = vi.fn(async (_url: URL, destination: string) => {
     await writeFile(destination, "fake-glb-bytes");

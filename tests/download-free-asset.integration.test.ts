@@ -43,7 +43,9 @@ async function downloadTransport(options: {
   libraryOnly?: boolean;
   eulaRequired?: boolean;
 } = {}) {
-  const downloadDir = await mkdtemp(join(tmpdir(), "fab-mcp-download-"));
+  const downloadDir = await mkdtemp(
+    join(tmpdir(), "threenative-asset-mcp-fab-download-"),
+  );
   temporaryDirectories.push(downloadDir);
   let currentUrl = "https://www.fab.com/";
   const saveAs = vi.fn(async (path: string) => {

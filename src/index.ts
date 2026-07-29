@@ -3,11 +3,13 @@
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 
 import { FabClient } from "./fab/client.js";
-import { createFabServer } from "./server.js";
+import { PolyHavenClient } from "./polyhaven/client.js";
+import { createAssetServer } from "./server.js";
 
-const client = new FabClient();
-void client.prepareBrowser();
-const handle = serveStdio(() => createFabServer(client), {
+const fab = new FabClient();
+const polyhaven = new PolyHavenClient();
+void fab.prepareBrowser();
+const handle = serveStdio(() => createAssetServer({ fab, polyhaven }), {
   onerror(error) {
     process.stderr.write(
       `${JSON.stringify({
@@ -23,7 +25,7 @@ let closing = false;
 async function shutdown(): Promise<void> {
   if (closing) return;
   closing = true;
-  await Promise.allSettled([client.close(), handle.close()]);
+  await Promise.allSettled([fab.close(), handle.close()]);
 }
 
 process.once("SIGINT", () => {

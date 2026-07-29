@@ -59,7 +59,7 @@ function safeToolError(error: unknown) {
       }
     : {
         code: "FAB_INTERNAL",
-        message: "The Fab MCP could not complete the request.",
+        message: "The Fab provider could not complete the request.",
         retryable: false,
       };
 }

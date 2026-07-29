@@ -163,7 +163,9 @@ export function createImpersonateFetch(
     }
 
     for (let challengeAttempt = 0; ; challengeAttempt += 1) {
-      const scratch = await mkdtemp(join(tmpdir(), "fab-mcp-curl-"));
+      const scratch = await mkdtemp(
+        join(tmpdir(), "threenative-asset-mcp-fab-curl-"),
+      );
       const headersPath = join(scratch, "headers.txt");
       const bodyPath = join(scratch, "body.bin");
       try {

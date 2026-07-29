@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/server";
 
 import { FabClient } from "./fab/client.js";
+import { PolyHavenClient } from "./polyhaven/client.js";
 import {
   AssetOutputSchema,
   createGetAssetHandler,
@@ -26,13 +27,36 @@ import {
   DownloadFreeAssetInputSchema,
   DownloadFreeAssetOutputSchema,
 } from "./tools/download-free-asset.js";
+import {
+  createPolyHavenGetAssetHandler,
+  createPolyHavenListCategoriesHandler,
+  createPolyHavenListFilesHandler,
+  createPolyHavenSearchHandler,
+  PolyHavenGetAssetInputSchema,
+  PolyHavenGetAssetOutputSchema,
+  PolyHavenListCategoriesInputSchema,
+  PolyHavenListCategoriesOutputSchema,
+  PolyHavenListFilesInputSchema,
+  PolyHavenListFilesOutputSchema,
+  PolyHavenSearchInputSchema,
+  PolyHavenSearchOutputSchema,
+} from "./tools/polyhaven.js";
 
-export function createFabServer(
-  client: FabClient = new FabClient(),
+export interface AssetServerClients {
+  fab: FabClient;
+  polyhaven: PolyHavenClient;
+}
+
+export function createAssetServer(
+  clients: AssetServerClients = {
+    fab: new FabClient(),
+    polyhaven: new PolyHavenClient(),
+  },
 ): McpServer {
+  const { fab, polyhaven } = clients;
   const server = new McpServer({
-    name: "fab-mcp",
-    version: "0.1.0",
+    name: "threenative-asset-mcp",
+    version: "0.2.0",
   });
 
   server.registerTool(
@@ -50,7 +74,7 @@ export function createFabServer(
         openWorldHint: true,
       },
     },
-    createSearchAssetsHandler(client),
+    createSearchAssetsHandler(fab),
   );
 
   server.registerTool(
@@ -68,7 +92,7 @@ export function createFabServer(
         openWorldHint: true,
       },
     },
-    createGetAssetHandler(client),
+    createGetAssetHandler(fab),
   );
 
   server.registerTool(
@@ -86,7 +110,7 @@ export function createFabServer(
         openWorldHint: true,
       },
     },
-    createListFiltersHandler(client),
+    createListFiltersHandler(fab),
   );
 
   server.registerTool(
@@ -104,7 +128,7 @@ export function createFabServer(
         openWorldHint: true,
       },
     },
-    createListLimitedTimeFreeHandler(client),
+    createListLimitedTimeFreeHandler(fab),
   );
 
   server.registerTool(
@@ -122,16 +146,93 @@ export function createFabServer(
         openWorldHint: true,
       },
     },
-    createDownloadFreeAssetHandler(client),
+    createDownloadFreeAssetHandler(fab),
+  );
+
+  server.registerTool(
+    "polyhaven_search_assets",
+    {
+      title: "Search Poly Haven assets",
+      description:
+        "Search CC0 HDRIs, textures, and models from Poly Haven. Results include explicit Poly Haven attribution.",
+      inputSchema: PolyHavenSearchInputSchema,
+      outputSchema: PolyHavenSearchOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    createPolyHavenSearchHandler(polyhaven),
+  );
+
+  server.registerTool(
+    "polyhaven_get_asset",
+    {
+      title: "Get a Poly Haven asset",
+      description:
+        "Get normalized metadata, authorship, dimensions, and CC0 license information for one Poly Haven asset.",
+      inputSchema: PolyHavenGetAssetInputSchema,
+      outputSchema: PolyHavenGetAssetOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    createPolyHavenGetAssetHandler(polyhaven),
+  );
+
+  server.registerTool(
+    "polyhaven_list_categories",
+    {
+      title: "List Poly Haven categories",
+      description:
+        "List Poly Haven category labels and asset counts for HDRIs, textures, or models.",
+      inputSchema: PolyHavenListCategoriesInputSchema,
+      outputSchema: PolyHavenListCategoriesOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    createPolyHavenListCategoriesHandler(polyhaven),
+  );
+
+  server.registerTool(
+    "polyhaven_list_files",
+    {
+      title: "List Poly Haven asset files",
+      description:
+        "List official download URLs, byte sizes, MD5 hashes, and file dependencies for a Poly Haven asset, with format and resolution filters.",
+      inputSchema: PolyHavenListFilesInputSchema,
+      outputSchema: PolyHavenListFilesOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    createPolyHavenListFilesHandler(polyhaven),
   );
 
   const closeServer = server.close.bind(server);
   server.close = async () => {
-    await Promise.allSettled([closeServer(), client.close()]);
+    await Promise.allSettled([closeServer(), fab.close()]);
   };
   server.server.onclose = () => {
-    void client.close();
+    void fab.close();
   };
 
   return server;
+}
+
+/** @deprecated Use createAssetServer to register every asset provider. */
+export function createFabServer(client: FabClient = new FabClient()): McpServer {
+  return createAssetServer({ fab: client, polyhaven: new PolyHavenClient() });
 }
