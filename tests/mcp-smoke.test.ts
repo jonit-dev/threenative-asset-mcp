@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { once } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -10,6 +11,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { TtlLruCache } from "../src/fab/cache.js";
 import { DirectFabTransport } from "../src/fab/direct-transport.js";
 import { createStderrLogger } from "../src/fab/errors.js";
+
+const packageVersion = (
+  JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
+    version: string;
+  }
+).version;
 
 const children = new Set<ChildProcessWithoutNullStreams>();
 const temporaryDirectories: string[] = [];
@@ -113,7 +120,9 @@ async function startInitializedServer(): Promise<{
     result: {
       serverInfo: {
         name: "threenative-asset-mcp",
-        version: "0.4.0",
+        // Read from the manifest rather than pinned here: the server's advertised version and the
+        // published version are one fact, and a literal in a test is how they came apart.
+        version: packageVersion,
       },
     },
   });

@@ -178,7 +178,7 @@ export function createAssetServer(
   } = clients;
   const server = new McpServer({
     name: "threenative-asset-mcp",
-    version: "0.4.0",
+    version: "0.5.0",
   });
 
   server.registerTool(
