@@ -249,6 +249,8 @@ describe("built stdio package", () => {
       "fab_list_filters",
       "fab_list_limited_time_free",
       "fab_download_free_asset",
+      "asset_import_unreal",
+      "fab_import_asset",
       "polyhaven_search_assets",
       "polyhaven_get_asset",
       "polyhaven_list_categories",

@@ -2,6 +2,18 @@
 
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 
+// `import` is the only argument form this bin accepts. No arguments still starts the stdio MCP
+// server, which is the contract every generated project's .mcp.json depends on.
+if (process.argv[2] === "import") {
+  const { runImportCli } = await import("./cli.js");
+  const result = await runImportCli(process.argv.slice(3), (message) => {
+    process.stderr.write(`${message}\n`);
+  });
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+  process.exit(result.exitCode);
+}
+
 import { AmbientCgClient } from "./ambientcg/client.js";
 import { AudioCatalogClient } from "./audio/client.js";
 import { BundleAssetClient } from "./bundle/client.js";

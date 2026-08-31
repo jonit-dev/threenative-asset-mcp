@@ -132,6 +132,13 @@ import {
   createBundleListAnimationsHandler,
   createBundleListEntriesHandler,
 } from "./tools/bundle.js";
+import {
+  AssetImportUnrealInputSchema,
+  createAssetImportUnrealHandler,
+  createFabImportAssetHandler,
+  FabImportAssetInputSchema,
+  ImportUnrealOutputSchema,
+} from "./tools/import-unreal.js";
 
 export interface AssetServerClients {
   fab: FabClient;
@@ -262,6 +269,42 @@ export function createAssetServer(
       },
     },
     createDownloadFreeAssetHandler(fab),
+  );
+
+  server.registerTool(
+    "asset_import_unreal",
+    {
+      title: "Import a local Unreal asset directory",
+      description:
+        "Convert a local directory of Unreal .uasset files into self-contained source GLBs under a game's assets directory, with reconstructed PBR materials and a provenance report. Works on any already-downloaded Unreal pack, whatever downloaded it.",
+      inputSchema: AssetImportUnrealInputSchema,
+      outputSchema: ImportUnrealOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    createAssetImportUnrealHandler(),
+  );
+
+  server.registerTool(
+    "fab_import_asset",
+    {
+      title: "Import an owned Fab Unreal asset",
+      description:
+        "Download an Unreal asset the signed-in Fab account already owns and convert it to source GLBs in one step. Uses the FabCLI session the user established themselves; it never logs in, claims, or purchases anything.",
+      inputSchema: FabImportAssetInputSchema,
+      outputSchema: ImportUnrealOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    createFabImportAssetHandler(),
   );
 
   server.registerTool(
