@@ -64,6 +64,14 @@ const OutputDirSchema = z
     "Directory the source GLBs are written to, normally <game>/assets/fab/<listing-id>. It must not already hold a different import; this tool never overwrites one.",
   );
 
+const PackagesSchema = z
+  .array(z.string().trim().min(1).max(200))
+  .max(500)
+  .optional()
+  .describe(
+    "Import only these package names, for example [\"SM_Rock\", \"SM_Tree\"]. Omit to convert every static mesh in the pack; a large marketplace pack is many gigabytes of GLBs.",
+  );
+
 const MaxTextureSizeSchema = z.coerce
   .number()
   .int()
@@ -82,12 +90,14 @@ export const AssetImportUnrealInputSchema = z.object({
     .max(4_096)
     .describe("A local directory of Unreal .uasset files, for example an already downloaded Fab pack."),
   outputDir: OutputDirSchema,
+  packages: PackagesSchema,
   maxTextureSize: MaxTextureSizeSchema,
 });
 
 export const FabImportAssetInputSchema = z.object({
   listingIdOrUrl: z.string().trim().min(1).max(500),
   outputDir: OutputDirSchema,
+  packages: PackagesSchema,
   engine: z
     .string()
     .trim()
@@ -215,6 +225,7 @@ export function createAssetImportUnrealHandler(dependencies: ImportUnrealDepende
         sourceDir: resolve(input.sourceDir),
         outputDir,
         maxTextureSize: input.maxTextureSize,
+        onlyPackages: input.packages,
         sourceKind: "local-directory",
         ...(dependencies.environment ? { environment: dependencies.environment } : {}),
         ...(dependencies.log ? { log: dependencies.log } : {}),
@@ -317,6 +328,7 @@ export function createFabImportAssetHandler(dependencies: ImportUnrealDependenci
         listingId,
         engine: input.engine,
         sourceKind: "fab-listing",
+        onlyPackages: input.packages,
         authenticatedDownload: true,
         fabcliVersion: tool.version,
         maxTextureSize: input.maxTextureSize,

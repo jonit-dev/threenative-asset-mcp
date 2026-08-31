@@ -17,6 +17,7 @@ import {
   hashSourceTree,
   ImportError,
   importUnrealDirectory,
+  interleavedBufferViews,
   parseUmodelList,
   summarizeClasses,
   validateGlb,
@@ -451,6 +452,20 @@ describe("importing a local Unreal directory", () => {
     expect(material.getMetallicRoughnessTexture()?.getImage()?.byteLength).toBeGreaterThan(0);
     // UE Viewer's debug colour never survives.
     expect(material.getBaseColorFactor()).toEqual([1, 1, 1, 1]);
+  });
+
+  it("writes separate vertex layout, which the native host requires", async () => {
+    const workspace = await unrealWorkspace();
+    const report = await importUnrealDirectory({
+      sourceDir: workspace.sourceDir,
+      outputDir: workspace.outputDir,
+      environment: workspace.environment,
+      umodel: { name: "umodel", path: workspace.umodel, version: "Test" },
+    });
+    const model = report.models[0];
+    if (!model) throw new Error("expected one model");
+    // An interleaved buffer view renders on the web and fails createRenderPipeline on native.
+    expect(interleavedBufferViews(await readFile(join(workspace.outputDir, model.glb)))).toBe(0);
   });
 
   it("drops UE Viewer's all-zero tangents and its lightmap UV sets", async () => {

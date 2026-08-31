@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { NodeIO } from "@gltf-transform/core";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { FabCli, FabCliError, preferredPlatform } from "../src/fab/fabcli.js";
@@ -341,6 +342,16 @@ describe("Fab import safety", () => {
     });
     const serialized = JSON.stringify(report);
     expect(serialized).not.toMatch(/token|cookie|Bearer|password|secret/i);
+
+    // The entitlement travels inside the GLB, where a game's asset health check reads it.
+    const models = report.models as { glb: string }[];
+    const glb = models[0];
+    if (!glb) throw new Error("expected one model");
+    const document = await new NodeIO().readBinary(
+      new Uint8Array(await readFile(join(test.outputDir, glb.glb))),
+    );
+    expect(document.getRoot().getAsset().copyright).toMatch(/personal, professional/);
+    expect(document.getRoot().getAsset().copyright).toMatch(/threenative-asset-mcp/);
   });
 
   it("reuses an already-downloaded pack instead of fetching it again", async () => {

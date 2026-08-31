@@ -14,6 +14,7 @@ const USAGE = `threenative-asset-mcp import <fab-listing-url-or-uid | local-unre
 
   --out <dir>              Where the source GLBs are written, normally <game>/assets/fab/<listing>.
   --engine <UE_x.y>        Unreal artifact selector for a Fab listing with more than one.
+  --only <a,b,c>           Import only these package names instead of every static mesh.
   --max-texture-size <n>   Longest edge for embedded textures. Omitted keeps Unreal's resolution.
   --json                   Print the machine-readable summary instead of a human one.
 
@@ -31,12 +32,14 @@ function parseFlags(argv: readonly string[]): {
   out: string | undefined;
   engine: string | undefined;
   maxTextureSize: number | undefined;
+  packages: string[] | undefined;
   json: boolean;
 } {
   let target: string | undefined;
   let out: string | undefined;
   let engine: string | undefined;
   let maxTextureSize: number | undefined;
+  let packages: string[] | undefined;
   let json = false;
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
@@ -47,6 +50,11 @@ function parseFlags(argv: readonly string[]): {
     }
     if (argument === "--out" || argument === "-o") {
       out = argv[(index += 1)];
+      continue;
+    }
+    if (argument === "--only") {
+      const raw = argv[(index += 1)];
+      packages = raw === undefined ? undefined : raw.split(",").map((entry) => entry.trim()).filter(Boolean);
       continue;
     }
     if (argument === "--engine") {
@@ -61,7 +69,7 @@ function parseFlags(argv: readonly string[]): {
     if (argument.startsWith("-")) continue;
     target ??= argument;
   }
-  return { target, out, engine, maxTextureSize, json };
+  return { target, out, engine, maxTextureSize, packages, json };
 }
 
 function isFabTarget(target: string): boolean {
@@ -87,12 +95,14 @@ export async function runImportCli(
         outputDir: flags.out,
         ...(flags.engine === undefined ? {} : { engine: flags.engine }),
         ...(flags.maxTextureSize === undefined ? {} : { maxTextureSize: flags.maxTextureSize }),
+        ...(flags.packages === undefined ? {} : { packages: flags.packages }),
         acceptFabEula: true,
       })
     : await (handler as ReturnType<typeof createAssetImportUnrealHandler>)({
         sourceDir: flags.target,
         outputDir: flags.out,
         ...(flags.maxTextureSize === undefined ? {} : { maxTextureSize: flags.maxTextureSize }),
+        ...(flags.packages === undefined ? {} : { packages: flags.packages }),
       });
 
   if ("isError" in result) {

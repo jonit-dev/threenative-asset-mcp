@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
-import { NodeIO, type Material, type Texture } from "@gltf-transform/core";
+import { NodeIO, VertexLayout, type Material, type Texture } from "@gltf-transform/core";
 
 import {
   type MaterialTextureBinding,
@@ -428,6 +428,16 @@ export interface PackagedModel {
  * Reads one UE Viewer glTF, replaces its debug-colour materials with the reconstructed PBR ones,
  * embeds every bound image, and writes a self-contained GLB.
  */
+/**
+ * glTF-Transform interleaves vertex attributes by default. ThreeNative's native host rejects an
+ * interleaved buffer view outright — `createRenderPipeline` fails on every mesh that uses one — so
+ * an interleaved GLB is a source asset that renders on the web and cannot be packaged for desktop
+ * or mobile at all. Separate is the only layout this importer writes.
+ */
+function separateLayoutIO(): NodeIO {
+  return new NodeIO().setVertexLayout(VertexLayout.SEPARATE);
+}
+
 export async function packageGlb(options: {
   readonly gltfPath: string;
   readonly glbPath: string;
@@ -435,10 +445,17 @@ export async function packageGlb(options: {
   readonly maxTextureSize: number | undefined;
   readonly keepAllUvSets: boolean;
   readonly imageCache?: TransformedImageCache;
+  /** Written into the glTF `asset.copyright`, so the entitlement travels with the file. */
+  readonly copyright?: string | undefined;
 }): Promise<PackagedModel> {
-  const io = new NodeIO();
+  const io = separateLayoutIO();
   const document = await io.read(options.gltfPath);
   const root = document.getRoot();
+  // A provenance record that lives only in a sibling report is one `cp` away from being lost.
+  // ThreeNative's own asset health check reads this field, so an imported asset that cannot say
+  // where it came from is reported as unknown rather than quietly assumed fine.
+  // glTF-Transform owns `generator` on write, so the provenance rides in `copyright` alone.
+  if (options.copyright) root.getAsset().copyright = options.copyright;
   const availableTextures = new Set(options.assets.png.keys());
   const sections: ImportedMaterialSection[] = [];
   const cache = new Map<string, Texture>();
@@ -610,6 +627,35 @@ function readMaterialSidecar(path: string): string | undefined {
   }
 }
 
+/**
+ * A buffer view is interleaved when more than one attribute semantic reads from it — the same
+ * definition ThreeNative's own native asset preflight uses. Byte stride alone is not the defect:
+ * a one-attribute view may carry a stride and packages fine.
+ */
+export function interleavedBufferViews(glb: Buffer): number {
+  const json = JSON.parse(
+    glb.subarray(20, 20 + glb.readUInt32LE(12)).toString("utf8"),
+  ) as {
+    accessors?: { bufferView?: number }[];
+    meshes?: { primitives?: { attributes?: Record<string, number> }[] }[];
+  };
+  const semanticsPerView = new Map<number, Set<string>>();
+  for (const mesh of json.meshes ?? []) {
+    for (const primitive of mesh.primitives ?? []) {
+      for (const [semantic, accessorIndex] of Object.entries(primitive.attributes ?? {})) {
+        const view = json.accessors?.[accessorIndex]?.bufferView;
+        if (view === undefined) continue;
+        const seen = semanticsPerView.get(view) ?? new Set<string>();
+        seen.add(semantic);
+        semanticsPerView.set(view, seen);
+      }
+    }
+  }
+  let interleaved = 0;
+  for (const seen of semanticsPerView.values()) if (seen.size > 1) interleaved += 1;
+  return interleaved;
+}
+
 /** Re-reads a written GLB and fails the model when the artifact does not hold up. */
 export async function validateGlb(path: string): Promise<{ bytes: number; sha256: string }> {
   const bytes = await readFile(path);
@@ -622,7 +668,7 @@ export async function validateGlb(path: string): Promise<{ bytes: number; sha256
       `${basename(path)} declares ${bytes.readUInt32LE(8)} bytes but is ${bytes.length}.`,
     );
   }
-  const io = new NodeIO();
+  const io = separateLayoutIO();
   const document = await io.readBinary(new Uint8Array(bytes));
   const root = document.getRoot();
   const meshes = root.listMeshes();
@@ -634,6 +680,13 @@ export async function validateGlb(path: string): Promise<{ bytes: number; sha256
   );
   if (!hasVertices) {
     throw new ImportError("UNREAL_GLB_INVALID", `${basename(path)} contains no vertices.`);
+  }
+  const interleaved = interleavedBufferViews(bytes);
+  if (interleaved > 0) {
+    throw new ImportError(
+      "UNREAL_GLB_INVALID",
+      `${basename(path)} holds ${interleaved} interleaved buffer view${interleaved === 1 ? "" : "s"}; ThreeNative's native host fails createRenderPipeline on every mesh that uses one.`,
+    );
   }
   for (const texture of root.listTextures()) {
     if ((texture.getImage()?.byteLength ?? 0) === 0) {
@@ -868,6 +921,12 @@ export async function importUnrealDirectory(
   await mkdir(promotionParent, { recursive: true });
   const promotion = await mkdtemp(join(promotionParent, ".threenative-import-"));
 
+  // Only a verified entitlement earns a copyright line. A local pack whose licence nobody
+  // checked stays blank so the game's asset health check keeps saying "unknown".
+  const copyright =
+    request.license && request.license.verdict === "allowed"
+      ? `${request.license.slugs.join(", ")} (Fab listing ${request.listingId ?? "unknown"}) via threenative-asset-mcp`
+      : undefined;
   const models: ImportedModel[] = [];
   const imageCache = new TransformedImageCache();
   const transforms: Record<string, number> = {};
@@ -892,6 +951,7 @@ export async function importUnrealDirectory(
           maxTextureSize: request.maxTextureSize,
           keepAllUvSets: false,
           imageCache,
+          copyright,
         });
         prunedUvSets += packaged.prunedUvSets;
         droppedTangents += packaged.droppedTangents;
