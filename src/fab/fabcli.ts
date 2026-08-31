@@ -12,6 +12,7 @@ const ALLOWED_SUBCOMMANDS = Object.freeze([
   "--version",
   "auth status",
   "formats",
+  "library",
   "download",
 ]);
 
@@ -50,6 +51,22 @@ const VersionSchema = z.object({
   fileType: z.string().optional(),
 });
 
+const LibraryEntrySchema = z.object({
+  title: z.string().default(""),
+  description: z.string().default(""),
+  url: z.string().default(""),
+  distributionMethod: z.string().default(""),
+  customAttributes: z
+    .array(z.object({ ListingIdentifier: z.string().optional() }).loose())
+    .default([]),
+  projectVersions: z.array(VersionSchema.loose()).default([]),
+  categories: z.array(z.object({ name: z.string().optional() }).loose()).default([]),
+});
+
+const LibrarySchema = z.object({
+  results: z.array(LibraryEntrySchema.loose()).default([]),
+});
+
 const FormatSchema = z.object({
   assetFormatType: z.object({ code: z.string() }).loose(),
   versions: z.array(VersionSchema).default([]),
@@ -59,6 +76,15 @@ export interface FabAuthStatus {
   readonly authenticated: boolean;
   /** ISO 8601, or undefined when FabCLI did not report one. Never a token. */
   readonly expiresAt: string | undefined;
+}
+
+export interface FabOwnedListing {
+  readonly listingId: string | undefined;
+  readonly title: string;
+  readonly url: string;
+  readonly categories: readonly string[];
+  readonly distributionMethod: string;
+  readonly unrealArtifacts: readonly FabUnrealVersion[];
 }
 
 export interface FabUnrealVersion {
@@ -173,9 +199,12 @@ export class FabCli {
   async #json(args: readonly string[], timeoutMs: number): Promise<unknown> {
     const tool = await this.tool();
     const run = await runBounded(tool.path, args, { timeoutMs });
-    // FabCLI writes its structured failures to stderr and its results to stdout, so a diagnosis
-    // that reads only stdout turns every real error into "produced no output".
-    const text = (run.stdout.trim() || run.stderr.trim()).slice(0, 4_096);
+    // FabCLI writes its results to stdout and some structured failures to stderr, so a diagnosis
+    // that reads only stdout turns every real error into "produced no output". The stdout payload
+    // is never truncated — `library` alone is tens of kilobytes, and clipping it to a diagnostic
+    // length turns a valid answer into "did not return JSON".
+    const payload = run.stdout.trim();
+    const text = payload || run.stderr.trim().slice(0, 4_096);
     if (!text) {
       throw new FabCliError(
         "FABCLI_DOWNLOAD_FAILED",
@@ -251,6 +280,35 @@ export class FabCli {
       }
     }
     return status;
+  }
+
+  /**
+   * Everything the signed-in account owns. Read-only: this is the "what do I already have"
+   * question, and answering it never touches an acquisition endpoint.
+   */
+  async ownedListings(): Promise<readonly FabOwnedListing[]> {
+    const parsed = LibrarySchema.loose().safeParse(await this.#json(["library"], 300_000));
+    if (!parsed.success) {
+      throw new FabCliError(
+        "FABCLI_INCOMPATIBLE",
+        "fabcli library did not match the expected 0.1.x shape.",
+      );
+    }
+    return parsed.data.results.map((entry) => ({
+      listingId: entry.customAttributes.find((attribute) => attribute.ListingIdentifier)
+        ?.ListingIdentifier,
+      title: entry.title || entry.description,
+      url: entry.url,
+      categories: entry.categories.flatMap((category) =>
+        category.name === undefined ? [] : [category.name],
+      ),
+      distributionMethod: entry.distributionMethod,
+      unrealArtifacts: entry.projectVersions.map((version) => ({
+        artifactId: version.artifactId,
+        engineVersions: version.engineVersions,
+        targetPlatforms: version.targetPlatforms,
+      })),
+    }));
   }
 
   /** The Unreal artifact versions this account can download for a listing. */

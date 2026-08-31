@@ -347,3 +347,93 @@ export function createFabImportAssetHandler(dependencies: ImportUnrealDependenci
     }
   };
 }
+
+
+const OwnedListingSchema = z.object({
+  listingId: z.string().max(100).optional(),
+  title: z.string().max(300),
+  url: z.string().max(1_000),
+  categories: z.array(z.string().max(120)).max(20),
+  distributionMethod: z.string().max(60),
+  hasUnrealArtifact: z.boolean(),
+  engineVersions: z.array(z.string().max(20)).max(60),
+});
+
+export const FabListOwnedInputSchema = z.object({
+  query: z
+    .string()
+    .trim()
+    .min(1)
+    .max(200)
+    .optional()
+    .describe("Case-insensitive substring of the title or category. Omit to list everything."),
+  unrealOnly: z
+    .boolean()
+    .default(false)
+    .describe(
+      "Keep only what fab_import_asset can actually take: a listing UID plus a published Unreal artifact. Drops the engine installs and code plugins a library also contains.",
+    ),
+});
+
+export const FabListOwnedOutputSchema = z.object({
+  listings: z.array(OwnedListingSchema).max(500),
+  total: z.number().int().nonnegative(),
+});
+
+/**
+ * What the signed-in Fab account already owns.
+ *
+ * Free assets remain the first place to look — `fab_search_assets` with the default
+ * `priceMode: "free"` — because an asset nobody had to buy is the one a reader of this project can
+ * also fetch. This tool is the second place: a paid listing already in the library costs nothing
+ * further to use and never appears in a free search. It reads the library and nothing else; there
+ * is no acquisition path here.
+ */
+export function createFabListOwnedHandler(dependencies: ImportUnrealDependencies = {}) {
+  const environment = dependencies.environment ?? process.env;
+  const log = dependencies.log ?? (() => {});
+  return async (rawInput: z.input<typeof FabListOwnedInputSchema>) => {
+    try {
+      const input = FabListOwnedInputSchema.parse(rawInput ?? {});
+      const fabCli = dependencies.fabCli ?? new FabCli({ environment, log });
+      await fabCli.requireAuthenticatedSession();
+      const owned = await fabCli.ownedListings();
+      const needle = input.query?.toLowerCase();
+      const matched = owned
+        .filter((entry) => {
+          // A library also holds engine installs and code plugins. They carry no listing UID, or
+          // no Unreal artifact, and the importer can do nothing with either — offering them as
+          // candidates would send an agent down a dead end.
+          if (input.unrealOnly && (entry.listingId === undefined || entry.unrealArtifacts.length === 0)) {
+            return false;
+          }
+          if (needle === undefined) return true;
+          return (
+            entry.title.toLowerCase().includes(needle) ||
+            entry.categories.some((category) => category.toLowerCase().includes(needle))
+          );
+        })
+        .map((entry) => ({
+          ...(entry.listingId === undefined ? {} : { listingId: entry.listingId }),
+          title: entry.title,
+          url: entry.url,
+          categories: entry.categories,
+          distributionMethod: entry.distributionMethod,
+          hasUnrealArtifact: entry.unrealArtifacts.length > 0,
+          engineVersions: [
+            ...new Set(entry.unrealArtifacts.flatMap((artifact) => artifact.engineVersions)),
+          ],
+        }));
+      const output = FabListOwnedOutputSchema.parse({
+        listings: matched.slice(0, 500),
+        total: matched.length,
+      });
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(output) }],
+        structuredContent: output,
+      };
+    } catch (error) {
+      return errorResult(error);
+    }
+  };
+}

@@ -165,6 +165,7 @@ export interface FakeFabCliOptions {
   readonly version?: string;
   readonly authStatus?: unknown;
   readonly formats?: unknown;
+  readonly library?: unknown;
   /** Copied into `--output` when `download` runs. */
   readonly downloadInto?: string;
   readonly downloadExitCode?: number;
@@ -192,6 +193,10 @@ if (argv[0] === "auth" && argv[1] === "status") {
 }
 if (argv[0] === "formats") {
   process.stdout.write(JSON.stringify(options.formats || []) + "\\n");
+  process.exit(0);
+}
+if (argv[0] === "library") {
+  process.stdout.write(JSON.stringify(options.library || { results: [] }) + "\\n");
   process.exit(0);
 }
 if (argv[0] === "download") {

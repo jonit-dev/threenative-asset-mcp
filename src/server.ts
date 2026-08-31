@@ -136,7 +136,10 @@ import {
   AssetImportUnrealInputSchema,
   createAssetImportUnrealHandler,
   createFabImportAssetHandler,
+  createFabListOwnedHandler,
   FabImportAssetInputSchema,
+  FabListOwnedInputSchema,
+  FabListOwnedOutputSchema,
   ImportUnrealOutputSchema,
 } from "./tools/import-unreal.js";
 
@@ -178,7 +181,7 @@ export function createAssetServer(
   } = clients;
   const server = new McpServer({
     name: "threenative-asset-mcp",
-    version: "0.5.0",
+    version: "0.6.0",
   });
 
   server.registerTool(
@@ -269,6 +272,24 @@ export function createAssetServer(
       },
     },
     createDownloadFreeAssetHandler(fab),
+  );
+
+  server.registerTool(
+    "fab_list_owned",
+    {
+      title: "List the Fab assets this account owns",
+      description:
+        "List every listing already in the signed-in Fab library, optionally filtered to the ones that publish an Unreal artifact fab_import_asset can convert. Search free assets first with fab_search_assets; reach for this when you want something already paid for. Read-only — it never claims or purchases.",
+      inputSchema: FabListOwnedInputSchema,
+      outputSchema: FabListOwnedOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    createFabListOwnedHandler(),
   );
 
   server.registerTool(

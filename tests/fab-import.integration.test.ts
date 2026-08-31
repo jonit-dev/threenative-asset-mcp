@@ -9,6 +9,7 @@ import { FabCli, FabCliError, preferredPlatform } from "../src/fab/fabcli.js";
 import { classifyLicenses } from "../src/fab/license.js";
 import {
   createFabImportAssetHandler,
+  createFabListOwnedHandler,
   requirePermittedLicense,
 } from "../src/tools/import-unreal.js";
 import { writeFakeFabCli, writeFakeUmodel, writeMeshFixture } from "./helpers/unreal-fixture.js";
@@ -45,6 +46,7 @@ const UNREAL_FORMAT = [
 
 interface Harness {
   readonly handler: ReturnType<typeof createFabImportAssetHandler>;
+  readonly environment: NodeJS.ProcessEnv;
   readonly outputDir: string;
   readonly argvLog: string;
   readonly root: string;
@@ -59,6 +61,7 @@ async function harness(options: {
   readonly requirePlatform?: boolean;
   readonly licenses?: readonly string[];
   readonly licenseError?: boolean;
+  readonly library?: unknown;
   readonly umodelClasses?: Readonly<Record<string, readonly string[]>>;
 } = {}): Promise<Harness> {
   const root = await temporaryDirectory();
@@ -92,6 +95,7 @@ async function harness(options: {
     authStatus: options.authStatus ?? { authenticated: true, expires_at: "2099-01-01T00:00:00Z" },
     formats: options.formats ?? UNREAL_FORMAT,
     downloadInto: join(root, "pack-source"),
+    ...(options.library === undefined ? {} : { library: options.library }),
     ...(options.downloadExitCode === undefined
       ? {}
       : { downloadExitCode: options.downloadExitCode }),
@@ -111,6 +115,7 @@ async function harness(options: {
   return {
     root,
     argvLog,
+    environment,
     outputDir: join(root, "game", "assets", "fab", LISTING),
     handler: createFabImportAssetHandler({
       environment,
@@ -245,6 +250,7 @@ describe("Fab import safety", () => {
       "--version",
       "auth status",
       "formats",
+      "library",
       "download",
     ]);
   });
@@ -365,5 +371,110 @@ describe("Fab import safety", () => {
     await test.handler({ ...input, outputDir: join(test.outputDir, "second") });
     const downloads = (await test.invocations()).filter((argv) => argv[0] === "download");
     expect(downloads).toHaveLength(1);
+  });
+});
+
+
+const LIBRARY = {
+  results: [
+    {
+      title: "Soul: Cave",
+      description: "Soul: Cave",
+      url: `https://www.fab.com/listings/${LISTING}`,
+      distributionMethod: "ASSET_PACK",
+      customAttributes: [{ ListingIdentifier: LISTING }],
+      categories: [{ name: "Fantasy" }],
+      projectVersions: [
+        { artifactId: "SoulCave418", engineVersions: ["UE_4.18"], targetPlatforms: ["Windows"] },
+      ],
+    },
+    {
+      title: "Unreal Engine",
+      description: "Unreal Engine",
+      url: "",
+      distributionMethod: "ENGINE",
+      customAttributes: [],
+      categories: [],
+      projectVersions: [],
+    },
+    {
+      title: "Quixel Bridge",
+      description: "Quixel Bridge",
+      url: "",
+      distributionMethod: "CODE_PLUGIN",
+      customAttributes: [],
+      categories: [{ name: "Unreal Engine" }],
+      projectVersions: [
+        { artifactId: "Bridge", engineVersions: ["UE_5.4"], targetPlatforms: ["Windows"] },
+      ],
+    },
+  ],
+};
+
+describe("listing what the account already owns", () => {
+  it("returns owned listings with the UID fab_import_asset takes", async () => {
+    const test = await harness({ library: LIBRARY });
+    const handler = createFabListOwnedHandler({ environment: test.environment });
+    const result = await handler({});
+    if ("isError" in result) throw new Error(JSON.stringify(errorOf(result)));
+    expect(result.structuredContent.total).toBe(3);
+    expect(result.structuredContent.listings[0]).toMatchObject({
+      listingId: LISTING,
+      title: "Soul: Cave",
+      hasUnrealArtifact: true,
+      engineVersions: ["UE_4.18"],
+    });
+  });
+
+  it("drops the engine installs and plugins the importer cannot take", async () => {
+    const test = await harness({ library: LIBRARY });
+    const handler = createFabListOwnedHandler({ environment: test.environment });
+    const result = await handler({ unrealOnly: true });
+    if ("isError" in result) throw new Error(JSON.stringify(errorOf(result)));
+    expect(result.structuredContent.listings.map((entry) => entry.title)).toEqual(["Soul: Cave"]);
+  });
+
+  it("filters by title or category without touching the network again", async () => {
+    const test = await harness({ library: LIBRARY });
+    const handler = createFabListOwnedHandler({ environment: test.environment });
+    const byCategory = await handler({ query: "fantasy" });
+    if ("isError" in byCategory) throw new Error(JSON.stringify(errorOf(byCategory)));
+    expect(byCategory.structuredContent.total).toBe(1);
+    const noMatch = await handler({ query: "spaceship" });
+    if ("isError" in noMatch) throw new Error(JSON.stringify(errorOf(noMatch)));
+    expect(noMatch.structuredContent.total).toBe(0);
+  });
+
+  it("refuses to list anything without a session, and never acquires", async () => {
+    const test = await harness({ authStatus: { authenticated: false }, library: LIBRARY });
+    const handler = createFabListOwnedHandler({ environment: test.environment });
+    const result = await handler({});
+    expect(errorOf(result).code).toBe("FABCLI_UNAUTHENTICATED");
+    const verbs = (await test.invocations()).map((argv) => argv[0]);
+    expect(verbs).not.toContain("library");
+    expect(verbs).not.toContain("claim");
+  });
+
+  it("does not truncate a library larger than a diagnostic message", async () => {
+    // A real library is tens of kilobytes. Clipping stdout to an error-sized slice turned a valid
+    // answer into "did not return JSON".
+    const many = {
+      results: Array.from({ length: 120 }, (_, index) => ({
+        title: `Pack ${index} ${"x".repeat(200)}`,
+        description: "",
+        url: "",
+        distributionMethod: "ASSET_PACK",
+        customAttributes: [{ ListingIdentifier: LISTING }],
+        categories: [],
+        projectVersions: [
+          { artifactId: `A${index}`, engineVersions: ["UE_5.4"], targetPlatforms: ["Windows"] },
+        ],
+      })),
+    };
+    const test = await harness({ library: many });
+    const handler = createFabListOwnedHandler({ environment: test.environment });
+    const result = await handler({ unrealOnly: true });
+    if ("isError" in result) throw new Error(JSON.stringify(errorOf(result)));
+    expect(result.structuredContent.total).toBe(120);
   });
 });
