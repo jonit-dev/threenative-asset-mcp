@@ -7,9 +7,16 @@ import {
   type ExternalTool,
   ToolchainError,
   assertSupportedHost,
+  childEnvironment,
   resolveExecutable,
   runBounded,
 } from "./toolchain.js";
+import {
+  CUE4PARSE_PATCH,
+  CUE4PARSE_PROGRAM,
+  CUE4PARSE_PROJECT,
+  CUE4PARSE_SOURCE,
+} from "./cue4parse-adapter.js";
 
 /**
  * The two external executables install themselves on first use. The PRD that specified this flow
@@ -56,6 +63,12 @@ export const FABCLI_RELEASE = Object.freeze({
   linux: "fabcli-v0.1.0-linux64.tar.gz",
   windows: "fabcli-v0.1.0-windows64.zip",
   sums: "SHA256SUMS.txt",
+});
+
+/** GPL-3.0-or-later command-line converter, always executed out-of-process. */
+export const UNCOOKED_CONVERTER = Object.freeze({
+  package: "unreal-assets-to-glb==4.27.2.0",
+  version: "4.27.2.0+threenative.6",
 });
 
 export interface ProvisionLog {
@@ -267,8 +280,775 @@ export async function provisionFabcli(
   }
 }
 
+async function pythonExecutable(environment: NodeJS.ProcessEnv): Promise<string> {
+  const safeEnvironment = childEnvironment(environment);
+  for (const candidate of process.platform === "win32" ? ["python", "py"] : ["python3", "python"]) {
+    try {
+      const run = await runBounded(candidate, ["--version"], { timeoutMs: 30_000, environment: safeEnvironment });
+      if (run.code === 0 && /Python 3\.(?:1\d|[89])/.test(`${run.stdout}${run.stderr}`)) return candidate;
+    } catch {
+      // Try the next conventional executable name.
+    }
+  }
+  throw new ToolchainError(
+    "UNREAL_TOOL_UNUSABLE",
+    "Converting uncooked Unreal editor meshes requires Python 3.10 or newer; no usable Python 3 executable was found.",
+  );
+}
+
+function replaceRequired(source: string, before: string, after: string, label: string): string {
+  if (!source.includes(before)) {
+    if (source.includes(after)) return source;
+    throw new ToolchainError(
+      "UNREAL_TOOL_UNUSABLE",
+      `The pinned uncooked converter no longer matches the verified ${label} patch.`,
+    );
+  }
+  return source.replace(before, after);
+}
+
+/**
+ * Installs the GPL converter in its own virtual environment and applies narrow compatibility
+ * fixes to that external program. The fixes preserve uncooked-package PersistentGuid fields,
+ * preserve numbered FNames (M_Wood_2), and make --skip-textures actually skip its multi-gigabyte
+ * pixel cache. A fourth patch exposes its existing level parser as bounded JSON instead of starting
+ * a preview web server. The fifth patch merges serialized Blueprint component templates into
+ * placed level instances; it does not execute Blueprint bytecode. A sixth patch decodes bounded
+ * UE4 ISM/HISM/foliage matrix arrays for standards-based GPU instancing. A seventh patch decodes
+ * editor LandscapeComponent heightmaps from their package-relative bulk payloads. No converter
+ * code is linked into this Node package.
+ */
+export async function provisionUncookedConverter(
+  environment: NodeJS.ProcessEnv = process.env,
+  log: ProvisionLog = silent,
+): Promise<string> {
+  assertSupportedHost();
+  const cache = join(toolchainCacheDir(environment), "uncooked");
+  const venv = join(cache, "venv");
+  const executable = join(
+    venv,
+    process.platform === "win32" ? "Scripts/unreal-assets-to-glb.exe" : "bin/unreal-assets-to-glb",
+  );
+  const python = await pythonExecutable(environment);
+  const safeEnvironment = childEnvironment(environment);
+  // Python console scripts embed the interpreter's absolute path in their shebang, so a venv
+  // cannot be built in /tmp and renamed. Build at its final path and remove it on any failure.
+  await rm(venv, { recursive: true, force: true });
+  await mkdir(cache, { recursive: true });
+  try {
+    log(`Installing uncooked Unreal converter ${UNCOOKED_CONVERTER.package}…`);
+    const create = await runBounded(python, ["-m", "venv", venv], {
+      timeoutMs: 300_000,
+      environment: safeEnvironment,
+    });
+    if (create.code !== 0) {
+      throw new ToolchainError("UNREAL_TOOL_UNUSABLE", "Python could not create the converter virtual environment.");
+    }
+    const stagedPython = join(venv, process.platform === "win32" ? "Scripts/python.exe" : "bin/python");
+    const install = await runBounded(
+      stagedPython,
+      ["-m", "pip", "install", "--disable-pip-version-check", UNCOOKED_CONVERTER.package],
+      { timeoutMs: 900_000, maxOutputBytes: 32 * 1024 * 1024, environment: safeEnvironment },
+    );
+    if (install.code !== 0) {
+      throw new ToolchainError(
+        "UNREAL_TOOL_UNUSABLE",
+        `Installing ${UNCOOKED_CONVERTER.package} failed (pip exit ${install.code}).`,
+        true,
+      );
+    }
+    const locate = await runBounded(
+      stagedPython,
+      ["-c", "import pathlib,uasset; print(pathlib.Path(uasset.__file__).parent)"],
+      { timeoutMs: 30_000, environment: safeEnvironment },
+    );
+    const moduleDir = locate.stdout.trim();
+    if (locate.code !== 0 || !moduleDir) {
+      throw new ToolchainError("UNREAL_TOOL_UNUSABLE", "The installed converter package could not be located.");
+    }
+
+    const packagePath = join(moduleDir, "package.py");
+    let packageSource = (await readFile(packagePath, "utf8")).replace(/\r\n/g, "\n");
+    packageSource = replaceRequired(
+      packageSource,
+      `        # 24. PersistentGuid (ObjectVersion >= VER_UE4_ADDED_PACKAGE_OWNER) - SKIPPED for cooked packages\n        # 25. OwnerPersistentGuid (VER_UE4_ADDED_PACKAGE_OWNER <= ObjectVersion < VER_UE4_NON_OUTER_PACKAGE_IMPORT) - SKIPPED for cooked packages\n        # Note: These editor-only fields may not be present in some packages`,
+      `        # 24. PersistentGuid exists when editor-only data was not filtered.\n        if (self.package_flags & 0x80000000) == 0 and self.file_version_ue4 >= VER_UE4_ADDED_PACKAGE_OWNER:\n            r.skip(16)\n\n        # 25. OwnerPersistentGuid existed for one package-version window.\n        if ((self.package_flags & 0x80000000) == 0 and\n                VER_UE4_ADDED_PACKAGE_OWNER <= self.file_version_ue4 < VER_UE4_NON_OUTER_PACKAGE_IMPORT):\n            r.skip(16)`,
+      "uncooked package-header",
+    );
+    packageSource = replaceRequired(
+      packageSource,
+      `            entry.object_name = self.name_map[on_idx] if 0 <= on_idx < len(self.name_map) else f"#{on_idx}"\n\n            if has_package_name:`,
+      `            entry.object_name = self.name_map[on_idx] if 0 <= on_idx < len(self.name_map) else f"#{on_idx}"\n            if _on_num > 0:\n                entry.object_name += f"_{_on_num - 1}"\n\n            if has_package_name:`,
+      "numbered import FName",
+    );
+    packageSource = replaceRequired(
+      packageSource,
+      `            entry.object_name = self.name_map[on_idx] if 0 <= on_idx < len(self.name_map) else f"#{on_idx}"\n\n            entry.object_flags`,
+      `            entry.object_name = self.name_map[on_idx] if 0 <= on_idx < len(self.name_map) else f"#{on_idx}"\n            if _on_num > 0:\n                entry.object_name += f"_{_on_num - 1}"\n\n            entry.object_flags`,
+      "numbered export FName",
+    );
+    await writeFile(packagePath, packageSource);
+
+    const cliPath = join(moduleDir, "cli.py");
+    let cliSource = (await readFile(cliPath, "utf8")).replace(/\r\n/g, "\n");
+    cliSource = replaceRequired(
+      cliSource,
+      `    base_color_textures = [(fp, n) for fp, n in textures]  # export ALL textures`,
+      `    base_color_textures = [] if skip_textures else [(fp, n) for fp, n in textures]`,
+      "skip-textures",
+    );
+    cliSource = replaceRequired(
+      cliSource,
+      `def find_umap_path(input_dir, umap_filename):`,
+      `def export_scene_jsons(input_dir, output_dir):
+    """Write bounded, non-interactive level data for the Node importer."""
+    import math
+    import struct
+    from uasset.umap import (
+        parse_level, _read_export_properties, _get_vector, _get_rotator,
+        _make_ue_transform, _decompose_ue_transform, resolve_package_index,
+    )
+    os.makedirs(output_dir, exist_ok=True)
+    component_types = {
+        "SceneComponent", "StaticMeshComponent", "DirectionalLightComponent",
+        "PointLightComponent", "SpotLightComponent", "RectLightComponent",
+    }
+    content_component_types = component_types - {"SceneComponent"}
+
+    def component_key(name):
+        suffix = "_GEN_VARIABLE"
+        return name[:-len(suffix)] if name.endswith(suffix) else name
+
+    def is_instanced_component(class_name):
+        return str(class_name).endswith("InstancedStaticMeshComponent")
+
+    def serialized_properties_end(pkg, export_index):
+        """Find the end of tagged UObject properties without trusting optional UE5 offsets."""
+        entry = pkg.exports[export_index]
+        data = pkg.get_export_data(export_index)
+        if data is None:
+            return 0
+        if entry.script_serialization_start_offset > 0:
+            data.seek(entry.script_serialization_start_offset)
+            read_properties(data, pkg.name_map, pkg.file_version_ue5)
+            return data.position()
+        expected = entry.script_serialization_end_offset if entry.script_serialization_end_offset > 0 else None
+        best_count, best_end = -1, 0
+        for offset in range(min(len(data.data), 256)):
+            data.seek(offset)
+            try:
+                parsed = read_properties(data, pkg.name_map, pkg.file_version_ue5)
+                end = data.position()
+            except Exception:
+                continue
+            if expected is not None and abs(end - expected) <= 8:
+                return end
+            if len(parsed) > best_count:
+                best_count, best_end = len(parsed), end
+        return best_end
+
+    def read_instance_matrices(pkg, export_index, props):
+        """Decode UE4's native BulkSerialize array of 64-byte FMatrix records."""
+        import struct
+        import math
+        import numpy as np
+        data_reader = pkg.get_export_data(export_index)
+        if data_reader is None:
+            return []
+        data = data_reader.data
+        start = serialized_properties_end(pkg, export_index)
+        expected = props.get("NumBuiltInstances", props.get("InstanceCountToRender", 0))
+        expected = expected if isinstance(expected, int) and 0 < expected <= 1000000 else 0
+        candidates = []
+        for offset in range(start, min(len(data) - 8, start + 4096)):
+            element_size, count = struct.unpack_from("<ii", data, offset)
+            if element_size != 64 or count <= 0 or count > 1000000:
+                continue
+            if expected and count != expected:
+                continue
+            end = offset + 8 + count * element_size
+            if end > len(data):
+                continue
+            first = struct.unpack_from("<16f", data, offset + 8)
+            last = struct.unpack_from("<16f", data, end - element_size)
+            def matrix_is_affine(values):
+                return (all(math.isfinite(value) and abs(value) < 1.0e12 for value in values)
+                        and abs(values[3]) < 1.0e-4 and abs(values[7]) < 1.0e-4
+                        and abs(values[11]) < 1.0e-4 and abs(values[15] - 1.0) < 1.0e-4)
+            if matrix_is_affine(first) and matrix_is_affine(last):
+                candidates.append((offset, count))
+        if len(candidates) != 1:
+            return []
+        offset, count = candidates[0]
+        matrices = []
+        for index in range(count):
+            values = struct.unpack_from("<16f", data, offset + 8 + index * 64)
+            if not all(math.isfinite(value) and abs(value) < 1.0e12 for value in values):
+                return []
+            # UE FMatrix is row-major with translation in row 3; math helpers use column vectors.
+            matrices.append(np.array(values, dtype=float).reshape((4, 4)).T)
+        return matrices
+
+    def read_landscape_texture(pkg, export_index):
+        """Decode mip 0 from an embedded uncooked UE4 TSF_BGRA8 texture export."""
+        import struct
+        from uasset.reader import BinaryReader
+        from uasset.uncooked_texture import decompress_texture_bulk
+        props = _read_export_properties(pkg, export_index)
+        source_blob = props.get("Source")
+        if not isinstance(source_blob, bytes):
+            return None
+        try:
+            source = read_properties(BinaryReader(source_blob), pkg.name_map, pkg.file_version_ue5)
+            width, height = int(source.get("SizeX", 0)), int(source.get("SizeY", 0))
+            mip_count = int(source.get("NumMips", 1))
+        except Exception:
+            return None
+        if width <= 0 or height <= 0 or width > 16384 or height > 16384 or mip_count <= 0:
+            return None
+        expected = sum(max(1, width >> mip) * max(1, height >> mip) * 4
+                       for mip in range(min(mip_count, 32)))
+        export_data = pkg.get_export_data(export_index)
+        if export_data is None:
+            return None
+        data = export_data.data
+        start = serialized_properties_end(pkg, export_index)
+        candidates = []
+        for offset in range(start, min(len(data) - 19, start + 96)):
+            flags = struct.unpack_from("<I", data, offset)[0]
+            size_64 = bool(flags & (1 << 13))
+            try:
+                if size_64:
+                    count, size_on_disk, payload_offset = struct.unpack_from("<qqq", data, offset + 4)
+                    header_end = offset + 28
+                else:
+                    count, size_on_disk, payload_offset = struct.unpack_from("<iiq", data, offset + 4)
+                    header_end = offset + 20
+            except struct.error:
+                continue
+            if count != expected or size_on_disk <= 0 or size_on_disk > len(pkg.reader.data):
+                continue
+            if flags & 1:
+                absolute = int(payload_offset) + int(pkg.bulk_data_start_offset)
+            else:
+                absolute = header_end
+            if absolute < 0 or absolute + size_on_disk > len(pkg.reader.data):
+                continue
+            candidates.append((flags, absolute, int(size_on_disk)))
+        if len(candidates) != 1:
+            return None
+        flags, absolute, size_on_disk = candidates[0]
+        blob = pkg.reader.data[absolute:absolute + size_on_disk]
+        pixels = decompress_texture_bulk(blob) if flags & 2 else blob
+        if pixels is None or len(pixels) < width * height * 4:
+            return None
+        return width, height, pixels[:width * height * 4]
+
+    # Compiled Blueprint component defaults live in the Blueprint package, while placed map
+    # components usually serialize only overrides. Index them by generated class and component.
+    blueprint_templates = {}
+    uassets, _ = find_uasset_files(input_dir)
+    for asset_path in sorted(uassets):
+        try:
+            blueprint_pkg = Package(asset_path)
+            for class_index, class_export in enumerate(blueprint_pkg.exports):
+                if blueprint_pkg.get_export_class_name(class_index) != "BlueprintGeneratedClass":
+                    continue
+                components = {}
+                for component_index, component_export in enumerate(blueprint_pkg.exports):
+                    class_name = blueprint_pkg.get_export_class_name(component_index)
+                    if component_export.outer_index != class_index + 1 or class_name not in component_types:
+                        continue
+                    props = _read_export_properties(blueprint_pkg, component_index)
+                    mesh_name = ""
+                    mesh_ref = props.get("StaticMesh")
+                    if class_name == "StaticMeshComponent" and isinstance(mesh_ref, int):
+                        mesh_name = resolve_package_index(blueprint_pkg, mesh_ref)
+                    components[component_key(component_export.object_name)] = {
+                        "className": class_name,
+                        "meshName": mesh_name,
+                        "props": props,
+                    }
+                if components:
+                    blueprint_templates[class_export.object_name] = components
+        except Exception:
+            continue
+
+    _, umaps = find_uasset_files(input_dir)
+    written = 0
+    for umap_path in sorted(umaps):
+        level = parse_level(umap_path)
+        pkg = Package(umap_path)
+        def vec(value):
+            return {"x": float(value[0]), "y": float(value[1]), "z": float(value[2])}
+        def rot(value):
+            return {"pitch": float(value[0]), "yaw": float(value[1]), "roll": float(value[2])}
+        lights = []
+        light_types = {
+            "DirectionalLightComponent": "directional",
+            "PointLightComponent": "point",
+            "SpotLightComponent": "spot",
+            "RectLightComponent": "rect",
+        }
+        for export_index, export in enumerate(pkg.exports):
+            class_name = pkg.get_export_class_name(export_index)
+            light_type = light_types.get(class_name)
+            if light_type is None:
+                continue
+            props = _read_export_properties(pkg, export_index)
+            # A Blueprint instance stores inherited values in its component template. Those are
+            # handled separately; a component with no intensity here is not a complete light.
+            if "Intensity" not in props:
+                continue
+            actor_name = export.object_name
+            if export.outer_index > 0 and export.outer_index <= len(pkg.exports):
+                actor_index = export.outer_index - 1
+                actor = pkg.exports[actor_index]
+                actor_props = _read_export_properties(pkg, actor_index)
+                actor_name = actor_props.get("ActorLabel", actor.object_name)
+            color = props.get("LightColor", {})
+            if isinstance(color, dict):
+                channels = [color.get(key, 255) for key in ("r", "g", "b")]
+                if max(channels) > 1:
+                    channels = [float(channel) / 255.0 for channel in channels]
+                else:
+                    channels = [float(channel) for channel in channels]
+            else:
+                channels = [1.0, 1.0, 1.0]
+            lights.append({
+                "name": str(actor_name) + "/" + str(export.object_name),
+                "type": light_type,
+                "location": vec(_get_vector(props, "RelativeLocation", (0.0, 0.0, 0.0))),
+                "rotation": rot(_get_rotator(props, "RelativeRotation", (0.0, 0.0, 0.0))),
+                "color": channels,
+                "intensity": float(props.get("Intensity", 1.0)),
+                "range": float(props.get("AttenuationRadius", 0.0)) * 0.01,
+                "innerConeAngle": float(props.get("InnerConeAngle", 0.0)),
+                "outerConeAngle": float(props.get("OuterConeAngle", 44.0)),
+                "temperature": float(props.get("Temperature", 6500.0)),
+                "useTemperature": bool(props.get("bUseTemperature", False)),
+                "sourceWidth": float(props.get("SourceWidth", 0.0)) * 0.01,
+                "sourceHeight": float(props.get("SourceHeight", 0.0)) * 0.01,
+            })
+        scene_actors = [{
+            "name": str(actor.name),
+            "meshName": str(actor.mesh_name),
+            "location": vec(actor.world_location),
+            "rotation": rot(actor.world_rotation),
+            "scale": vec(actor.world_scale),
+            "parent": str(actor.parent),
+        } for actor in level.actors]
+        instance_groups = []
+        all_components = {}
+        for component_index, component_export in enumerate(pkg.exports):
+            class_name = pkg.get_export_class_name(component_index)
+            if not (str(class_name).endswith("Component") or is_instanced_component(class_name)):
+                continue
+            all_components[component_index] = _read_export_properties(pkg, component_index)
+
+        all_world_cache = {}
+        def all_component_world(component_index, visiting=None):
+            if component_index in all_world_cache:
+                return all_world_cache[component_index]
+            props = all_components.get(component_index)
+            if props is None:
+                return _make_ue_transform((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+            visiting = set() if visiting is None else visiting
+            if component_index in visiting:
+                return _make_ue_transform((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+            visiting.add(component_index)
+            local = _make_ue_transform(
+                _get_vector(props, "RelativeLocation", (0.0, 0.0, 0.0)),
+                _get_rotator(props, "RelativeRotation", (0.0, 0.0, 0.0)),
+                _get_vector(props, "RelativeScale3D", (1.0, 1.0, 1.0)),
+            )
+            parent_ref = props.get("AttachParent", 0)
+            parent_index = parent_ref - 1 if isinstance(parent_ref, int) and parent_ref > 0 else -1
+            world = all_component_world(parent_index, visiting) @ local if parent_index in all_components else local
+            all_world_cache[component_index] = world
+            visiting.remove(component_index)
+            return world
+
+        for component_index, component_export in enumerate(pkg.exports):
+            class_name = pkg.get_export_class_name(component_index)
+            if not is_instanced_component(class_name):
+                continue
+            props = all_components.get(component_index, {})
+            matrices = read_instance_matrices(pkg, component_index, props)
+            mesh_ref = props.get("StaticMesh")
+            mesh_name = resolve_package_index(pkg, mesh_ref) if isinstance(mesh_ref, int) else ""
+            if not matrices or not mesh_name:
+                continue
+            actor_name = str(component_export.object_name)
+            if component_export.outer_index > 0 and component_export.outer_index <= len(pkg.exports):
+                actor_export = pkg.exports[component_export.outer_index - 1]
+                actor_props = _read_export_properties(pkg, component_export.outer_index - 1)
+                actor_name = str(actor_props.get("ActorLabel", actor_export.object_name))
+            component_transform = all_component_world(component_index)
+            transforms = []
+            for local_matrix in matrices:
+                location, rotation, scale = _decompose_ue_transform(component_transform @ local_matrix)
+                transforms.append({
+                    "location": vec(location),
+                    "rotation": rot(rotation),
+                    "scale": vec(scale),
+                })
+            instance_groups.append({
+                "name": actor_name + "/" + str(component_export.object_name),
+                "meshName": str(mesh_name),
+                "transforms": transforms,
+                "parent": actor_name,
+                "sourceClass": str(class_name),
+            })
+        landscapes = []
+        landscape_actor_props = {}
+        for actor_index, actor_export in enumerate(pkg.exports):
+            if pkg.get_export_class_name(actor_index) in ("Landscape", "LandscapeStreamingProxy"):
+                landscape_actor_props[actor_index] = _read_export_properties(pkg, actor_index)
+        for component_index, component_export in enumerate(pkg.exports):
+            if pkg.get_export_class_name(component_index) != "LandscapeComponent":
+                continue
+            props = all_components.get(component_index, {})
+            heightmap_ref = props.get("HeightmapTexture")
+            if not isinstance(heightmap_ref, int) or heightmap_ref <= 0:
+                continue
+            texture_index = heightmap_ref - 1
+            if texture_index >= len(pkg.exports) or pkg.get_export_class_name(texture_index) != "Texture2D":
+                continue
+            decoded = read_landscape_texture(pkg, texture_index)
+            if decoded is None:
+                continue
+            width, height, pixels = decoded
+            size_quads = int(props.get("ComponentSizeQuads", 0))
+            subsection_quads = int(props.get("SubsectionSizeQuads", 0))
+            num_subsections = int(props.get("NumSubsections", 0))
+            if (size_quads <= 0 or size_quads > 8192 or subsection_quads <= 0
+                    or num_subsections <= 0 or size_quads != subsection_quads * num_subsections):
+                continue
+            scale_bias = props.get("HeightmapScaleBias")
+            if not isinstance(scale_bias, bytes) or len(scale_bias) < 16:
+                continue
+            _, _, bias_x, bias_y = struct.unpack_from("<4f", scale_bias)
+            offset_x = round(bias_x * width)
+            offset_y = round(bias_y * height)
+            side = size_quads + 1
+            heights, normals = [], []
+            valid = True
+            for y in range(side):
+                sub_y, local_y = ((0, 0) if y == 0 else ((y - 1) // subsection_quads, (y - 1) % subsection_quads + 1))
+                tex_y = offset_y + sub_y * (subsection_quads + 1) + local_y
+                for x in range(side):
+                    sub_x, local_x = ((0, 0) if x == 0 else ((x - 1) // subsection_quads, (x - 1) % subsection_quads + 1))
+                    tex_x = offset_x + sub_x * (subsection_quads + 1) + local_x
+                    if tex_x < 0 or tex_y < 0 or tex_x >= width or tex_y >= height:
+                        valid = False
+                        break
+                    pixel = (tex_y * width + tex_x) * 4
+                    blue, green, red, alpha = pixels[pixel:pixel + 4]
+                    heights.append(((red << 8) | green) - 32768.0)
+                    heights[-1] /= 128.0
+                    normal_x = 2.0 * blue / 255.0 - 1.0
+                    normal_y = 2.0 * alpha / 255.0 - 1.0
+                    normal_z = math.sqrt(max(0.0, 1.0 - normal_x * normal_x - normal_y * normal_y))
+                    normals.extend((normal_x, normal_y, normal_z))
+                if not valid:
+                    break
+            if not valid or len(heights) != side * side:
+                continue
+            location, rotation, scale = _decompose_ue_transform(all_component_world(component_index))
+            owner_index = component_export.outer_index - 1 if component_export.outer_index > 0 else -1
+            owner_props = landscape_actor_props.get(owner_index, {})
+            material_ref = props.get("OverrideMaterial", owner_props.get("LandscapeMaterial"))
+            material_name = resolve_package_index(pkg, material_ref) if isinstance(material_ref, int) else ""
+            actor_name = str(owner_props.get("ActorLabel", pkg.exports[owner_index].object_name
+                             if 0 <= owner_index < len(pkg.exports) else "Landscape"))
+            landscapes.append({
+                "name": actor_name + "/" + str(component_export.object_name),
+                "materialName": str(material_name or "Landscape_Default"),
+                "location": vec(location),
+                "rotation": rot(rotation),
+                "scale": vec(scale),
+                "sizeQuads": size_quads,
+                "heights": heights,
+                "normals": normals,
+            })
+        blueprint_component_count = 0
+
+        for actor_index, actor_export in enumerate(pkg.exports):
+            templates = blueprint_templates.get(pkg.get_export_class_name(actor_index))
+            if not templates:
+                continue
+            actor_props = _read_export_properties(pkg, actor_index)
+            actor_name = str(actor_props.get("ActorLabel", actor_export.object_name))
+            components = {
+                index: export for index, export in enumerate(pkg.exports)
+                if export.outer_index == actor_index + 1
+                and pkg.get_export_class_name(index) in component_types
+            }
+            merged = {}
+            for component_index, component_export in components.items():
+                instance_props = _read_export_properties(pkg, component_index)
+                template = templates.get(component_key(component_export.object_name), {})
+                props = dict(template.get("props", {}))
+                props.update(instance_props)
+                merged[component_index] = (template, props, instance_props)
+
+            world_cache = {}
+            def component_world(component_index, visiting=None):
+                if component_index in world_cache:
+                    return world_cache[component_index]
+                visiting = set() if visiting is None else visiting
+                if component_index in visiting:
+                    return _make_ue_transform((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+                visiting.add(component_index)
+                _, props, _ = merged[component_index]
+                local = _make_ue_transform(
+                    _get_vector(props, "RelativeLocation", (0.0, 0.0, 0.0)),
+                    _get_rotator(props, "RelativeRotation", (0.0, 0.0, 0.0)),
+                    _get_vector(props, "RelativeScale3D", (1.0, 1.0, 1.0)),
+                )
+                parent_ref = props.get("AttachParent", 0)
+                parent_index = parent_ref - 1 if isinstance(parent_ref, int) and parent_ref > 0 else -1
+                world = component_world(parent_index, visiting) @ local if parent_index in merged else local
+                world_cache[component_index] = world
+                visiting.remove(component_index)
+                return world
+
+            for component_index, component_export in components.items():
+                template, props, instance_props = merged[component_index]
+                class_name = pkg.get_export_class_name(component_index)
+                if class_name not in content_component_types:
+                    continue
+                location, rotation, scale = _decompose_ue_transform(component_world(component_index))
+                component_name = actor_name + "/" + str(component_export.object_name)
+                if class_name == "StaticMeshComponent":
+                    mesh_name = template.get("meshName", "")
+                    # A template FPackageIndex belongs to the Blueprint package's import table.
+                    # Resolve only an actual map override against the map package here.
+                    mesh_ref = instance_props.get("StaticMesh")
+                    if isinstance(mesh_ref, int):
+                        mesh_name = resolve_package_index(pkg, mesh_ref) or mesh_name
+                    if mesh_name:
+                        scene_actors.append({
+                            "name": component_name,
+                            "meshName": str(mesh_name),
+                            "location": vec(location),
+                            "rotation": rot(rotation),
+                            "scale": vec(scale),
+                            "parent": actor_name,
+                        })
+                        blueprint_component_count += 1
+                    continue
+                light_type = light_types.get(class_name)
+                if light_type is None or "Intensity" not in props:
+                    continue
+                color = props.get("LightColor", {})
+                if isinstance(color, dict):
+                    channels = [color.get(key, 255) for key in ("r", "g", "b")]
+                    channels = ([float(channel) / 255.0 for channel in channels]
+                                if max(channels) > 1 else [float(channel) for channel in channels])
+                else:
+                    channels = [1.0, 1.0, 1.0]
+                lights.append({
+                    "name": component_name,
+                    "type": light_type,
+                    "location": vec(location),
+                    "rotation": rot(rotation),
+                    "color": channels,
+                    "intensity": float(props.get("Intensity", 1.0)),
+                    "range": float(props.get("AttenuationRadius", 0.0)) * 0.01,
+                    "innerConeAngle": float(props.get("InnerConeAngle", 0.0)),
+                    "outerConeAngle": float(props.get("OuterConeAngle", 44.0)),
+                    "temperature": float(props.get("Temperature", 6500.0)),
+                    "useTemperature": bool(props.get("bUseTemperature", False)),
+                    "sourceWidth": float(props.get("SourceWidth", 0.0)) * 0.01,
+                    "sourceHeight": float(props.get("SourceHeight", 0.0)) * 0.01,
+                })
+                blueprint_component_count += 1
+        payload = {
+            "format": "threenative-unreal-scene-source",
+            "version": 1,
+            "mapName": level.map_name,
+            "sourceFile": os.path.relpath(umap_path, input_dir).replace(os.sep, "/"),
+            "actors": scene_actors,
+            "instanceGroups": instance_groups,
+            "landscapes": landscapes,
+            "lights": lights,
+            "blueprintComponents": blueprint_component_count,
+            "camera": {
+                "hasCamera": bool(level.has_camera),
+                "location": vec(level.camera_location),
+                "rotation": rot(level.camera_rotation),
+            },
+        }
+        target = os.path.join(output_dir, level.map_name + ".scene-source.json")
+        with open(target, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        written += 1
+    print(f"Scene manifests: {written}")
+    return written
+
+
+def find_umap_path(input_dir, umap_filename):`,
+      "scene-json exporter",
+    );
+    cliSource = replaceRequired(
+      cliSource,
+      `    parser.add_argument(
+        '--filter', metavar='SUBSTRING', dest='mesh_filter',
+        help='Only export meshes whose name contains this substring (case-insensitive)'
+    )`,
+      `    parser.add_argument(
+        '--filter', metavar='SUBSTRING', dest='mesh_filter',
+        help='Only export meshes whose name contains this substring (case-insensitive)'
+    )
+    parser.add_argument(
+        '--scene-json-dir', metavar='DIR',
+        help='Write parsed .umap actors/lights/blueprint components/gpu instances/landscapes as JSON without starting the preview server'
+    )`,
+      "scene-json argument",
+    );
+    cliSource = replaceRequired(
+      cliSource,
+      `    else:
+        print("Skipping export (using existing Export/ directory)")
+
+    # Preview if requested`,
+      `    else:
+        print("Skipping export (using existing Export/ directory)")
+
+    if args.scene_json_dir:
+        export_scene_jsons(input_dir, os.path.abspath(args.scene_json_dir))
+
+    # Preview if requested`,
+      "scene-json invocation",
+    );
+    await writeFile(cliPath, cliSource);
+
+    const meshPath = join(moduleDir, "mesh.py");
+    let meshSource = (await readFile(meshPath, "utf8")).replace(/\r\n/g, "\n");
+    meshSource = replaceRequired(
+      meshSource,
+      `        mat = Material()\n        mat.pbrMetallicRoughness = PbrMetallicRoughness()`,
+      `        mat = Material()\n        if mesh.material_slots:\n            slot_idx = (mesh.section_info_map[mat_idx]\n                        if mesh.section_info_map and mat_idx < len(mesh.section_info_map)\n                        else mat_idx)\n            if slot_idx < len(mesh.material_slots):\n                mat.name = mesh.material_slots[slot_idx][1]\n        mat.pbrMetallicRoughness = PbrMetallicRoughness()`,
+      "material names",
+    );
+    await writeFile(meshPath, meshSource);
+
+    if (!(await canRun(executable, ["--help"], /gpu instances\/landscapes/))) {
+      throw new ToolchainError("UNREAL_TOOL_UNUSABLE", "The patched uncooked converter does not run.");
+    }
+    log(`Installed uncooked Unreal converter at ${executable}`);
+    return executable;
+  } catch (error) {
+    await rm(venv, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+const DOTNET_SDK_VERSION = "10.0.400";
+
+async function ensureDotnetSdk(
+  environment: NodeJS.ProcessEnv,
+  cache: string,
+  log: ProvisionLog,
+): Promise<string> {
+  const safeEnvironment = childEnvironment(environment);
+  try {
+    const run = await runBounded("dotnet", ["--version"], { timeoutMs: 30_000, environment: safeEnvironment });
+    if (run.code === 0 && /^10\./.test(run.stdout.trim())) return "dotnet";
+  } catch {
+    // Install the pinned SDK below.
+  }
+  const sdkRoot = join(cache, "dotnet");
+  const executable = join(sdkRoot, process.platform === "win32" ? "dotnet.exe" : "dotnet");
+  if (await canRun(executable, ["--version"], /^10\./m)) return executable;
+  await mkdir(sdkRoot, { recursive: true });
+  log(`Installing .NET SDK ${DOTNET_SDK_VERSION} for the modern Unreal decoder…`);
+  const installer = join(cache, process.platform === "win32" ? "dotnet-install.ps1" : "dotnet-install.sh");
+  await fetchToFile(
+    process.platform === "win32"
+      ? "https://dot.net/v1/dotnet-install.ps1"
+      : "https://dot.net/v1/dotnet-install.sh",
+    installer,
+  );
+  if (process.platform !== "win32") await chmod(installer, 0o755);
+  const install = process.platform === "win32"
+    ? await runBounded("powershell", ["-NoProfile", "-File", installer, "-Version", DOTNET_SDK_VERSION, "-InstallDir", sdkRoot], {
+        timeoutMs: 900_000,
+        maxOutputBytes: 32 * 1024 * 1024,
+        environment: safeEnvironment,
+      })
+    : await runBounded(installer, ["--version", DOTNET_SDK_VERSION, "--install-dir", sdkRoot, "--no-path"], {
+        timeoutMs: 900_000,
+        maxOutputBytes: 32 * 1024 * 1024,
+        environment: safeEnvironment,
+      });
+  if (install.code !== 0 || !(await canRun(executable, ["--version"], /^10\./m))) {
+    throw new ToolchainError("UNREAL_TOOL_UNUSABLE", `Installing .NET SDK ${DOTNET_SDK_VERSION} failed.`);
+  }
+  return executable;
+}
+
+/** Builds the pinned CUE4Parse adapter as a self-contained process; Unreal Engine is not needed. */
+export async function provisionModernConverter(
+  environment: NodeJS.ProcessEnv = process.env,
+  log: ProvisionLog = silent,
+): Promise<string> {
+  assertSupportedHost();
+  const cache = join(toolchainCacheDir(environment), "modern");
+  const bin = join(cache, "bin");
+  const executable = join(bin, process.platform === "win32" ? "ThreeNativeConverter.exe" : "ThreeNativeConverter");
+  await mkdir(cache, { recursive: true });
+  const dotnet = await ensureDotnetSdk(environment, cache, log);
+  const source = join(cache, "source");
+  await rm(source, { recursive: true, force: true });
+  await mkdir(source, { recursive: true });
+  try {
+    log(`Building modern Unreal decoder ${CUE4PARSE_SOURCE.version} (one time, ~3 minutes)…`);
+    const safeEnvironment = childEnvironment(environment);
+    for (const args of [
+      ["init"],
+      ["remote", "add", "origin", CUE4PARSE_SOURCE.repository],
+      ["fetch", "--depth", "1", "origin", CUE4PARSE_SOURCE.commit],
+      ["checkout", "--detach", "FETCH_HEAD"],
+    ]) {
+      const run = await runBounded("git", args, { cwd: source, timeoutMs: 600_000, environment: safeEnvironment });
+      if (run.code !== 0) throw new ToolchainError("UNREAL_TOOL_UNUSABLE", "The pinned CUE4Parse source could not be fetched.", true);
+    }
+    const patchPath = join(source, "threenative-skeletal.patch");
+    await writeFile(patchPath, CUE4PARSE_PATCH);
+    const applied = await runBounded("git", ["apply", "--check", patchPath], { cwd: source, timeoutMs: 30_000, environment: safeEnvironment });
+    if (applied.code !== 0) throw new ToolchainError("UNREAL_TOOL_UNUSABLE", "The pinned CUE4Parse source did not match the verified skeletal decoder patch.");
+    const apply = await runBounded("git", ["apply", patchPath], { cwd: source, timeoutMs: 30_000, environment: safeEnvironment });
+    if (apply.code !== 0) throw new ToolchainError("UNREAL_TOOL_UNUSABLE", "Applying the verified CUE4Parse skeletal decoder patch failed.");
+    const adapter = join(source, "ThreeNativeConverter");
+    await mkdir(adapter, { recursive: true });
+    const project = join(adapter, "ThreeNativeConverter.csproj");
+    await writeFile(project, CUE4PARSE_PROJECT);
+    await writeFile(join(adapter, "Program.cs"), CUE4PARSE_PROGRAM);
+    await rm(bin, { recursive: true, force: true });
+    const runtime = process.platform === "win32"
+      ? process.arch === "arm64" ? "win-arm64" : "win-x64"
+      : process.arch === "arm64" ? "linux-arm64" : "linux-x64";
+    const publish = await runBounded(dotnet, ["publish", project, "-c", "Release", "-r", runtime, "--self-contained", "true", "-o", bin], {
+      timeoutMs: 1_800_000,
+      maxOutputBytes: 64 * 1024 * 1024,
+      environment: safeEnvironment,
+    });
+    if (publish.code !== 0 || !(await canRun(executable, ["--version"], new RegExp(CUE4PARSE_SOURCE.version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))))) {
+      throw new ToolchainError("UNREAL_TOOL_UNUSABLE", "The modern Unreal decoder could not be built from the pinned source.");
+    }
+    log(`Installed modern Unreal decoder at ${executable}`);
+    return executable;
+  } catch (error) {
+    await rm(bin, { recursive: true, force: true });
+    throw error;
+  }
+}
+
 async function resolveOrProvision(
-  name: "umodel" | "fabcli",
+  name: "umodel" | "fabcli" | "uncooked" | "modern",
   environment: NodeJS.ProcessEnv,
   log: ProvisionLog,
 ): Promise<string> {
@@ -276,18 +1056,34 @@ async function resolveOrProvision(
     return await resolveExecutable(name, environment);
   } catch (error) {
     if (!(error instanceof ToolchainError) || error.code !== "UNREAL_TOOL_NOT_FOUND") throw error;
-    const cached = join(
-      toolchainCacheDir(environment),
-      name,
-      process.platform === "win32" ? `${name}.exe` : name,
-    );
-    const marker = name === "umodel" ? /UE Viewer/i : /fabcli/i;
-    const probe = name === "umodel" ? ["-version"] : ["--version"];
+    const cached = name === "uncooked"
+      ? join(
+          toolchainCacheDir(environment),
+          "uncooked",
+          "venv",
+          process.platform === "win32" ? "Scripts/unreal-assets-to-glb.exe" : "bin/unreal-assets-to-glb",
+        )
+      : name === "modern"
+        ? join(toolchainCacheDir(environment), "modern", "bin", process.platform === "win32" ? "ThreeNativeConverter.exe" : "ThreeNativeConverter")
+        : join(
+          toolchainCacheDir(environment),
+          name,
+          process.platform === "win32" ? `${name}.exe` : name,
+        );
+    const marker = name === "umodel"
+      ? /UE Viewer/i
+      : name === "fabcli"
+        ? /fabcli/i
+        : name === "modern"
+          ? new RegExp(CUE4PARSE_SOURCE.version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+          : /gpu instances\/landscapes/;
+    const probe = name === "umodel" ? ["-version"] : name === "fabcli" ? ["--version"] : name === "modern" ? ["--version"] : ["--help"];
     if (await canRun(cached, probe, marker)) return cached;
     if (!autoInstallEnabled(environment)) throw error;
-    return name === "umodel"
-      ? await provisionUmodel(environment, log)
-      : await provisionFabcli(environment, log);
+    if (name === "umodel") return await provisionUmodel(environment, log);
+    if (name === "fabcli") return await provisionFabcli(environment, log);
+    if (name === "modern") return await provisionModernConverter(environment, log);
+    return await provisionUncookedConverter(environment, log);
   }
 }
 
@@ -331,4 +1127,31 @@ export async function ensureFabcli(
     );
   }
   return { name: "fabcli", path, version: text.split("\n")[0]?.trim() ?? "fabcli" };
+}
+
+/** Uncooked UE4.26/4.27 MeshDescription converter, isolated as an external GPL process. */
+export async function ensureUncookedConverter(
+  environment: NodeJS.ProcessEnv = process.env,
+  log: ProvisionLog = silent,
+): Promise<ExternalTool> {
+  assertSupportedHost();
+  const path = await resolveOrProvision("uncooked", environment, log);
+  const run = await runBounded(path, ["--help"], { timeoutMs: 30_000 });
+  if (!/UE 4\.27 UAsset Parser/.test(`${run.stdout}${run.stderr}`) || !/gpu instances\/landscapes/.test(`${run.stdout}${run.stderr}`)) {
+    throw new ToolchainError("UNREAL_TOOL_UNUSABLE", `"${path}" is not the expected uncooked Unreal converter.`);
+  }
+  return { name: "uncooked", path, version: UNCOOKED_CONVERTER.version };
+}
+
+export async function ensureModernConverter(
+  environment: NodeJS.ProcessEnv = process.env,
+  log: ProvisionLog = silent,
+): Promise<ExternalTool> {
+  assertSupportedHost();
+  const path = await resolveOrProvision("modern", environment, log);
+  const run = await runBounded(path, ["--version"], { timeoutMs: 30_000 });
+  if (!`${run.stdout}${run.stderr}`.includes(CUE4PARSE_SOURCE.version)) {
+    throw new ToolchainError("UNREAL_TOOL_UNUSABLE", `"${path}" is not the expected modern Unreal converter.`);
+  }
+  return { name: "modern", path, version: CUE4PARSE_SOURCE.version };
 }

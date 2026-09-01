@@ -41,6 +41,77 @@ export async function writePng(
   );
 }
 
+/** Writes a small valid mono PCM WAV without relying on ffmpeg or browser APIs. */
+export async function writeWavFixture(path: string, sampleRate = 8_000, samples = 800): Promise<void> {
+  const dataBytes = samples * 2;
+  const wav = Buffer.alloc(44 + dataBytes);
+  wav.write("RIFF", 0, "ascii");
+  wav.writeUInt32LE(36 + dataBytes, 4);
+  wav.write("WAVEfmt ", 8, "ascii");
+  wav.writeUInt32LE(16, 16);
+  wav.writeUInt16LE(1, 20);
+  wav.writeUInt16LE(1, 22);
+  wav.writeUInt32LE(sampleRate, 24);
+  wav.writeUInt32LE(sampleRate * 2, 28);
+  wav.writeUInt16LE(2, 32);
+  wav.writeUInt16LE(16, 34);
+  wav.write("data", 36, "ascii");
+  wav.writeUInt32LE(dataBytes, 40);
+  await writeFile(path, wav);
+}
+
+function writeActorXName(target: Buffer, offset: number, value: string): void {
+  target.write(value, offset, Math.min(Buffer.byteLength(value), 63), "utf8");
+}
+
+function actorXChunk(id: string, dataSize: number, records: readonly Buffer[]): Buffer {
+  const header = Buffer.alloc(32);
+  writeActorXName(header, 0, id);
+  header.writeUInt32LE(20_100_422, 20);
+  header.writeInt32LE(dataSize, 24);
+  header.writeInt32LE(records.length, 28);
+  return Buffer.concat([header, ...records]);
+}
+
+/** Writes a minimal real ActorX PSA clip, matching the bytes UE Viewer's `-psk` exporter emits. */
+export async function writePsaFixture(
+  path: string,
+  options: { readonly animation?: string; readonly bone?: string } = {},
+): Promise<void> {
+  const boneName = options.bone ?? "root";
+  const bone = Buffer.alloc(120);
+  writeActorXName(bone, 0, boneName);
+  bone.writeInt32LE(-1, 72);
+  bone.writeFloatLE(1, 88);
+
+  const info = Buffer.alloc(168);
+  writeActorXName(info, 0, options.animation ?? "Wave");
+  writeActorXName(info, 64, "None");
+  info.writeInt32LE(1, 128);
+  info.writeInt32LE(2, 140);
+  info.writeFloatLE(2, 148);
+  info.writeFloatLE(30, 152);
+  info.writeInt32LE(0, 160);
+  info.writeInt32LE(2, 164);
+
+  const key = (x: number): Buffer => {
+    const record = Buffer.alloc(32);
+    record.writeFloatLE(x, 0);
+    record.writeFloatLE(1, 24);
+    record.writeFloatLE(1 / 30, 28);
+    return record;
+  };
+  await writeFile(
+    path,
+    Buffer.concat([
+      actorXChunk("ANIMHEAD", 0, []),
+      actorXChunk("BONENAMES", 120, [bone]),
+      actorXChunk("ANIMINFO", 168, [info]),
+      actorXChunk("ANIMKEYS", 32, [key(0), key(100)]),
+    ]),
+  );
+}
+
 export async function writeMeshFixture(
   directory: string,
   options: MeshFixtureOptions,
@@ -115,6 +186,8 @@ export interface FakeUmodelOptions {
   readonly outputSubdirectory?: string;
   /** Truncates every copied `.bin`, so the glTF reader meets a corrupt buffer. */
   readonly corruptBuffer?: boolean;
+  /** Package basenames UE Viewer recognizes but intentionally emits no files for. */
+  readonly emptyExports?: readonly string[];
 }
 
 export async function writeFakeUmodel(
@@ -124,7 +197,7 @@ export async function writeFakeUmodel(
   const script = `#!/usr/bin/env node
 "use strict";
 const fs = require("node:fs");
-const { join } = require("node:path");
+const { basename, join } = require("node:path");
 const argv = process.argv.slice(2);
 const options = ${JSON.stringify(options)};
 if (options.argvLog) fs.appendFileSync(options.argvLog, JSON.stringify(argv) + "\\n");
@@ -132,7 +205,8 @@ if (argv.includes("-version")) {
   process.stdout.write("UE Viewer (UModel)\\nCompiled ${options.version ?? "Test 2026 (build 1)"}\\n");
   process.exit(0);
 }
-const target = argv.filter((entry) => !entry.startsWith("-")).pop();
+const selector = argv.filter((entry) => !entry.startsWith("-")).pop();
+const target = basename(selector || "").replace(/\.(uasset|umap)$/i, "");
 if (argv.includes("-list")) {
   const classes = options.classes[target] || [];
   process.stdout.write("Found 1 game files (0 skipped) in 1 folders\\n");
@@ -143,6 +217,7 @@ if (argv.includes("-list")) {
 }
 if (argv.includes("-export")) {
   if (options.exportExitCode) process.exit(options.exportExitCode);
+  if ((options.emptyExports || []).includes(target)) process.exit(0);
   if (!options.exportFrom) process.exit(0);
   const out = (argv.find((entry) => entry.indexOf("-out=") === 0) || "").slice("-out=".length);
   const destination = join(out, options.outputSubdirectory || "Group/Package");

@@ -131,6 +131,11 @@ Fab:
   the dedicated download directory after explicit Fab EULA acknowledgement. It
   refuses purchase, acquisition, library-only, ambiguous, and unsafe-path
   flows.
+- `asset_import_unreal` — converts an already-downloaded Unreal directory to
+  self-contained GLBs plus `import-report.json`; Unreal Engine is not required.
+- `fab_import_asset` — downloads an owned listing through the user's existing
+  FabCLI session, then runs the same Unreal importer. It never signs in, claims,
+  or purchases an asset.
 
 Poly Haven:
 
@@ -247,6 +252,133 @@ dedicated local directories and never purchase, add to cart or library,
 wishlist, sign in, or overwrite an existing download. Audio packs remain
 subject to their source license; raw redistribution is not implied by download.
 
+## Unreal import support
+
+The importer writes the same GLB/report layout for cooked and uncooked inputs.
+It auto-provisions UE Viewer for package metadata, textures, and cooked render
+data. For uncooked UE4 editor meshes it also provisions the separate GPL-3.0+
+`unreal-assets-to-glb` CLI in an isolated Python virtual environment and invokes
+it out of process. Modern UE5 packages rejected by UE Viewer use a pinned,
+out-of-process CUE4Parse adapter. Set `THREENATIVE_TOOLCHAIN_AUTOINSTALL=0` to
+require manually installed tools instead.
+
+| Input | Current result |
+| --- | --- |
+| Cooked loose UE4 static meshes and textures | GLB geometry, LOD sections, embedded textures, and common PBR reconstruction |
+| Cooked loose UE4 skeletal meshes and standalone animation packages | Standard skinned GLB; joints, weights, inverse-bind matrices, and existing clips are preserved; ActorX PSA clips are attached by case-insensitive bone name when at least 80% of tracks match, without duplicating an existing clip name |
+| Uncooked UE4 `FMeshDescription` static meshes (object versions 517–522) | GLB geometry with centimetres converted to metres; verified on Fab Office Pack Vol.1 (47/47 meshes) |
+| Standalone `Texture2D` packages | Collision-free source-relative PNGs under `textures/`; duplicate Unreal basenames are exported independently instead of overwriting one another |
+| `TextureCube` environment maps | Collision-free 2:1 equirectangular PNG or lossless Radiance HDR files under `cubemaps/`; CUE4Parse decodes cooked faces, while editor `TSF_BGRE8` source art retains its lighting range without Unreal Engine |
+| `Texture2DArray`, `TextureCubeArray`, and `VolumeTexture` | Collision-free RGBA8 slice data plus JSON dimensions under `textures3d/`; use `DataArrayTexture` for arrays and `Data3DTexture` for volumes. Cube-array faces remain ordered in groups of six for custom shaders. Floating-point/HDR stacks are rejected rather than reduced to RGBA8 |
+| Standalone `Material` and `MaterialInstanceConstant` packages | One directly loadable `Materials/UnrealMaterialLibrary.glb`; each source-relative swatch name is collision-free, follows parent instances, embeds resolved texture inputs, and applies common base-color/emissive vectors plus roughness/metallic/opacity scalars |
+| Standalone `SoundWave` packages | Collision-free WAV/Ogg/MP3/FLAC files under `audio/`; modern UE5 editor source WAVs and cooked formats exposed by CUE4Parse feed the same report path, verified through Three.js `AudioLoader` |
+| Runtime `Font` and inline `FontFace` packages | Validated TTF/OTF faces under collision-free `fonts/` paths; direct SFNT and legacy multi-block zlib `FontBulkData` are supported without Unreal Engine, with family/style/weight metadata for the browser `FontFace` API |
+| Offline `Font` packages | Pre-baked glyph pages and serialized `FontCharacter` rectangles become collision-safe atlas PNGs plus BMFont-compatible JSON under `bitmap-fonts/`; Unicode remaps, baseline metrics, kerning, page indices, and distance-field metadata are retained for Three.js bitmap/SDF text |
+| Paper2D `PaperSprite` and `PaperFlipbook` packages | Each sprite becomes a self-contained, unlit GLB with exact baked triangles and a cropped atlas region; flipbooks become JSON manifests preserving FPS and per-frame run lengths. Verified in Three.js on a real UE5.2 Paper2D project without Unreal Engine |
+| Paper2D `PaperTileSet` and `PaperTileMap` packages | Populated layers become indexed, unlit GLB quads with atlas UVs, empty cells omitted, layer order retained, and packed horizontal/vertical/diagonal tile flips decoded. Placed tile maps and inherited Blueprint flipbook components are reconstructed in modern UE5 levels |
+| Paper2D grouped sprites and `TextRenderActor` | Grouped sprite instances become `EXT_mesh_gpu_instancing` batches over shared sprite GLBs; text becomes unlit glyph geometry from offline `UFont` atlas pages, preserving alignment, colour, world size, and placement |
+| `DataTable`, `StringTable`, `CurveTable`, and float/vector/colour curves | Collision-free, directly fetchable JSON under `data/`; row names, typed fields, localized strings, asset references, and rich-curve keys/tangents are retained |
+| Modern UE5 loose static meshes, skeletal meshes, `Texture2D`, Material, and `.umap` packages rejected by UE Viewer | CUE4Parse converts directly to the same output/report pipeline; verified with UE5.5 cooked static geometry, UE5 editor skeletal geometry, Oodle-compressed UE5.3 editor texture source art, and a UE5.2 Paper2D map. Cooked packages using unversioned properties require one matching `.usmap` file beside the imported tree |
+| Separate roughness/metalness, solid palette maps, glass, and mirrors | Packed glTF PBR maps or explicit material fallbacks; extra graph inputs remain named sidecars |
+| UE4 `.umap` placement, direct lights, and serialized Blueprint component templates (object versions 517–522) | Directly loadable scene GLB plus a transform/source manifest; repeated actors instance shared meshes; inherited mesh/light defaults are merged into placed instances; directional, point, and spot lights use `KHR_lights_punctual` |
+| Standalone modern UE5 Blueprint prefabs | Serialized static/skeletal mesh and light component defaults become directly loadable scene GLBs; referenced meshes, transforms, skins, and bone hierarchies are retained, while bytecode is explicitly reported and never executed |
+| UE4 ISM/HISM and painted static-mesh foliage placement | Bulk-serialized instance matrices become `EXT_mesh_gpu_instancing`, which Three.js `GLTFLoader` loads as GPU-instanced meshes |
+| UE4 editor `LandscapeComponent` heightfields | Package-relative compressed BGRA8 heightmaps become indexed terrain meshes with decoded normals, component transforms, and original material names |
+| ActorX per-frame bone scale, dynamic Blueprint bytecode/construction scripts, Paper Terrain/spline deformation, and Nanite-only data without a fallback mesh | Detected or reported honestly; scene-level omissions are listed in `scenes[].omittedActors`, and Blueprint bytecode is never executed by the importer |
+| Arbitrary Unreal shader graphs | Common PBR inputs become standard glTF materials; graph inputs with no glTF counterpart remain named in the report instead of being silently discarded |
+| Encrypted Pak/IoStore | Unsupported without user-supplied keys and archive extraction; never reported as a complete conversion |
+
+Automatic uncooked conversion needs Python 3 with `venv` and `pip`. A Linux
+source build fallback for UE Viewer additionally needs `git`, `g++`, `perl`,
+zlib, and SDL2 development headers. Unreal import currently runs on Linux and
+Windows; use the path overrides below for preinstalled executables.
+
+Load a reconstructed level with the normal Three.js loader — no Unreal runtime
+or custom `.uasset` loader is involved:
+
+```js
+new GLTFLoader().load("assets/fab/<listing>/Scenes/DemoMap.glb", ({ scene }) => {
+  threeScene.add(scene);
+});
+```
+
+Standalone materials use that same loader. Find a swatch by the report's
+`materialAssets[].libraryName`, then assign its standard Three.js material:
+
+```js
+new GLTFLoader().load("assets/fab/<listing>/Materials/UnrealMaterialLibrary.glb", ({ scene }) => {
+  const swatch = scene.getObjectByName(materialAsset.libraryName);
+  targetMesh.material = swatch.material;
+});
+```
+
+Sound waves use Three.js directly as well:
+
+```js
+const buffer = await new THREE.AudioLoader().loadAsync(audioAsset.file);
+sound.setBuffer(buffer);
+```
+
+Structured data is ordinary runtime JSON — no Unreal object loader is needed:
+
+```js
+const table = await fetch(dataAsset.json).then((response) => response.json());
+const defaultAmmo = table.Rows.Default;
+```
+
+Fonts can back Three.js canvas textures or text libraries that accept web fonts:
+
+```js
+const face = new FontFace(font.family, `url(${font.file})`, {
+  style: font.fontStyle,
+  weight: String(font.weight),
+});
+await face.load();
+document.fonts.add(face);
+// Draw with this family on a canvas, then pass the canvas to THREE.CanvasTexture.
+```
+
+Paper2D flipbooks reference ordinary GLBs. Select a frame using the manifest's
+`frameRun` and `framesPerSecond`, then show its loaded scene:
+
+```js
+const flipbook = await fetch(report.flipbooks[0].manifest).then((response) => response.json());
+const frames = await Promise.all(flipbook.frames.map((frame) => loader.loadAsync(frame.glb)));
+const tick = Math.floor(elapsedSeconds * flipbook.framesPerSecond) % flipbook.frameCount;
+let end = 0;
+frames.forEach(({ scene }, index) => {
+  end += flipbook.frames[index].frameRun;
+  scene.visible = tick < end && tick >= end - flipbook.frames[index].frameRun;
+});
+```
+
+Cubemaps use the standard Three.js equirectangular environment path:
+
+```js
+const loader = cubemapAsset.dynamicRange === "hdr" ? new RGBELoader() : new THREE.TextureLoader();
+const environment = await loader.loadAsync(cubemapAsset.file);
+environment.mapping = THREE.EquirectangularReflectionMapping;
+threeScene.environment = environment;
+```
+
+Multidimensional textures use the report's explicit Three.js type:
+
+```js
+const metadata = await fetch(textureStack.manifest).then((response) => response.json());
+const bytes = new Uint8Array(await fetch(textureStack.data).then((response) => response.arrayBuffer()));
+const texture = metadata.threeTexture === "Data3DTexture"
+  ? new THREE.Data3DTexture(bytes, metadata.width, metadata.height, metadata.depth)
+  : new THREE.DataArrayTexture(bytes, metadata.width, metadata.height, metadata.depth);
+texture.format = THREE.RGBAFormat;
+texture.type = THREE.UnsignedByteType;
+texture.needsUpdate = true;
+```
+
+Installation-only Unreal `BasicShapes/Plane` references are generated locally
+when the asset pack does not contain that mesh. Rectangular area lights are
+preserved in scene metadata and approximated as punctual point lights because
+glTF's standard punctual-light extension has no area-light type.
+
 ## Configuration
 
 | Variable                        | Default                                            | Purpose                                                  |
@@ -270,6 +402,11 @@ subject to their source license; raw redistribution is not implied by download.
 | `ASSET_DOWNLOAD_DIR`            | `~/Downloads/threenative-asset-mcp/assets`         | Dedicated directory for direct provider downloads.       |
 | `ASSET_MAX_DOWNLOAD_BYTES`      | `10737418240`                                      | Maximum accepted bytes per provider file (10 GiB).       |
 | `ASSET_DOWNLOAD_TIMEOUT_MS`     | `1800000`                                          | Total timeout for one provider download (30 minutes).    |
+| `THREENATIVE_TOOLCHAIN_AUTOINSTALL` | `1`                                            | Set to `0` to disable first-use external-tool installs.  |
+| `THREENATIVE_TOOLCHAIN_DIR`     | OS cache under `threenative-asset-mcp/toolchain`   | UE Viewer, FabCLI, and uncooked-converter cache.          |
+| `THREENATIVE_UMODEL_PATH`       | auto-detected/provisioned                           | Absolute path to a UE Viewer executable override.        |
+| `THREENATIVE_UNCOOKED_CONVERTER_PATH` | auto-detected/provisioned                     | Absolute path to `unreal-assets-to-glb`.                  |
+| `THREENATIVE_FABCLI_PATH`       | auto-detected/provisioned                           | Absolute path to FabCLI; login remains user-controlled.  |
 
 Direct requests are spaced at least `FAB_MIN_REQUEST_INTERVAL_MS` apart. Only
 HTTP 429, 502, 503, and 504 are retried, at most twice, with backoff and

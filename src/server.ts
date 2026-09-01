@@ -181,7 +181,7 @@ export function createAssetServer(
   } = clients;
   const server = new McpServer({
     name: "threenative-asset-mcp",
-    version: "0.6.0",
+    version: "0.7.0",
   });
 
   server.registerTool(
@@ -297,7 +297,7 @@ export function createAssetServer(
     {
       title: "Import a local Unreal asset directory",
       description:
-        "Convert a local directory of Unreal .uasset files into self-contained source GLBs under a game's assets directory, with reconstructed PBR materials and a provenance report. Works on any already-downloaded Unreal pack, whatever downloaded it.",
+        "Convert a local directory of Unreal .uasset/.umap files into self-contained model and scene GLBs under a game's assets directory, with reconstructed PBR materials, actor transforms, and a provenance report. Works on any already-downloaded Unreal pack, whatever downloaded it.",
       inputSchema: AssetImportUnrealInputSchema,
       outputSchema: ImportUnrealOutputSchema,
       annotations: {

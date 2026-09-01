@@ -31,14 +31,18 @@ export type TextureTransform =
   /** A gloss/specular-power map in red: roughness is its inverse. */
   | "specPowerToRoughness"
   /** A roughness map already in red: moved to glTF's green channel. */
-  | "redToRoughness";
+  | "redToRoughness"
+  /** Separate red-channel roughness and metalness maps packed into glTF G and B. */
+  | "redRoughnessRedMetalness";
 
-export type BindingSource = "mat" | "props" | "filename";
+export type BindingSource = "mat" | "props" | "filename" | "texture-set";
 export type BindingConfidence = "exact" | "heuristic";
 
 export interface MaterialTextureBinding {
   readonly slot: GltfSlot;
   readonly texture: string;
+  /** Second image used only by transforms that combine separate Unreal maps. */
+  readonly secondaryTexture?: string;
   readonly source: BindingSource;
   readonly confidence: BindingConfidence;
   readonly transform: TextureTransform;
@@ -56,6 +60,10 @@ export interface ResolvedMaterial {
   readonly alphaMode: "OPAQUE" | "MASK" | "BLEND";
   readonly alphaCutoff: number | undefined;
   readonly doubleSided: boolean;
+  readonly baseColorFactor: readonly [number, number, number, number] | undefined;
+  readonly emissiveFactor: readonly [number, number, number] | undefined;
+  readonly metallicFactor: number | undefined;
+  readonly roughnessFactor: number | undefined;
   /** Parent materials followed, nearest first. Empty for a plain Material. */
   readonly parents: readonly string[];
 }
@@ -70,6 +78,16 @@ export interface CollectedTextureParameter {
   readonly texture: string;
 }
 
+export interface ScalarParameter {
+  readonly name: string;
+  readonly value: number;
+}
+
+export interface VectorParameter {
+  readonly name: string;
+  readonly value: readonly [number, number, number, number];
+}
+
 export interface PropsFile {
   readonly twoSided: boolean;
   readonly blendMode: string | undefined;
@@ -79,6 +97,10 @@ export interface PropsFile {
   /** `TextureParameterValues` — a MaterialInstanceConstant's own overrides of its parent's inputs.
    * The only place an instance's textures appear when umodel resolved the parent's instead. */
   readonly overrides: readonly CollectedTextureParameter[];
+  readonly scalars: readonly ScalarParameter[];
+  readonly scalarOverrides: readonly ScalarParameter[];
+  readonly vectors: readonly VectorParameter[];
+  readonly vectorOverrides: readonly VectorParameter[];
   readonly parent: string | undefined;
 }
 
@@ -137,6 +159,10 @@ export function parsePropsFile(text: string): PropsFile {
   const collected: CollectedTextureParameter[] = [];
 
   const overrides: CollectedTextureParameter[] = [];
+  const scalars: ScalarParameter[] = [];
+  const scalarOverrides: ScalarParameter[] = [];
+  const vectors: VectorParameter[] = [];
+  const vectorOverrides: VectorParameter[] = [];
   let inCollected = false;
   let collectedDepth = 0;
   let inOverrides = false;
@@ -146,6 +172,62 @@ export function parsePropsFile(text: string): PropsFile {
   let pendingName: string | undefined;
   let overrideTexture: string | undefined;
   let overrideName: string | undefined;
+
+  const number = "[-+]?(?:\\d+\\.?\\d*|\\.\\d+)(?:[Ee][-+]?\\d+)?";
+  const readName = (line: string): string | undefined =>
+    /(?:ParameterName|Name)\s*=\s*([^,}\r\n]+)/.exec(line)?.[1]?.trim();
+  const readScalar = (line: string): number | undefined => {
+    const value = new RegExp(`(?:ParameterValue|Value)\\s*=\\s*(${number})`).exec(line)?.[1];
+    return value === undefined ? undefined : Number(value);
+  };
+  const readVector = (line: string): [number, number, number, number] | undefined => {
+    const value = new RegExp(
+      `(?:ParameterValue|Value)\\s*=\\s*\\{[^}]*?(?:R|X)=(${number})[^}]*?(?:G|Y)=(${number})[^}]*?(?:B|Z)=(${number})(?:[^}]*?(?:A|W)=(${number}))?[^}]*?\\}`,
+    ).exec(line);
+    if (!value?.[1] || !value[2] || !value[3]) return undefined;
+    return [Number(value[1]), Number(value[2]), Number(value[3]), Number(value[4] ?? 1)];
+  };
+
+  const indexedBlocks = (prefix: string): string[] => {
+    const blocks: string[] = [];
+    const expression = new RegExp(`${prefix}\\[\\d+\\]\\s*=\\s*\\{`, "g");
+    for (const match of text.matchAll(expression)) {
+      const start = (match.index ?? 0) + match[0].lastIndexOf("{");
+      let depth = 0;
+      for (let index = start; index < text.length; index += 1) {
+        if (text[index] === "{") depth += 1;
+        else if (text[index] === "}") {
+          depth -= 1;
+          if (depth === 0) {
+            blocks.push(text.slice(start + 1, index));
+            break;
+          }
+        }
+      }
+    }
+    return blocks;
+  };
+
+  const collectScalars = (prefix: string, target: ScalarParameter[]): void => {
+    for (const block of indexedBlocks(prefix)) {
+      if (new RegExp(`${prefix}\\[\\d+\\]`).test(block)) continue;
+      const name = readName(block);
+      const value = readScalar(block);
+      if (name && value !== undefined) target.push({ name, value });
+    }
+  };
+  const collectVectors = (prefix: string, target: VectorParameter[]): void => {
+    for (const block of indexedBlocks(prefix)) {
+      if (new RegExp(`${prefix}\\[\\d+\\]`).test(block)) continue;
+      const name = readName(block);
+      const value = readVector(block);
+      if (name && value) target.push({ name, value });
+    }
+  };
+  collectScalars("CollectedScalarParameters", scalars);
+  collectScalars("ScalarParameterValues", scalarOverrides);
+  collectVectors("CollectedVectorParameters", vectors);
+  collectVectors("VectorParameterValues", vectorOverrides);
 
   for (const rawLine of lines) {
     const line = rawLine.trim();
@@ -206,7 +288,18 @@ export function parsePropsFile(text: string): PropsFile {
     }
   }
 
-  return { twoSided, blendMode, opacityMaskClipValue, collected, overrides, parent };
+  return {
+    twoSided,
+    blendMode,
+    opacityMaskClipValue,
+    collected,
+    overrides,
+    scalars,
+    scalarOverrides,
+    vectors,
+    vectorOverrides,
+    parent,
+  };
 }
 
 interface SlotPlan {
@@ -247,6 +340,14 @@ function planForParameterName(name: string): SlotPlan | undefined {
   return undefined;
 }
 
+function normalizedParameterName(name: string): string {
+  return name.toLowerCase().replace(/[^a-z]/g, "");
+}
+
+function clamp01(value: number): number {
+  return Math.max(0, Math.min(1, value));
+}
+
 /** Texture filename suffixes, the weakest signal and the only one that reads no material data. */
 function planForFileName(texture: string): SlotPlan | undefined {
   const name = texture.toLowerCase();
@@ -268,6 +369,14 @@ function planForFileName(texture: string): SlotPlan | undefined {
   return undefined;
 }
 
+function isDisplacementTexture(texture: string): boolean {
+  return /(_displacement|_height)(_tex)?$/i.test(texture);
+}
+
+function isColourTexture(texture: string): boolean {
+  return /(_color|_colour|_d|_diff|_diffuse|_basecolor|_albedo)(_tex)?$/i.test(texture);
+}
+
 /** `*_D_R` textures carry roughness in alpha; the same image serves both slots. */
 export function packsRoughnessInAlpha(texture: string): boolean {
   return /_d(?:\d+)?(?:_[a-z0-9]+)*_r$/i.test(texture);
@@ -285,6 +394,27 @@ export interface ResolveMaterialRequest {
 
 const MAX_PARENT_DEPTH = 8;
 
+/** Every texture any material in the chain names, whether or not it mapped to a slot. */
+function referencedTextures(
+  request: ResolveMaterialRequest,
+  materials: Iterable<string>,
+): Set<string> {
+  const referenced = new Set<string>();
+  for (const material of materials) {
+    const matText = request.readMat(material);
+    if (matText) {
+      const mat = parseMatFile(matText);
+      for (const texture of mat.slots.values()) referenced.add(texture);
+      for (const texture of mat.others) referenced.add(texture);
+    }
+    const propsText = request.readProps(material);
+    if (propsText) {
+      for (const parameter of parsePropsFile(propsText).overrides) referenced.add(parameter.texture);
+    }
+  }
+  return referenced;
+}
+
 /**
  * Resolves one material, following `Parent` chains with a visited set so a self-referential or
  * mutually-referential instance terminates instead of recursing forever.
@@ -299,6 +429,11 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
   let alphaCutoff: number | undefined;
   let doubleSided = false;
   let sawAlphaSource = false;
+  let baseColorFactorValue: [number, number, number, number] | undefined;
+  let emissive: [number, number, number] | undefined;
+  let metallic: number | undefined;
+  let roughness: number | undefined;
+  let opacity: number | undefined;
 
   const bind = (
     plan: SlotPlan,
@@ -364,6 +499,27 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
         const plan = planForParameterName(parameter.name);
         if (plan) bind(plan, parameter.texture, "props", "heuristic");
       }
+      // The current instance is visited before its parents. Own overrides therefore win, then
+      // collected defaults fill only values that remain unset.
+      for (const parameter of [...props.scalarOverrides, ...props.scalars]) {
+        const key = normalizedParameterName(parameter.name);
+        if (["rough", "roughness"].includes(key) && roughness === undefined) {
+          roughness = clamp01(parameter.value);
+        } else if (["metal", "metallic", "metalness"].includes(key) && metallic === undefined) {
+          metallic = clamp01(parameter.value);
+        } else if (["opacity", "alpha", "transparency"].includes(key) && opacity === undefined) {
+          opacity = clamp01(parameter.value);
+        }
+      }
+      for (const parameter of [...props.vectorOverrides, ...props.vectors]) {
+        const key = normalizedParameterName(parameter.name);
+        const value = parameter.value;
+        if (["basecolor", "basecolour", "albedo", "color", "colour", "tint"].includes(key) && !baseColorFactorValue) {
+          baseColorFactorValue = [clamp01(value[0]), clamp01(value[1]), clamp01(value[2]), clamp01(value[3])];
+        } else if (["emissive", "emission", "emissivecolor"].includes(key) && !emissive) {
+          emissive = [clamp01(value[0]), clamp01(value[1]), clamp01(value[2])];
+        }
+      }
     }
 
     if (mat) {
@@ -375,6 +531,42 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
     }
 
     current = props?.parent;
+  }
+
+  // Last resort: complete a texture set by its own naming.
+  //
+  // Unreal materials that blend two surfaces by vertex colour — the moss and dirt variants of a
+  // rock master material are the common case — have no single diffuse input, so umodel resolves
+  // none and the section would ship flat grey. The material still references a coherent texture
+  // set, and a set is named `<stem>_N` beside `<stem>_<something>`. When the base colour is
+  // otherwise unbound, that sibling is the colour map far more often than not. It is recorded as
+  // heuristic, and a grey rock is a worse answer than a probable one.
+  if (!bindings.has("baseColor")) {
+    // "Claimed" only means some rule looked at it; a texture recognized as a normal map while the
+    // normal slot was already taken is still unused pixels. What disqualifies a candidate here is
+    // being bound to a slot, not having been considered.
+    const boundAlready = new Set([...bindings.values()].map((binding) => binding.texture));
+    const unmapped = [...referencedTextures(request, seenMaterials)].filter(
+      (texture) => !boundAlready.has(texture) && request.availableTextures.has(texture),
+    );
+    const stems = new Map<string, string[]>();
+    for (const texture of unmapped) {
+      const stem = texture.replace(/_[A-Za-z0-9]+$/, "");
+      stems.set(stem, [...(stems.get(stem) ?? []), texture]);
+    }
+    for (const [, members] of stems) {
+      if (members.length < 2) continue;
+      const normal = members.find((texture) => /_n(?:_tex)?$/i.test(texture));
+      const colour = members.find((texture) => texture !== normal);
+      if (!normal || !colour) continue;
+      bind({ slot: "baseColor", transform: "none" }, colour, "texture-set", "heuristic");
+      // The set's own normal is more specific than whatever the parent resolved.
+      claimed.add(normal);
+      if (!bindings.has("normal")) {
+        bind({ slot: "normal", transform: "none" }, normal, "texture-set", "heuristic");
+      }
+      break;
+    }
   }
 
   // A `*_D_R` base colour also carries roughness in its alpha channel.
@@ -389,6 +581,46 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
     });
   }
 
+  // glTF has one combined metallic-roughness texture while Unreal commonly references two
+  // grayscale images. Preserve both by packing roughness.red -> G and metalness.red -> B.
+  const referenced = referencedTextures(request, seenMaterials);
+
+  // UE Viewer occasionally labels a graph's displacement input as `Diffuse` when it cannot
+  // reduce a layered material. A filename cannot normally outrank the resolved `.mat`, but this
+  // contradiction is unambiguous when that same graph references an explicit colour image.
+  const resolvedBaseColor = bindings.get("baseColor");
+  if (resolvedBaseColor && isDisplacementTexture(resolvedBaseColor.texture)) {
+    const colour = [...referenced].find(
+      (texture) => request.availableTextures.has(texture) && isColourTexture(texture),
+    );
+    if (colour) {
+      bindings.set("baseColor", {
+        slot: "baseColor",
+        texture: colour,
+        source: "filename",
+        confidence: "heuristic",
+        transform: "none",
+      });
+    }
+  }
+
+  const metallicRoughness = bindings.get("metallicRoughness");
+  if (metallicRoughness?.transform === "redToRoughness") {
+    const metalness = [...referenced].find(
+      (texture) =>
+        request.availableTextures.has(texture) &&
+        /(_metallic|_metalness)(_tex)?$/i.test(texture),
+    );
+    if (metalness) {
+      claimed.add(metalness);
+      bindings.set("metallicRoughness", {
+        ...metallicRoughness,
+        secondaryTexture: metalness,
+        transform: "redRoughnessRedMetalness",
+      });
+    }
+  }
+
   // Masked foliage takes its cutout from the base colour's own alpha channel.
   if (alphaMode === "OPAQUE" && sawAlphaSource && baseColor) {
     alphaMode = "MASK";
@@ -396,19 +628,11 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
   }
 
   const unsupported: UnsupportedTexture[] = [];
-  const referenced = new Set<string>();
-  for (const material of seenMaterials) {
-    const matText = request.readMat(material);
-    if (!matText) continue;
-    const mat = parseMatFile(matText);
-    for (const texture of mat.slots.values()) referenced.add(texture);
-    for (const texture of mat.others) referenced.add(texture);
-    const propsText = request.readProps(material);
-    if (propsText) {
-      for (const parameter of parsePropsFile(propsText).overrides) referenced.add(parameter.texture);
-    }
-  }
-  const bound = new Set([...bindings.values()].map((binding) => binding.texture));
+  const bound = new Set(
+    [...bindings.values()].flatMap((binding) =>
+      binding.secondaryTexture ? [binding.texture, binding.secondaryTexture] : [binding.texture],
+    ),
+  );
   for (const texture of referenced) {
     if (bound.has(texture)) continue;
     unsupported.push({
@@ -426,6 +650,14 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
     alphaMode,
     alphaCutoff,
     doubleSided,
+    baseColorFactor: baseColorFactorValue
+      ? [baseColorFactorValue[0], baseColorFactorValue[1], baseColorFactorValue[2], opacity ?? baseColorFactorValue[3]]
+      : opacity === undefined
+        ? undefined
+        : [1, 1, 1, opacity],
+    emissiveFactor: emissive,
+    metallicFactor: metallic,
+    roughnessFactor: roughness,
     parents,
   };
 }

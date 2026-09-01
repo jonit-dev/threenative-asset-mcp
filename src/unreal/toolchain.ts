@@ -4,11 +4,11 @@ import { constants } from "node:fs";
 import { delimiter, isAbsolute, join } from "node:path";
 
 /**
- * External executables the Unreal import flow drives. They are never bundled, linked, imported, or
- * auto-installed: FabCLI is GPLv3 and its use of an unofficial Fab API must stay the user's
- * explicit choice, and UE Viewer is a C++ program we refuse to compile during `npm install`.
+ * External executables the Unreal import flow drives. They are never bundled, linked, or imported.
+ * First use may provision them into the MCP-owned cache; nothing runs during `npm install`, and
+ * FabCLI authentication remains an explicit user action.
  */
-export type ExternalToolName = "umodel" | "fabcli";
+export type ExternalToolName = "umodel" | "fabcli" | "uncooked" | "modern";
 
 export interface ExternalTool {
   readonly name: ExternalToolName;
@@ -37,6 +37,15 @@ export class ToolchainError extends Error {
 const ENVIRONMENT_OVERRIDE: Record<ExternalToolName, string> = {
   umodel: "THREENATIVE_UMODEL_PATH",
   fabcli: "THREENATIVE_FABCLI_PATH",
+  uncooked: "THREENATIVE_UNCOOKED_CONVERTER_PATH",
+  modern: "THREENATIVE_MODERN_UNREAL_CONVERTER_PATH",
+};
+
+const EXECUTABLE_NAME: Record<ExternalToolName, string> = {
+  umodel: "umodel",
+  fabcli: "fabcli",
+  uncooked: "unreal-assets-to-glb",
+  modern: "threenative-cue4parse",
 };
 
 /** Hosts UE Viewer publishes and we have executed on. macOS stays unclaimed until run there. */
@@ -88,10 +97,11 @@ export async function resolveExecutable(
   }
 
   const suffixes = process.platform === "win32" ? [".exe", ".cmd", ".bat", ""] : [""];
+  const executableName = EXECUTABLE_NAME[name];
   for (const directory of (environment.PATH ?? "").split(delimiter)) {
     if (!directory) continue;
     for (const suffix of suffixes) {
-      const candidate = join(directory, `${name}${suffix}`);
+      const candidate = join(directory, `${executableName}${suffix}`);
       if (await isExecutableFile(candidate)) return candidate;
     }
   }
@@ -99,7 +109,11 @@ export async function resolveExecutable(
     "UNREAL_TOOL_NOT_FOUND",
     name === "umodel"
       ? "UE Viewer (umodel) was not found. Install it and set THREENATIVE_UMODEL_PATH, or put `umodel` on PATH. See https://www.gildor.org/en/projects/umodel."
-      : "FabCLI was not found. Install it and set THREENATIVE_FABCLI_PATH, or put `fabcli` on PATH. FabCLI is a separate, unofficial GPLv3 tool; installing and authenticating it is your choice.",
+      : name === "fabcli"
+        ? "FabCLI was not found. Install it and set THREENATIVE_FABCLI_PATH, or put `fabcli` on PATH. FabCLI is a separate, unofficial GPLv3 tool; installing and authenticating it is your choice."
+        : name === "uncooked"
+          ? "The uncooked Unreal converter was not found. Install `unreal-assets-to-glb==4.27.2.0` and set THREENATIVE_UNCOOKED_CONVERTER_PATH, or allow toolchain auto-install."
+          : "The modern Unreal converter was not found. Set THREENATIVE_MODERN_UNREAL_CONVERTER_PATH, or allow toolchain auto-install.",
   );
 }
 

@@ -5,21 +5,47 @@ import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
-import { NodeIO, VertexLayout, type Material, type Texture } from "@gltf-transform/core";
+import { Document, NodeIO, VertexLayout, type Material, type Texture } from "@gltf-transform/core";
+import { EXTMeshGPUInstancing, KHRLightsPunctual, KHRMaterialsUnlit } from "@gltf-transform/extensions";
+import { attachPsaAnimations, parsePsa, type PsaFile } from "./psa.js";
 
 import {
   type MaterialTextureBinding,
+  type UnsupportedTexture,
   type ResolvedMaterial,
   type TextureTransform,
   resolveMaterial,
 } from "./materials.js";
-import { ensureUmodel } from "./provision.js";
+import { readPackageCooking } from "./cooking.js";
+import { extractUnrealFonts } from "./fonts.js";
+import { parseOfflineFontDescriptor, writeOfflineFont } from "./bitmap-fonts.js";
+import {
+  paperObjectPathToPackage,
+  parsePaperFlipbookDescriptor,
+  parsePaperSpriteDescriptor,
+  writePaperSpriteGlb,
+  type PaperFlipbookDescriptor,
+  type PaperSpriteDescriptor,
+} from "./paper2d.js";
+import {
+  parsePaperTileMapDescriptor,
+  parsePaperTileSetDescriptor,
+  writePaperTileMapGlb,
+  type PaperTileMapDescriptor,
+  type PaperTileSetDescriptor,
+} from "./paper-tilemaps.js";
+import { ensureModernConverter, ensureUncookedConverter, ensureUmodel } from "./provision.js";
+import {
+  assembleSceneGlb,
+  type ImportedScene,
+  parseUnrealSceneSource,
+} from "./scenes.js";
 import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } from "./toolchain.js";
 
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 1;
+export const IMPORTER_VERSION = 42;
 
 export type ImportErrorCode =
   | "UNREAL_SOURCE_NOT_FOUND"
@@ -28,6 +54,8 @@ export type ImportErrorCode =
   | "UNREAL_OUTPUT_COLLISION"
   | "UNREAL_DISK_SPACE"
   | "UNREAL_EXPORT_EMPTY"
+  | "UNREAL_SOURCE_UNCOOKED"
+  | "UNREAL_SOURCE_UNSUPPORTED"
   | "UNREAL_GLB_INVALID";
 
 export class ImportError extends Error {
@@ -48,6 +76,7 @@ export interface ImportedMaterialSection {
   readonly bindings: readonly {
     readonly slot: string;
     readonly texture: string;
+    readonly secondaryTexture?: string;
     readonly source: string;
     readonly confidence: string;
     readonly transform: TextureTransform;
@@ -55,20 +84,153 @@ export interface ImportedMaterialSection {
   readonly unsupported: readonly { readonly texture: string; readonly reason: string }[];
   readonly alphaMode: string;
   readonly doubleSided: boolean;
+  readonly factors: {
+    readonly baseColor: readonly [number, number, number, number];
+    readonly emissive: readonly [number, number, number];
+    readonly metallic: number;
+    readonly roughness: number;
+  };
   readonly textured: boolean;
+  /** Textures written beside the GLB because no glTF slot honestly fits them. */
+  readonly sidecarTextures: readonly string[];
 }
 
 export interface ImportedModel {
   readonly name: string;
   readonly package: string;
+  readonly kind: "static" | "skeletal";
   /** Path relative to the promoted output directory. */
   readonly glb: string;
   readonly bytes: number;
   readonly sha256: string;
   readonly vertices: number;
   readonly primitives: number;
+  readonly skins: number;
+  readonly animations: number;
   readonly boundsMetres: readonly [number, number, number];
   readonly materials: readonly ImportedMaterialSection[];
+}
+
+export interface ImportedTexture {
+  readonly name: string;
+  readonly package: string;
+  /** Collision-free path relative to the promoted output directory. */
+  readonly png: string;
+  readonly bytes: number;
+  readonly sha256: string;
+  readonly width: number;
+  readonly height: number;
+}
+
+/** A TextureCube decoded to the equirectangular layout consumed by Three.js environments. */
+export interface ImportedCubemap {
+  readonly name: string;
+  readonly package: string;
+  readonly file: string;
+  readonly mimeType: "image/png" | "image/vnd.radiance";
+  readonly bytes: number;
+  readonly sha256: string;
+  readonly width: number;
+  readonly height: number;
+  readonly dynamicRange: "ldr" | "hdr";
+  readonly mapping: "EquirectangularReflectionMapping";
+}
+
+/** One standalone Unreal material exposed through a shared, directly loadable glTF library. */
+export interface ImportedMaterialAsset extends ImportedMaterialSection {
+  readonly name: string;
+  readonly package: string;
+  /** Path to the shared material-swatch GLB, relative to the promoted output directory. */
+  readonly glb: string;
+  /** Unique material name inside the GLB; use this when Unreal packages share a basename. */
+  readonly libraryName: string;
+}
+
+export interface ImportedAudio {
+  readonly name: string;
+  readonly package: string;
+  /** Collision-free, Three.js AudioLoader-compatible path relative to the output directory. */
+  readonly file: string;
+  readonly mimeType: string;
+  readonly bytes: number;
+  readonly sha256: string;
+  readonly durationSeconds: number | undefined;
+  readonly channels: number | undefined;
+  readonly sampleRate: number | undefined;
+}
+
+export interface ImportedDataAsset {
+  readonly name: string;
+  readonly package: string;
+  readonly className: string;
+  /** Collision-free JSON path relative to the output directory. */
+  readonly json: string;
+  readonly bytes: number;
+  readonly sha256: string;
+}
+
+export interface ImportedTextureStack {
+  readonly name: string;
+  readonly package: string;
+  readonly kind: "array" | "cube-array" | "volume";
+  readonly data: string;
+  readonly manifest: string;
+  readonly format: "RGBA8";
+  readonly threeTexture: "DataArrayTexture" | "Data3DTexture";
+  readonly width: number;
+  readonly height: number;
+  readonly depth: number;
+  readonly bytes: number;
+  readonly sha256: string;
+}
+
+export interface ImportedFont {
+  readonly name: string;
+  readonly package: string;
+  /** Browser FontFace-compatible TTF/OTF path relative to the output directory. */
+  readonly file: string;
+  readonly mimeType: "font/ttf" | "font/otf";
+  readonly family: string;
+  readonly style: string;
+  readonly weight: number;
+  readonly fontStyle: "normal" | "italic";
+  readonly bytes: number;
+  readonly sha256: string;
+}
+
+export interface ImportedBitmapFont {
+  readonly name: string;
+  readonly package: string;
+  /** BMFont-compatible metrics and atlas references, relative to the output directory. */
+  readonly manifest: string;
+  readonly pages: readonly string[];
+  readonly glyphs: number;
+  readonly distanceField: boolean;
+  readonly bytes: number;
+  readonly sha256: string;
+}
+
+export interface ImportedSprite {
+  readonly name: string;
+  readonly package: string;
+  readonly glb: string;
+  readonly vertices: number;
+  readonly widthMetres: number;
+  readonly heightMetres: number;
+  readonly textureWidth: number;
+  readonly textureHeight: number;
+  readonly bytes: number;
+  readonly sha256: string;
+}
+
+export interface ImportedFlipbook {
+  readonly name: string;
+  readonly package: string;
+  readonly manifest: string;
+  readonly framesPerSecond: number;
+  readonly frames: number;
+  readonly durationSeconds: number;
+  readonly unresolvedSprites: readonly string[];
 }
 
 export interface ImportReport {
@@ -92,17 +254,44 @@ export interface ImportReport {
       | { readonly verdict: string; readonly slugs: readonly string[]; readonly reason: string }
       | undefined;
   };
-  readonly toolchain: { readonly umodel: string; readonly fabcli: string | undefined };
+  readonly toolchain: {
+    readonly umodel: string;
+    readonly fabcli: string | undefined;
+    readonly uncookedConverter: string | undefined;
+    readonly modernConverter: string | undefined;
+  };
   readonly cacheKey: string;
   readonly reused: boolean;
   readonly materials: "complete" | "degraded";
   readonly counts: {
     readonly packages: number;
     readonly exported: number;
+    readonly textures: number;
+    readonly cubemaps: number;
+    readonly materialAssets: number;
+    readonly audio: number;
+    readonly dataAssets: number;
+    readonly textureStacks: number;
+    readonly fonts: number;
+    readonly bitmapFonts: number;
+    readonly sprites: number;
+    readonly flipbooks: number;
+    readonly scenes: number;
     readonly skipped: number;
     readonly failed: number;
   };
   readonly models: readonly ImportedModel[];
+  readonly textures: readonly ImportedTexture[];
+  readonly cubemaps: readonly ImportedCubemap[];
+  readonly materialAssets: readonly ImportedMaterialAsset[];
+  readonly audio: readonly ImportedAudio[];
+  readonly dataAssets: readonly ImportedDataAsset[];
+  readonly textureStacks: readonly ImportedTextureStack[];
+  readonly fonts: readonly ImportedFont[];
+  readonly bitmapFonts: readonly ImportedBitmapFont[];
+  readonly sprites: readonly ImportedSprite[];
+  readonly flipbooks: readonly ImportedFlipbook[];
+  readonly scenes: readonly ImportedScene[];
   readonly skipped: readonly { readonly package: string; readonly reason: string }[];
   readonly failed: readonly { readonly package: string; readonly reason: string }[];
   readonly materialCoverage: {
@@ -115,6 +304,8 @@ export interface ImportReport {
     readonly unresolved: number;
   };
   readonly transforms: Readonly<Record<string, number>>;
+  /** Relative paths of textures written beside the models because no glTF slot fits them. */
+  readonly sidecarTextures: readonly string[];
   readonly warnings: readonly string[];
   readonly durationMs: number;
 }
@@ -141,11 +332,13 @@ export interface ImportUnrealRequest {
   readonly environment?: NodeJS.ProcessEnv;
   readonly log?: (message: string) => void;
   readonly umodel?: ExternalTool;
+  /** Injected by tests or advanced installations; production provisions the pinned converter. */
+  readonly uncookedConverter?: ExternalTool;
+  /** Modern UE5 editor-package decoder; production provisions the pinned CUE4Parse adapter. */
+  readonly modernConverter?: ExternalTool;
 }
 
-const UNSUPPORTED_EXTENSIONS = new Map<string, string>([
-  [".umap", "Unreal level (.umap): placement, landscape, foliage instancing, and lighting are level data with no glTF equivalent"],
-]);
+const UNSUPPORTED_EXTENSIONS = new Map<string, string>();
 
 const UNSUPPORTED_CLASSES = new Map<string, string>([
   ["Blueprint", "Blueprint graph"],
@@ -158,6 +351,17 @@ const UNSUPPORTED_CLASSES = new Map<string, string>([
   ["World", "level"],
   ["MapBuildDataRegistry", "baked level lighting"],
 ]);
+
+const DATA_ASSET_CLASSES = new Set([
+  "DataTable",
+  "CurveTable",
+  "StringTable",
+  "CurveFloat",
+  "CurveVector",
+  "CurveLinearColor",
+]);
+
+const TEXTURE_STACK_CLASSES = new Set(["Texture2DArray", "TextureCubeArray", "VolumeTexture"]);
 
 /** A material package lists hundreds of expression classes; the reason names a few and counts the rest. */
 export function summarizeClasses(classes: readonly string[], keep = 4): string {
@@ -229,9 +433,21 @@ export function assertContained(root: string, candidate: string): string {
 
 interface PackageClassification {
   readonly package: string;
+  readonly selector: string;
   readonly file: string;
   readonly classes: readonly string[];
-  readonly hasStaticMesh: boolean;
+  readonly meshKind: "static" | "skeletal" | undefined;
+  readonly hasAnimation: boolean;
+  readonly hasTexture: boolean;
+  readonly hasCubemap: boolean;
+  readonly hasMaterial: boolean;
+  readonly hasSound: boolean;
+  readonly dataClass: string | undefined;
+  readonly textureStackClass: string | undefined;
+  readonly hasFont: boolean;
+  readonly hasBlueprintPrefab: boolean;
+  readonly paperClass: "PaperSprite" | "PaperFlipbook" | "PaperTileMap" | "PaperTileSet" | undefined;
+  readonly needsModernConverter: boolean;
   readonly error: string | undefined;
 }
 
@@ -271,24 +487,91 @@ async function mapWithConcurrency<T, R>(
 
 interface ExportedAssets {
   readonly gltf: Map<string, string>;
+  readonly psa: Map<string, string>;
   readonly mat: Map<string, string>;
   readonly props: Map<string, string>;
   readonly png: Map<string, string>;
+  readonly audio: Map<string, string>;
 }
 
 async function indexExported(root: string): Promise<ExportedAssets> {
   const gltf = new Map<string, string>();
+  const psa = new Map<string, string>();
   const mat = new Map<string, string>();
   const props = new Map<string, string>();
   const png = new Map<string, string>();
+  const audio = new Map<string, string>();
   for (const file of await listFiles(root).catch(() => [])) {
     const name = basename(file.path);
     if (name.endsWith(".props.txt")) props.set(name.slice(0, -".props.txt".length), file.path);
     else if (name.endsWith(".mat")) mat.set(name.slice(0, -".mat".length), file.path);
     else if (name.endsWith(".gltf")) gltf.set(name.slice(0, -".gltf".length), file.path);
+    else if (name.endsWith(".psa")) psa.set(name.slice(0, -".psa".length), file.path);
     else if (name.endsWith(".png")) png.set(name.slice(0, -".png".length), file.path);
+    else if (/\.(?:wav|ogg|mp3|flac)$/i.test(name)) audio.set(name.slice(0, name.lastIndexOf(".")), file.path);
   }
-  return { gltf, mat, props, png };
+  return { gltf, psa, mat, props, png, audio };
+}
+
+function mergeExported(left: ExportedAssets, right: ExportedAssets): ExportedAssets {
+  const merge = (first: Map<string, string>, second: Map<string, string>): Map<string, string> =>
+    new Map([...first, ...second]);
+  return {
+    gltf: merge(left.gltf, right.gltf),
+    psa: merge(left.psa, right.psa),
+    mat: merge(left.mat, right.mat),
+    props: merge(left.props, right.props),
+    png: merge(left.png, right.png),
+    audio: merge(left.audio, right.audio),
+  };
+}
+
+async function indexGlbs(root: string): Promise<Map<string, string>> {
+  const glbs = new Map<string, string>();
+  for (const file of await listFiles(root).catch(() => [])) {
+    const name = basename(file.path);
+    if (name.toLowerCase().endsWith(".glb")) glbs.set(name.slice(0, -4), file.path);
+  }
+  return glbs;
+}
+
+const MODERN_ENGINE_FALLBACKS = ["5.7", "5.6", "5.5", "5.4", "5.3", "5.2", "5.1", "5.0"] as const;
+
+function isEngineProfileMismatch(output: string): boolean {
+  return /CUE4Parse could not decode|ParserException|Invalid FString length|UnknownEngineVersion|No StaticMesh, SkeletalMesh, Texture2D, TextureCube, SoundWave, or structured-data output was produced/i.test(output);
+}
+
+/**
+ * Unversioned UE5.6 and UE5.7 packages both use LegacyFileVersion -9, so the package header alone
+ * cannot select the serializer. Each attempt writes to a private sibling and only a complete exit
+ * zero is renamed into the caller's staging path; failed partial exports never leak forward.
+ */
+async function runModernConverter(
+  executable: string,
+  sourceDir: string,
+  outputDir: string,
+  tailArgs: readonly string[],
+  limits: { readonly timeoutMs: number; readonly maxOutputBytes: number },
+) {
+  const attempts: (typeof MODERN_ENGINE_FALLBACKS[number] | undefined)[] = [undefined, ...MODERN_ENGINE_FALLBACKS];
+  let last: Awaited<ReturnType<typeof runBounded>> | undefined;
+  for (const engine of attempts) {
+    const attempt = `${outputDir}.engine-${engine ?? "auto"}`;
+    await rm(attempt, { recursive: true, force: true });
+    await mkdir(dirname(attempt), { recursive: true });
+    const args = [sourceDir, "--export-dir", attempt, ...tailArgs];
+    if (engine) args.push("--engine", engine);
+    const converted = await runBounded(executable, args, limits);
+    if (converted.code === 0) {
+      await rm(outputDir, { recursive: true, force: true });
+      await rename(attempt, outputDir);
+      return converted;
+    }
+    last = converted;
+    await rm(attempt, { recursive: true, force: true });
+    if (!isEngineProfileMismatch(`${converted.stdout}\n${converted.stderr}`)) return converted;
+  }
+  return last!;
 }
 
 /**
@@ -300,6 +583,7 @@ export async function applyTextureTransform(
   input: Buffer,
   transform: TextureTransform,
   maxTextureSize: number | undefined,
+  secondaryInput?: Buffer,
 ): Promise<{ data: Buffer; mimeType: string }> {
   const { default: sharp } = await import("sharp");
   sharp.cache(false);
@@ -327,6 +611,15 @@ export async function applyTextureTransform(
     .toBuffer({ resolveWithObject: true });
   const pixels = info.width * info.height;
   const output = Buffer.alloc(pixels * 3);
+  let secondary: Buffer | undefined;
+  if (transform === "redRoughnessRedMetalness") {
+    if (!secondaryInput) throw new Error("Metalness source is missing for metallic-roughness packing.");
+    secondary = await sharp(secondaryInput, { limitInputPixels: 268_435_456, unlimited: true })
+      .resize(info.width, info.height, { fit: "fill" })
+      .removeAlpha()
+      .raw()
+      .toBuffer();
+  }
   for (let index = 0; index < pixels; index += 1) {
     const source = index * 4;
     const target = index * 3;
@@ -337,12 +630,12 @@ export async function applyTextureTransform(
     const roughness =
       transform === "alphaToRoughness"
         ? alpha
-        : transform === "redToRoughness"
+        : transform === "redToRoughness" || transform === "redRoughnessRedMetalness"
           ? red
           : 255 - red;
     output[target] = 255;
     output[target + 1] = roughness;
-    output[target + 2] = 0;
+    output[target + 2] = secondary?.[source - Math.floor(source / 4)] ?? 0;
   }
   return {
     data: await sharp(output, {
@@ -355,6 +648,86 @@ export async function applyTextureTransform(
 }
 
 const SLOT_ORDER = ["baseColor", "normal", "metallicRoughness", "emissive", "occlusion"] as const;
+
+/**
+ * Whether an image can plausibly be a base colour map.
+ *
+ * Unreal's larger materials do not ship an albedo texture at all: a rock master blends tiling
+ * detail materials through a packed mask, and umodel resolves that mask into its `Diffuse` slot
+ * because it is where the diffuse chain begins. Binding it as base colour is what turns a
+ * limestone cave magenta — the channels are three unrelated masks, not a photograph.
+ *
+ * A photographed albedo has strongly correlated RGB and low saturation; the pack's masks measure
+ * 0.02–0.16 correlation at 0.78–0.84 saturation against 0.97–1.00 at 0.09–0.13 for its real
+ * albedos. The thresholds sit in the gap, and the decision is recorded rather than silent.
+ */
+export interface IAlbedoVerdict {
+  readonly isAlbedo: boolean;
+  readonly saturation: number;
+  readonly channelCorrelation: number;
+  readonly spatialVariation: number;
+}
+
+const MASK_SATURATION = 0.45;
+const ALBEDO_CORRELATION = 0.55;
+
+export async function classifyAlbedo(image: Buffer): Promise<IAlbedoVerdict> {
+  const { default: sharp } = await import("sharp");
+  const { data, info } = await sharp(image, { limitInputPixels: 268_435_456, unlimited: true })
+    .resize(96, 96, { fit: "fill" })
+    .removeAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  const pixels = info.width * info.height;
+  let saturation = 0;
+  let meanRed = 0;
+  let meanGreen = 0;
+  let meanBlue = 0;
+  for (let index = 0; index < pixels; index += 1) {
+    const red = (data[index * 3] ?? 0) / 255;
+    const green = (data[index * 3 + 1] ?? 0) / 255;
+    const blue = (data[index * 3 + 2] ?? 0) / 255;
+    const high = Math.max(red, green, blue);
+    const low = Math.min(red, green, blue);
+    saturation += high === 0 ? 0 : (high - low) / high;
+    meanRed += red;
+    meanGreen += green;
+    meanBlue += blue;
+  }
+  saturation /= pixels;
+  meanRed /= pixels;
+  meanGreen /= pixels;
+  meanBlue /= pixels;
+  let covariance = 0;
+  let varianceRed = 0;
+  let varianceGreen = 0;
+  let varianceBlue = 0;
+  for (let index = 0; index < pixels; index += 1) {
+    const red = (data[index * 3] ?? 0) / 255 - meanRed;
+    const green = (data[index * 3 + 1] ?? 0) / 255 - meanGreen;
+    const blue = (data[index * 3 + 2] ?? 0) / 255 - meanBlue;
+    covariance += red * green;
+    varianceRed += red * red;
+    varianceGreen += green * green;
+    varianceBlue += blue * blue;
+  }
+  const channelCorrelation = covariance / Math.sqrt(varianceRed * varianceGreen || 1e-9);
+  const spatialVariation = Math.sqrt(
+    (varianceRed + varianceGreen + varianceBlue) / Math.max(1, pixels * 3),
+  );
+  return {
+    // A solid swatch can be fully saturated but is still a legitimate base colour. Packed masks
+    // vary spatially; accepting near-uniform images avoids classifying red/blue palette textures
+    // as channel masks.
+    isAlbedo:
+      spatialVariation < 0.03 ||
+      saturation < MASK_SATURATION ||
+      channelCorrelation > ALBEDO_CORRELATION,
+    saturation,
+    channelCorrelation,
+    spatialVariation,
+  };
+}
 
 /**
  * Transformed images, shared across every mesh in one import. A ground-tile texture is bound by
@@ -418,6 +791,11 @@ function attachTexture(
 export interface PackagedModel {
   readonly vertices: number;
   readonly primitives: number;
+  readonly skins: number;
+  readonly animations: number;
+  readonly attachedPsa: readonly string[];
+  readonly existingPsa: readonly string[];
+  readonly incompatiblePsa: readonly string[];
   readonly bounds: [number, number, number];
   readonly sections: ImportedMaterialSection[];
   readonly prunedUvSets: number;
@@ -435,7 +813,59 @@ export interface PackagedModel {
  * or mobile at all. Separate is the only layout this importer writes.
  */
 function separateLayoutIO(): NodeIO {
-  return new NodeIO().setVertexLayout(VertexLayout.SEPARATE);
+  return new NodeIO()
+    .registerExtensions([KHRLightsPunctual, EXTMeshGPUInstancing, KHRMaterialsUnlit])
+    .setVertexLayout(VertexLayout.SEPARATE);
+}
+
+/** Builds a tiny swatch mesh per material so GLTFLoader returns normal Three.js materials. */
+async function writeMaterialLibrarySource(
+  path: string,
+  entries: readonly { readonly libraryName: string; readonly package: string }[],
+): Promise<void> {
+  const document = new Document();
+  const buffer = document.createBuffer();
+  const position = document
+    .createAccessor("POSITION")
+    .setType("VEC3")
+    .setArray(new Float32Array([-0.45, -0.45, 0, 0.45, -0.45, 0, 0.45, 0.45, 0, -0.45, 0.45, 0]))
+    .setBuffer(buffer);
+  const normal = document
+    .createAccessor("NORMAL")
+    .setType("VEC3")
+    .setArray(new Float32Array([0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1]))
+    .setBuffer(buffer);
+  const uv = document
+    .createAccessor("TEXCOORD_0")
+    .setType("VEC2")
+    .setArray(new Float32Array([0, 1, 1, 1, 1, 0, 0, 0]))
+    .setBuffer(buffer);
+  const indices = document
+    .createAccessor("indices")
+    .setType("SCALAR")
+    .setArray(new Uint16Array([0, 1, 2, 0, 2, 3]))
+    .setBuffer(buffer);
+  const scene = document.createScene("Unreal Material Library");
+  const columns = Math.max(1, Math.ceil(Math.sqrt(entries.length)));
+  for (const [index, entry] of entries.entries()) {
+    const material = document.createMaterial(entry.libraryName);
+    const primitive = document
+      .createPrimitive()
+      .setIndices(indices)
+      .setAttribute("POSITION", position)
+      .setAttribute("NORMAL", normal)
+      .setAttribute("TEXCOORD_0", uv)
+      .setMaterial(material);
+    const mesh = document.createMesh(entry.libraryName).addPrimitive(primitive);
+    const node = document
+      .createNode(entry.libraryName)
+      .setMesh(mesh)
+      .setTranslation([index % columns, -Math.floor(index / columns), 0])
+      .setExtras({ unrealPackage: entry.package, materialSwatch: true });
+    scene.addChild(node);
+  }
+  await mkdir(dirname(path), { recursive: true });
+  await separateLayoutIO().write(path, document);
 }
 
 export async function packageGlb(options: {
@@ -447,23 +877,37 @@ export async function packageGlb(options: {
   readonly imageCache?: TransformedImageCache;
   /** Written into the glTF `asset.copyright`, so the entitlement travels with the file. */
   readonly copyright?: string | undefined;
+  /** Collects textures no glTF slot fits, to be written beside the GLBs. */
+  readonly sidecars?: Map<string, string>;
+  /** Multiplies positions before writing; uncooked MeshDescription coordinates are centimetres. */
+  readonly geometryScale?: number;
+  /** Standalone ActorX animations exported by UE Viewer and matched to this model's joints. */
+  readonly psaFiles?: readonly PsaFile[];
+  /** Unique library material name -> Unreal object basename used for sidecar lookup. */
+  readonly materialLookupNames?: ReadonlyMap<string, string>;
+  /** Per-material isolated exports, required when two packages share an object basename. */
+  readonly materialAssets?: ReadonlyMap<string, ExportedAssets>;
 }): Promise<PackagedModel> {
   const io = separateLayoutIO();
   const document = await io.read(options.gltfPath);
   const root = document.getRoot();
+  const psa = attachPsaAnimations(document, options.psaFiles ?? []);
   // A provenance record that lives only in a sibling report is one `cp` away from being lost.
   // ThreeNative's own asset health check reads this field, so an imported asset that cannot say
   // where it came from is reported as unknown rather than quietly assumed fine.
   // glTF-Transform owns `generator` on write, so the provenance rides in `copyright` alone.
   if (options.copyright) root.getAsset().copyright = options.copyright;
-  const availableTextures = new Set(options.assets.png.keys());
   const sections: ImportedMaterialSection[] = [];
   const cache = new Map<string, Texture>();
   let prunedUvSets = 0;
   let droppedTangents = 0;
+  const rejectedMasks: UnsupportedTexture[] = [];
 
   for (const [index, material] of root.listMaterials().entries()) {
     const name = material.getName();
+    const lookupName = options.materialLookupNames?.get(name) ?? name;
+    const materialAssets = options.materialAssets?.get(name) ?? options.assets;
+    const availableTextures = new Set(materialAssets.png.keys());
     // UE Viewer names a section it could not resolve `dummy_material_<n>` and paints it a debug
     // colour. Shipping that name would put a placeholder into a game asset and let a reader
     // mistake it for a real material, so it is renamed to something that says what it is.
@@ -472,13 +916,13 @@ export async function packageGlb(options: {
       material.setName(`${basename(options.glbPath, ".glb")}_unresolved_section_${index}`);
     }
     const resolved: ResolvedMaterial = resolveMaterial({
-      name,
+      name: lookupName,
       readMat: (materialName) => {
-        const path = options.assets.mat.get(materialName);
+        const path = materialAssets.mat.get(materialName);
         return path === undefined ? undefined : readMaterialSidecar(path);
       },
       readProps: (materialName) => {
-        const path = options.assets.props.get(materialName);
+        const path = materialAssets.props.get(materialName);
         return path === undefined ? undefined : readMaterialSidecar(path);
       },
       availableTextures,
@@ -497,10 +941,34 @@ export async function packageGlb(options: {
     const ordered = [...resolved.bindings].sort(
       (left, right) => SLOT_ORDER.indexOf(left.slot) - SLOT_ORDER.indexOf(right.slot),
     );
-    for (const binding of ordered) {
-      const source = options.assets.png.get(binding.texture);
+    const sidecarTextures: string[] = [];
+    for (const unsupported of resolved.unsupported) {
+      const source = materialAssets.png.get(unsupported.texture);
       if (!source) continue;
-      const key = `${binding.texture}|${binding.transform}`;
+      sidecarTextures.push(unsupported.texture);
+      options.sidecars?.set(unsupported.texture, source);
+    }
+    for (const binding of ordered) {
+      const source = materialAssets.png.get(binding.texture);
+      if (!source) continue;
+      if (binding.slot === "baseColor") {
+        const verdict = await classifyAlbedo(await readFile(source));
+        if (!verdict.isAlbedo) {
+          // Not a photograph of a surface. Leave the slot on its neutral fallback and hand the
+          // pixels to the game instead of painting the model with a mask.
+          rejectedMasks.push({
+            texture: binding.texture,
+            reason: `packed mask, not a base colour (saturation ${verdict.saturation.toFixed(2)}, channel correlation ${verdict.channelCorrelation.toFixed(2)})`,
+          });
+          if (!sidecarTextures.includes(binding.texture)) sidecarTextures.push(binding.texture);
+          options.sidecars?.set(binding.texture, source);
+          continue;
+        }
+      }
+      const secondarySource = binding.secondaryTexture
+        ? materialAssets.png.get(binding.secondaryTexture)
+        : undefined;
+      const key = `${source}|${secondarySource ?? ""}|${binding.transform}`;
       let texture = cache.get(key);
       if (!texture) {
         const image = options.imageCache
@@ -509,12 +977,14 @@ export async function packageGlb(options: {
                 await readFile(source),
                 binding.transform,
                 options.maxTextureSize,
+                secondarySource ? await readFile(secondarySource) : undefined,
               ),
             )
           : await applyTextureTransform(
               await readFile(source),
               binding.transform,
               options.maxTextureSize,
+              secondarySource ? await readFile(secondarySource) : undefined,
             );
         texture = document
           .createTexture(`${binding.texture}${binding.transform === "none" ? "" : `_${binding.transform}`}`)
@@ -525,25 +995,59 @@ export async function packageGlb(options: {
       attachTexture(material, binding, texture);
     }
 
-    if (!ordered.some((binding) => binding.slot === "baseColor")) {
-      // Explicit neutral fallback, never the exporter's debug colour.
-      material.setBaseColorFactor([0.8, 0.8, 0.8, 1]);
+    const boundBaseColour = material.getBaseColorTexture() !== null;
+    if (!boundBaseColour) {
+      const materialName = material.getName().toLowerCase();
+      if (materialName.includes("glass")) {
+        material.setBaseColorFactor([0.65, 0.8, 0.95, 0.22]);
+        material.setRoughnessFactor(0.1);
+        material.setMetallicFactor(0);
+        material.setAlphaMode("BLEND");
+        material.setDoubleSided(true);
+      } else if (materialName.includes("mirror")) {
+        material.setBaseColorFactor([0.95, 0.95, 0.95, 1]);
+        material.setRoughnessFactor(0.03);
+        material.setMetallicFactor(1);
+      } else if (/(?:^|_)light(?:_|$)/.test(materialName)) {
+        material.setBaseColorFactor([1, 1, 0.9, 1]);
+        material.setEmissiveFactor([1, 1, 0.85]);
+      } else {
+        // Explicit neutral fallback, never the exporter's debug colour.
+        material.setBaseColorFactor([0.8, 0.8, 0.8, 1]);
+      }
     }
+    if (resolved.baseColorFactor) {
+      material.setBaseColorFactor([...resolved.baseColorFactor]);
+      if (resolved.baseColorFactor[3] < 1 && material.getAlphaMode() === "OPAQUE") {
+        material.setAlphaMode("BLEND");
+      }
+    }
+    if (resolved.emissiveFactor) material.setEmissiveFactor([...resolved.emissiveFactor]);
+    if (resolved.metallicFactor !== undefined) material.setMetallicFactor(resolved.metallicFactor);
+    if (resolved.roughnessFactor !== undefined) material.setRoughnessFactor(resolved.roughnessFactor);
 
     sections.push({
       name: material.getName(),
       resolved: !unresolvedSection,
+      sidecarTextures,
       bindings: ordered.map((binding) => ({
         slot: binding.slot,
         texture: binding.texture,
+        ...(binding.secondaryTexture ? { secondaryTexture: binding.secondaryTexture } : {}),
         source: binding.source,
         confidence: binding.confidence,
         transform: binding.transform,
       })),
-      unsupported: resolved.unsupported.map((entry) => ({ ...entry })),
-      alphaMode: resolved.alphaMode,
-      doubleSided: resolved.doubleSided,
-      textured: ordered.some((binding) => binding.slot === "baseColor"),
+      unsupported: [...resolved.unsupported.map((entry) => ({ ...entry })), ...rejectedMasks.splice(0)],
+      alphaMode: material.getAlphaMode(),
+      doubleSided: material.getDoubleSided(),
+      factors: {
+        baseColor: material.getBaseColorFactor(),
+        emissive: material.getEmissiveFactor(),
+        metallic: material.getMetallicFactor(),
+        roughness: material.getRoughnessFactor(),
+      },
+      textured: boundBaseColour,
     });
   }
 
@@ -556,6 +1060,16 @@ export async function packageGlb(options: {
       primitives += 1;
       const position = primitive.getAttribute("POSITION");
       if (!position) continue;
+      if (options.geometryScale !== undefined && options.geometryScale !== 1) {
+        const element = [0, 0, 0];
+        for (let index = 0; index < position.getCount(); index += 1) {
+          position.getElement(index, element);
+          element[0] = (element[0] ?? 0) * options.geometryScale;
+          element[1] = (element[1] ?? 0) * options.geometryScale;
+          element[2] = (element[2] ?? 0) * options.geometryScale;
+          position.setElement(index, element);
+        }
+      }
       vertices += position.getCount();
       for (let axis = 0; axis < 3; axis += 1) {
         min[axis] = Math.min(min[axis] ?? Infinity, position.getMin([0, 0, 0])[axis] ?? 0);
@@ -601,6 +1115,11 @@ export async function packageGlb(options: {
   return {
     vertices,
     primitives,
+    skins: root.listSkins().length,
+    animations: root.listAnimations().length,
+    attachedPsa: psa.attached,
+    existingPsa: psa.existing,
+    incompatiblePsa: psa.incompatible,
     bounds: [
       Number.isFinite(max[0]) ? max[0] - (min[0] ?? 0) : 0,
       Number.isFinite(max[1]) ? max[1] - (min[1] ?? 0) : 0,
@@ -656,8 +1175,11 @@ export function interleavedBufferViews(glb: Buffer): number {
   return interleaved;
 }
 
-/** Re-reads a written GLB and fails the model when the artifact does not hold up. */
-export async function validateGlb(path: string): Promise<{ bytes: number; sha256: string }> {
+/** Re-reads a written GLB and fails the artifact when it does not hold up. */
+export async function validateGlb(
+  path: string,
+  options: { readonly allowEmptyScene?: boolean } = {},
+): Promise<{ bytes: number; sha256: string }> {
   const bytes = await readFile(path);
   if (bytes.length < 20 || bytes.readUInt32LE(0) !== 0x46546c67) {
     throw new ImportError("UNREAL_GLB_INVALID", `${basename(path)} is not a glTF binary container.`);
@@ -672,10 +1194,10 @@ export async function validateGlb(path: string): Promise<{ bytes: number; sha256
   const document = await io.readBinary(new Uint8Array(bytes));
   const root = document.getRoot();
   const meshes = root.listMeshes();
-  if (meshes.length === 0) {
+  if (meshes.length === 0 && !options.allowEmptyScene) {
     throw new ImportError("UNREAL_GLB_INVALID", `${basename(path)} contains no mesh.`);
   }
-  const hasVertices = meshes.some((mesh) =>
+  const hasVertices = meshes.length === 0 || meshes.some((mesh) =>
     mesh.listPrimitives().some((primitive) => (primitive.getAttribute("POSITION")?.getCount() ?? 0) > 0),
   );
   if (!hasVertices) {
@@ -697,6 +1219,77 @@ export async function validateGlb(path: string): Promise<{ bytes: number; sha256
     }
   }
   return { bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") };
+}
+
+export interface AudioInspection {
+  readonly extension: "wav" | "ogg" | "mp3" | "flac";
+  readonly mimeType: string;
+  readonly durationSeconds: number | undefined;
+  readonly channels: number | undefined;
+  readonly sampleRate: number | undefined;
+}
+
+export interface RadianceInspection {
+  readonly width: number;
+  readonly height: number;
+  readonly pixelOffset: number;
+}
+
+/** Reads the ASCII envelope shared by flat and scanline-RLE Radiance RGBE files. */
+export function inspectRadiance(data: Buffer): RadianceInspection | undefined {
+  if (data.length < 32 || !data.subarray(0, 10).toString("ascii").startsWith("#?RADIANCE")) return undefined;
+  const head = data.subarray(0, Math.min(data.length, 8_192)).toString("ascii");
+  if (!/^FORMAT=32-bit_rle_rgbe$/m.test(head)) return undefined;
+  const match = /(?:^|\n)-Y\s+(\d+)\s+\+X\s+(\d+)\r?\n/.exec(head);
+  if (!match?.[1] || !match[2]) return undefined;
+  const height = Number(match[1]);
+  const width = Number(match[2]);
+  if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width <= 0 || height <= 0) return undefined;
+  return { width, height, pixelOffset: match.index + match[0].length };
+}
+
+/** Recognizes formats browser AudioContext decoders commonly accept; parses WAV metadata exactly. */
+export function inspectWebAudio(data: Buffer): AudioInspection | undefined {
+  if (data.length >= 12 && data.subarray(0, 4).toString("ascii") === "RIFF" && data.subarray(8, 12).toString("ascii") === "WAVE") {
+    let at = 12;
+    let channels: number | undefined;
+    let sampleRate: number | undefined;
+    let byteRate: number | undefined;
+    let sampleBytes: number | undefined;
+    while (at + 8 <= data.length) {
+      const id = data.subarray(at, at + 4).toString("ascii");
+      const size = data.readUInt32LE(at + 4);
+      const body = at + 8;
+      if (body + size > data.length) return undefined;
+      if (id === "fmt " && size >= 16) {
+        channels = data.readUInt16LE(body + 2);
+        sampleRate = data.readUInt32LE(body + 4);
+        byteRate = data.readUInt32LE(body + 8);
+      } else if (id === "data") sampleBytes = size;
+      at = body + size + (size % 2);
+    }
+    if (!channels || !sampleRate || !byteRate || sampleBytes === undefined) return undefined;
+    return {
+      extension: "wav",
+      mimeType: "audio/wav",
+      durationSeconds: sampleBytes / byteRate,
+      channels,
+      sampleRate,
+    };
+  }
+  if (data.length >= 4 && data.subarray(0, 4).toString("ascii") === "OggS") {
+    return { extension: "ogg", mimeType: "audio/ogg", durationSeconds: undefined, channels: undefined, sampleRate: undefined };
+  }
+  if (
+    data.length >= 3 &&
+    (data.subarray(0, 3).toString("ascii") === "ID3" || (data[0] === 0xff && ((data[1] ?? 0) & 0xe0) === 0xe0))
+  ) {
+    return { extension: "mp3", mimeType: "audio/mpeg", durationSeconds: undefined, channels: undefined, sampleRate: undefined };
+  }
+  if (data.length >= 4 && data.subarray(0, 4).toString("ascii") === "fLaC") {
+    return { extension: "flac", mimeType: "audio/flac", durationSeconds: undefined, channels: undefined, sampleRate: undefined };
+  }
+  return undefined;
 }
 
 async function freeBytes(path: string): Promise<number> {
@@ -760,6 +1353,8 @@ export async function importUnrealDirectory(
         listingId: request.listingId ?? null,
         maxTextureSize: request.maxTextureSize ?? null,
         only: request.onlyPackages ? [...request.onlyPackages].sort() : null,
+        uncookedConverter: request.uncookedConverter?.version ?? null,
+        modernConverter: request.modernConverter?.version ?? null,
       }),
     )
     .digest("hex");
@@ -790,13 +1385,35 @@ export async function importUnrealDirectory(
   const staging = join(cacheRoot(environment), cacheKey);
   const raw = join(staging, "raw");
   await mkdir(raw, { recursive: true });
-  const required = Math.max(totalBytes, 2 * 1024 ** 3);
-  const available = await freeBytes(staging);
+  const promotionParent = dirname(outputDir);
+  await mkdir(promotionParent, { recursive: true });
+  // Unbounded scene assembly can temporarily hold model GLBs plus a source-sized aggregate GLB.
+  // Staging and output may be different volumes, so checking only the cache volume is insufficient.
+  const minimum = 2 * 1024 ** 3;
+  const stagingRequired = totalBytes;
+  const outputRequired = totalBytes * (request.maxTextureSize === undefined ? 2 : 1);
+  const stagingDevice = (await stat(staging)).dev;
+  const outputDevice = (await stat(promotionParent)).dev;
+  const required = Math.max(
+    stagingDevice === outputDevice ? stagingRequired + outputRequired : outputRequired,
+    minimum,
+  );
+  const available = await freeBytes(promotionParent);
   if (available < required) {
     throw new ImportError(
       "UNREAL_DISK_SPACE",
-      `The import needs about ${Math.round(required / 1024 ** 3)} GiB of staging space; ${Math.round(available / 1024 ** 3)} GiB is free at ${staging}.`,
+      `The import needs about ${Math.ceil(required / 1024 ** 3)} GiB on the output volume; ${Math.floor(available / 1024 ** 3)} GiB is free at ${promotionParent}. Use --max-texture-size or choose an output on a larger volume.`,
     );
+  }
+  if (stagingDevice !== outputDevice) {
+    const stagingAvailable = await freeBytes(staging);
+    const separateStagingRequired = Math.max(stagingRequired, minimum);
+    if (stagingAvailable < separateStagingRequired) {
+      throw new ImportError(
+        "UNREAL_DISK_SPACE",
+        `The import needs about ${Math.ceil(separateStagingRequired / 1024 ** 3)} GiB of staging space; ${Math.floor(stagingAvailable / 1024 ** 3)} GiB is free at ${staging}.`,
+      );
+    }
   }
 
   const wanted = request.onlyPackages ? new Set(request.onlyPackages) : undefined;
@@ -805,6 +1422,7 @@ export async function importUnrealDirectory(
       file: file.path,
       package: basename(file.path, extname(file.path)),
       relative: relative(sourceDir, file.path).split(sep).join("/"),
+      selector: relative(sourceDir, file.path).split(sep).join("/").slice(0, -extname(file.path).length),
       extension: extname(file.path).toLowerCase(),
     }))
     .filter((entry) => !wanted || wanted.has(entry.package));
@@ -819,45 +1437,187 @@ export async function importUnrealDirectory(
     if (unsupported) {
       return {
         package: entry.relative,
+        selector: entry.selector,
         file: entry.file,
         classes: [],
-        hasStaticMesh: false,
+        meshKind: undefined,
+        hasAnimation: false,
+        hasTexture: false,
+        hasCubemap: false,
+        hasMaterial: false,
+        hasSound: false,
+        dataClass: undefined,
+        textureStackClass: undefined,
+        hasFont: false,
+        hasBlueprintPrefab: false,
+        paperClass: undefined,
+        needsModernConverter: false,
         error: unsupported,
       };
     }
     try {
       const run = await runBounded(
         umodel.path,
-        [`-path=${sourceDir}`, "-list", entry.package],
+        [`-path=${sourceDir}`, "-list", entry.selector],
         { timeoutMs: 300_000, maxOutputBytes: 16 * 1024 * 1024 },
       );
       const { classes } = parseUmodelList(run.stdout);
+      const cooking = await readPackageCooking(entry.file);
+      if (cooking?.materialHint && !classes.some((className) => className === "Material" || className === "MaterialInstanceConstant")) classes.push("Material");
+      if (cooking?.levelHint && !classes.includes("Level")) classes.push("Level");
+      const meshKind =
+        classes.includes("SkeletalMesh")
+          ? "skeletal"
+          : classes.includes("StaticMesh")
+            ? "static"
+            : cooking?.meshKindHint;
+      const isMapBuildData = classes.includes("MapBuildDataRegistry");
+      const hasTexture = !isMapBuildData && (classes.includes("Texture2D") || cooking?.textureHint === true);
+      // MapBuildDataRegistry owns transient reflection-capture cubes that are tied to baked level
+      // lighting. They are not standalone environment assets and cannot be meaningfully reused.
+      const hasCubemap =
+        !isMapBuildData && (classes.includes("TextureCube") || cooking?.cubemapHint === true);
+      const hasMaterial = classes.some((className) =>
+        ["Material", "Material3", "MaterialInstance", "MaterialInstanceConstant"].includes(className),
+      );
+      const hasSound = classes.includes("SoundWave") || cooking?.soundHint === true;
+      const dataClass = classes.find((className) => DATA_ASSET_CLASSES.has(className)) ?? cooking?.dataClassHint;
+      const textureStackClass =
+        classes.find((className) => TEXTURE_STACK_CLASSES.has(className)) ?? cooking?.textureStackClassHint;
+      const hasFont = classes.some((className) => className === "Font" || className === "FontFace") || cooking?.fontHint === true;
+      const paperClass = classes.includes("PaperSprite") ? "PaperSprite"
+        : classes.includes("PaperFlipbook") ? "PaperFlipbook"
+        : classes.includes("PaperTileMap") ? "PaperTileMap"
+        : classes.includes("PaperTileSet") ? "PaperTileSet"
+        : undefined;
+      const modernHeader = cooking.legacyFileVersion !== undefined && cooking.legacyFileVersion <= -8;
+      const hasBlueprintPrefab = classes.includes("BlueprintGeneratedClass") || cooking?.blueprintPrefabHint === true;
+      const needsModernConverter = modernHeader && (
+        hasMaterial ||
+        hasBlueprintPrefab ||
+        (run.code !== 0 && (meshKind !== undefined || hasTexture || hasCubemap || hasSound || dataClass !== undefined || textureStackClass !== undefined))
+      );
       return {
         package: entry.relative,
+        selector: entry.selector,
         file: entry.file,
         classes,
-        hasStaticMesh: classes.includes("StaticMesh"),
+        meshKind,
+        hasAnimation:
+          classes.some((className) => ["AnimSequence", "AnimSet", "MeshAnimation"].includes(className)) ||
+          (classes.includes("Skeleton") && !classes.includes("SkeletalMesh")),
+        hasTexture,
+        hasCubemap,
+        hasMaterial,
+        hasSound,
+        dataClass,
+        textureStackClass,
+        hasFont,
+        hasBlueprintPrefab,
+        paperClass,
+        needsModernConverter,
         error:
-          run.code === 0
+          run.code === 0 || needsModernConverter || hasFont || paperClass !== undefined || cooking?.levelHint === true
             ? undefined
             : `UE Viewer could not list the package (exit ${run.code}).`,
       };
     } catch (error) {
       return {
         package: entry.relative,
+        selector: entry.selector,
         file: entry.file,
         classes: [],
-        hasStaticMesh: false,
+        meshKind: undefined,
+        hasAnimation: false,
+        hasTexture: false,
+        hasCubemap: false,
+        hasMaterial: false,
+        hasSound: false,
+        dataClass: undefined,
+        textureStackClass: undefined,
+        hasFont: false,
+        hasBlueprintPrefab: false,
+        paperClass: undefined,
+        needsModernConverter: false,
         error: error instanceof ToolchainError ? error.message : "UE Viewer failed to list the package.",
       };
     }
   });
 
-  const meshPackages = classified.filter((entry) => entry.hasStaticMesh && !entry.error);
+  const meshPackages = classified.filter((entry) => entry.meshKind !== undefined && !entry.error);
+  const animationPackages = classified.filter((entry) => entry.hasAnimation && !entry.error);
+  // A Texture2D export nested in an offline UFont is its glyph atlas, not a standalone texture
+  // asset. It is promoted with metrics below so it cannot produce a duplicate false failure.
+  const texturePackages = classified.filter((entry) => entry.hasTexture && !entry.hasFont && !entry.error);
+  const cubemapPackages = classified.filter((entry) => entry.hasCubemap && !entry.error);
+  const materialPackages = classified.filter((entry) => entry.hasMaterial && !entry.error);
+  const soundPackages = classified.filter((entry) => entry.hasSound && !entry.error);
+  const dataPackages = classified.filter((entry) => entry.dataClass !== undefined && !entry.error);
+  const textureStackPackages = classified.filter((entry) => entry.textureStackClass !== undefined && !entry.error);
+  const fontPackages = classified.filter((entry) => entry.hasFont && !entry.error);
+  const offlineFontPackages = fontPackages.filter((entry) => entry.classes.includes("Font") && entry.classes.includes("Texture2D"));
+  const paperPackages = classified.filter((entry) => entry.paperClass !== undefined && !entry.error);
+  const levelCandidates = classified.filter(
+    (entry) =>
+      entry.file.toLowerCase().endsWith(".umap") &&
+      entry.classes.includes("Level") &&
+      !entry.error,
+  );
+  const levelCooking = await mapWithConcurrency(levelCandidates, concurrency, async (entry) => ({
+    entry,
+    ...(await readPackageCooking(entry.file)),
+  }));
+  const mapPackages = levelCooking
+    .filter(
+      ({ legacyFileVersion, fileVersionUE4 }) =>
+        legacyFileVersion !== undefined && legacyFileVersion >= -7 && fileVersionUE4 !== undefined && fileVersionUE4 >= 517 && fileVersionUE4 <= 522,
+    )
+    .map(({ entry }) => entry);
+  const modernMapPackages = levelCooking
+    .filter(({ legacyFileVersion }) => legacyFileVersion !== undefined && legacyFileVersion <= -8)
+    .map(({ entry }) => entry);
+  const blueprintCandidates = classified.filter((entry) =>
+    entry.file.toLowerCase().endsWith(".uasset") && entry.hasBlueprintPrefab && !entry.error,
+  );
+  const blueprintCooking = await mapWithConcurrency(blueprintCandidates, concurrency, async (entry) => ({
+    entry,
+    ...(await readPackageCooking(entry.file)),
+  }));
+  const modernPrefabPackages = blueprintCooking
+    .filter(({ legacyFileVersion }) => legacyFileVersion !== undefined && legacyFileVersion <= -8)
+    .map(({ entry }) => entry);
+  const prefabFiles = new Set(modernPrefabPackages.map((entry) => entry.file));
+  const unsupportedMaps = new Map<string, string>(
+    levelCooking
+      .filter(({ legacyFileVersion, fileVersionUE4 }) =>
+        !(legacyFileVersion !== undefined && legacyFileVersion <= -8) &&
+        (fileVersionUE4 === undefined || fileVersionUE4 < 517 || fileVersionUE4 > 522))
+      .map(({ entry, fileVersionUE4 }): [string, string] => [
+        entry.file,
+        `Unreal level uses object version ${fileVersionUE4 ?? "unknown"}; engine-free scene reconstruction is verified for versions 517–522.`,
+      ]),
+  );
+  const mapFiles = new Set([...mapPackages, ...modernMapPackages].map((entry) => entry.file));
+  // A World Partition .umap may embed UStaticMesh exports for landscape/HLOD cells. Those are
+  // level dependencies, not a second standalone mesh package for the map itself.
+  const assetMeshPackages = meshPackages.filter((entry) => !mapFiles.has(entry.file));
   const skipped: { package: string; reason: string }[] = [];
   const failed: { package: string; reason: string }[] = [];
   for (const entry of classified) {
-    if (entry.hasStaticMesh && !entry.error) continue;
+    if (
+      (entry.meshKind !== undefined && !entry.error) ||
+      (entry.hasAnimation && !entry.error) ||
+      (entry.hasTexture && !entry.error) ||
+      (entry.hasCubemap && !entry.error) ||
+      (entry.hasMaterial && !entry.error) ||
+      (entry.hasSound && !entry.error) ||
+      (entry.dataClass !== undefined && !entry.error) ||
+      (entry.textureStackClass !== undefined && !entry.error) ||
+      (entry.hasFont && !entry.error) ||
+      (entry.paperClass !== undefined && !entry.error) ||
+      prefabFiles.has(entry.file) ||
+      mapFiles.has(entry.file)
+    ) continue;
     if (entry.error && !UNSUPPORTED_EXTENSIONS.has(extname(entry.file).toLowerCase())) {
       failed.push({ package: entry.package, reason: entry.error });
       continue;
@@ -866,29 +1626,81 @@ export async function importUnrealDirectory(
     skipped.push({
       package: entry.package,
       reason:
-        entry.error ??
-        (unsupportedClass
+        entry.error ?? unsupportedMaps.get(entry.file) ??
+        (extname(entry.file).toLowerCase() === ".umap"
+          ? "Unreal level has no supported Level export to reconstruct"
+          : unsupportedClass
           ? `unsupported Unreal-only content: ${UNSUPPORTED_CLASSES.get(unsupportedClass)}`
           : entry.classes.length === 0
             ? "no exportable object"
-            : `carries no StaticMesh (${summarizeClasses(entry.classes)})`),
+            : `carries no directly importable mesh, texture, or level (${summarizeClasses(entry.classes)})`),
     });
   }
 
-  if (meshPackages.length === 0) {
+  if (
+    assetMeshPackages.length === 0 &&
+    mapPackages.length === 0 &&
+    modernMapPackages.length === 0 &&
+    modernPrefabPackages.length === 0 &&
+    texturePackages.length === 0 &&
+    cubemapPackages.length === 0 &&
+    materialPackages.length === 0 &&
+    soundPackages.length === 0
+    && dataPackages.length === 0 &&
+    textureStackPackages.length === 0
+    && fontPackages.length === 0
+    && paperPackages.length === 0
+  ) {
+    const animationOnly = animationPackages.length > 0
+      ? ` Found ${animationPackages.length} animation package${animationPackages.length === 1 ? "" : "s"}, but no compatible SkeletalMesh to receive those tracks.`
+      : "";
     throw new ImportError(
       "UNREAL_EXPORT_EMPTY",
-      `No package under "${sourceDir}" contains a StaticMesh, so there is nothing to convert.`,
+      `No package under "${sourceDir}" contains a supported StaticMesh, SkeletalMesh, Texture2D, TextureCube, multidimensional texture, Material, SoundWave, Font, PaperSprite, PaperFlipbook, structured data, or Level, so there is nothing to convert.${animationOnly}`,
+    );
+  }
+
+  // An uncooked package lists as a StaticMesh and exports as nothing, so this has to be checked
+  // before the export loop rather than inferred from its silence afterwards. Only a unanimous
+  // verdict fails the import: one odd package among many is a package to skip, not a broken pack.
+  const cooking = await mapWithConcurrency(assetMeshPackages, concurrency, async (entry) => ({
+    entry,
+    package: entry.package,
+    ...(await readPackageCooking(entry.file)),
+  }));
+  const modernPackages = cooking.filter(
+    ({ entry, state }) => entry.needsModernConverter || (entry.meshKind === "skeletal" && state === "uncooked"),
+  );
+  const modernTexturePackages = texturePackages.filter((entry) => entry.needsModernConverter);
+  const modernMaterialPackages = materialPackages.filter((entry) => entry.needsModernConverter);
+  const modernSoundPackages = soundPackages.filter((entry) => entry.needsModernConverter);
+  const modernFiles = new Set(modernPackages.map(({ entry }) => entry.file));
+  const exportableMeshPackages = assetMeshPackages.filter(
+    (entry) => !modernFiles.has(entry.file),
+  );
+  const uncooked = cooking.filter(
+    ({ entry, state }) => entry.meshKind === "static" && state === "uncooked" && !entry.needsModernConverter,
+  );
+  const unsupportedUncooked = uncooked.filter(
+    (entry) =>
+      entry.fileVersionUE4 === undefined ||
+      entry.fileVersionUE4 < 517 ||
+      entry.fileVersionUE4 > 522,
+  );
+  if (unsupportedUncooked.length > 0) {
+    const versions = [...new Set(unsupportedUncooked.map((entry) => entry.fileVersionUE4 ?? "unknown"))];
+    throw new ImportError(
+      "UNREAL_SOURCE_UNSUPPORTED",
+      `${unsupportedUncooked.length} uncooked static-mesh package${unsupportedUncooked.length === 1 ? " uses" : "s use"} UE4 object version ${versions.join(", ")}. The engine-free MeshDescription path is verified for versions 517–522 (UE4.26/4.27-era source assets); refusing to guess at a different binary layout.`,
     );
   }
 
   // Packages share textures, so two exporters can write the same PNG at once and `-nooverwrite`
   // would see a half-written file as done. Listing is read-only and parallel; exporting is not.
-  log(`Exporting ${meshPackages.length} static-mesh packages with UE Viewer…`);
-  const exportFailures = await mapWithConcurrency(meshPackages, 1, async (entry) => {
-    const name = basename(entry.package, extname(entry.package));
+  log(`Exporting ${exportableMeshPackages.length} static/skeletal mesh packages with UE Viewer…`);
+  const exportFailures = await mapWithConcurrency(exportableMeshPackages, 1, async (entry) => {
     try {
-      const run = await runBounded(
+      let run = await runBounded(
         umodel.path,
         [
           `-path=${sourceDir}`,
@@ -897,10 +1709,28 @@ export async function importUnrealDirectory(
           "-png",
           "-nooverwrite",
           `-out=${raw}`,
-          name,
+          entry.selector,
         ],
         { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
       );
+      // UE Viewer occasionally exits non-zero for one package under filesystem pressure even
+      // though the same read-only export succeeds immediately afterward. One bounded retry keeps
+      // a transient process failure from silently removing a mesh from an otherwise valid pack.
+      if (run.code !== 0) {
+        run = await runBounded(
+          umodel.path,
+          [
+            `-path=${sourceDir}`,
+            "-export",
+            "-gltf",
+            "-png",
+            "-nooverwrite",
+            `-out=${raw}`,
+            entry.selector,
+          ],
+          { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
+        );
+      }
       if (run.code !== 0) {
         return { package: entry.package, reason: `UE Viewer export exited ${run.code}.` };
       }
@@ -914,11 +1744,642 @@ export async function importUnrealDirectory(
   });
   for (const failure of exportFailures) if (failure) failed.push(failure);
 
-  const assets = await indexExported(raw);
+  let assets = await indexExported(raw);
   log(`UE Viewer wrote ${assets.gltf.size} glTF meshes and ${assets.png.size} textures.`);
 
-  const promotionParent = dirname(outputDir);
-  await mkdir(promotionParent, { recursive: true });
+  // Mesh exports often bring their materials along, but a material-only pack has no mesh to
+  // trigger that side effect. Export missing materials explicitly. Duplicate basenames are kept
+  // in isolated directories so UE Viewer and our indexes cannot silently conflate packages.
+  const materialNameCounts = new Map<string, number>();
+  for (const entry of materialPackages) {
+    const name = basename(entry.package, extname(entry.package));
+    materialNameCounts.set(name, (materialNameCounts.get(name) ?? 0) + 1);
+  }
+  const materialAssetsByFile = new Map<string, ExportedAssets>();
+  const materialFallbackPackages: PackageClassification[] = [];
+  const materialsNeedingExport = materialPackages.filter((entry) => {
+    if (entry.needsModernConverter) return false;
+    const name = basename(entry.package, extname(entry.package));
+    const reusable = materialNameCounts.get(name) === 1 && assets.mat.has(name) && assets.props.has(name);
+    if (reusable) materialAssetsByFile.set(entry.file, assets);
+    return !reusable;
+  });
+  if (materialsNeedingExport.length > 0) {
+    const standaloneRaw = join(staging, "standalone-materials");
+    await mkdir(standaloneRaw, { recursive: true });
+    log(
+      `Exporting ${materialsNeedingExport.length} standalone or duplicate-named Material package${materialsNeedingExport.length === 1 ? "" : "s"}…`,
+    );
+    const results = await mapWithConcurrency(materialsNeedingExport, 1, async (entry, index) => {
+      const isolated = join(standaloneRaw, String(index).padStart(5, "0"));
+      await mkdir(isolated, { recursive: true });
+      try {
+        const run = await runBounded(
+          umodel.path,
+          [`-path=${sourceDir}`, "-export", "-png", `-out=${isolated}`, entry.selector],
+          { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
+        );
+        if (run.code !== 0) return { entry, reason: `UE Viewer material export exited ${run.code}.` };
+        const exported = await indexExported(isolated);
+        // UE Viewer intentionally ignores a Material whose graph has no texture parameters.
+        // It is still useful as a named glass/light/mirror/neutral PBR swatch, and packageGlb's
+        // explicit fallback makes that approximation visible instead of failing the whole pack.
+        return { entry, exported };
+      } catch (error) {
+        return {
+          entry,
+          reason: error instanceof ToolchainError ? error.message : "UE Viewer material export failed.",
+        };
+      }
+    });
+    for (const result of results) {
+      if (result.exported) {
+        materialAssetsByFile.set(result.entry.file, result.exported);
+        // A unique material exported here may also be referenced by a mesh whose export omitted
+        // it. Duplicate names deliberately remain package-local.
+        const name = basename(result.entry.package, extname(result.entry.package));
+        if (materialNameCounts.get(name) === 1) assets = mergeExported(assets, result.exported);
+      } else {
+        materialFallbackPackages.push(result.entry);
+      }
+    }
+  }
+
+  // Preserve standalone textures as first-class outputs. Reuse images already emitted while
+  // walking meshes when the package basename is unique; duplicate names must be exported into
+  // isolated directories or UE Viewer's basename lookup would silently select the first one.
+  const textureSources = new Map<string, string>();
+  const cubemapSources = new Map<string, string>();
+  const audioSources = new Map<string, string>();
+  const dataSources = new Map<string, string>();
+  const textureStackSources = new Map<string, string>();
+  const offlineFontSources = new Map<string, string>();
+  const paperSpriteSources: { entry: PackageClassification; descriptor: string }[] = [];
+  const paperFlipbookSources = new Map<string, string>();
+  const paperTileSources: { entry: PackageClassification; descriptor: string }[] = [];
+  const textureNameCounts = new Map<string, number>();
+  for (const entry of texturePackages) {
+    if (entry.needsModernConverter) continue;
+    const name = basename(entry.package, extname(entry.package));
+    textureNameCounts.set(name, (textureNameCounts.get(name) ?? 0) + 1);
+  }
+  const texturesNeedingExport: PackageClassification[] = [];
+  for (const entry of texturePackages) {
+    if (entry.needsModernConverter) continue;
+    const name = basename(entry.package, extname(entry.package));
+    const shared = assets.png.get(name);
+    if (textureNameCounts.get(name) === 1 && shared) textureSources.set(entry.file, shared);
+    else texturesNeedingExport.push(entry);
+  }
+  if (texturesNeedingExport.length > 0) {
+    const standaloneRaw = join(staging, "standalone-textures");
+    await mkdir(standaloneRaw, { recursive: true });
+    log(
+      `Exporting ${texturesNeedingExport.length} standalone or duplicate-named Texture2D package${texturesNeedingExport.length === 1 ? "" : "s"}…`,
+    );
+    // UE Viewer uses process-global image codecs that can intermittently leave empty PNGs when
+    // several exporter processes run together. Keep this narrow phase serial; packaging remains
+    // concurrent and deterministic after all source images are complete.
+    const results = await mapWithConcurrency(texturesNeedingExport, 1, async (entry, index) => {
+      const name = basename(entry.package, extname(entry.package));
+      const isolated = join(standaloneRaw, String(index).padStart(5, "0"));
+      await mkdir(isolated, { recursive: true });
+      try {
+        const run = await runBounded(
+          umodel.path,
+          [`-path=${sourceDir}`, "-export", "-png", `-out=${isolated}`, entry.selector],
+          { timeoutMs: 1_800_000, maxOutputBytes: 16 * 1024 * 1024 },
+        );
+        if (run.code !== 0) {
+          return { entry, reason: `UE Viewer texture export exited ${run.code}.` };
+        }
+        const emitted = (await listFiles(isolated)).find(
+          (file) => basename(file.path).toLowerCase() === `${name}.png`.toLowerCase(),
+        );
+        return emitted
+          ? { entry, source: emitted.path }
+          : { entry, reason: "UE Viewer recognized Texture2D but produced no PNG." };
+      } catch (error) {
+        return {
+          entry,
+          reason: error instanceof ToolchainError ? error.message : "UE Viewer texture export failed.",
+        };
+      }
+    });
+    for (const result of results) {
+      if (result.source) textureSources.set(result.entry.file, result.source);
+      else failed.push({ package: result.entry.package, reason: result.reason ?? "Texture export failed." });
+    }
+  }
+
+  const legacySoundPackages = soundPackages.filter((entry) => !entry.needsModernConverter);
+  if (legacySoundPackages.length > 0) {
+    const standaloneRaw = join(staging, "standalone-audio");
+    await mkdir(standaloneRaw, { recursive: true });
+    log(`Exporting ${legacySoundPackages.length} SoundWave package${legacySoundPackages.length === 1 ? "" : "s"}…`);
+    const results = await mapWithConcurrency(legacySoundPackages, Math.min(4, concurrency), async (entry, index) => {
+      const name = basename(entry.package, extname(entry.package));
+      const isolated = join(standaloneRaw, String(index).padStart(5, "0"));
+      await mkdir(isolated, { recursive: true });
+      try {
+        const run = await runBounded(
+          umodel.path,
+          [`-path=${sourceDir}`, "-export", "-sounds", `-out=${isolated}`, entry.selector],
+          { timeoutMs: 1_800_000, maxOutputBytes: 16 * 1024 * 1024 },
+        );
+        if (run.code !== 0) return { entry, reason: `UE Viewer sound export exited ${run.code}.` };
+        const emitted = (await listFiles(isolated)).find(
+          (file) => basename(file.path, extname(file.path)).toLowerCase() === name.toLowerCase() &&
+            [".wav", ".ogg", ".mp3", ".flac"].includes(extname(file.path).toLowerCase()),
+        );
+        return emitted
+          ? { entry, source: emitted.path }
+          : { entry, reason: "UE Viewer recognized SoundWave but produced no web-decodable audio file." };
+      } catch (error) {
+        return {
+          entry,
+          reason: error instanceof ToolchainError ? error.message : "UE Viewer sound export failed.",
+        };
+      }
+    });
+    for (const result of results) {
+      if (result.source) audioSources.set(result.entry.file, result.source);
+      else failed.push({ package: result.entry.package, reason: result.reason ?? "Sound export failed." });
+    }
+  }
+
+  const psaFiles: PsaFile[] = [];
+  if (animationPackages.length > 0) {
+    const animationRaw = join(staging, "animations");
+    await mkdir(animationRaw, { recursive: true });
+    log(`Exporting ${animationPackages.length} standalone animation packages as ActorX PSA…`);
+    const animationFailures = await mapWithConcurrency(animationPackages, 1, async (entry) => {
+      try {
+        const run = await runBounded(
+          umodel.path,
+          [
+            `-path=${sourceDir}`,
+            "-export",
+            "-psk",
+            "-nooverwrite",
+            `-out=${animationRaw}`,
+            entry.selector,
+          ],
+          { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
+        );
+        return run.code === 0
+          ? undefined
+          : { package: entry.package, reason: `UE Viewer animation export exited ${run.code}.` };
+      } catch (error) {
+        return {
+          package: entry.package,
+          reason: error instanceof ToolchainError ? error.message : "UE Viewer animation export failed.",
+        };
+      }
+    });
+    for (const failure of animationFailures) if (failure) failed.push(failure);
+    const animationAssets = await indexExported(animationRaw);
+    for (const [name, path] of animationAssets.psa) {
+      try {
+        const parsed = parsePsa(await readFile(path));
+        psaFiles.push(parsed);
+        if (parsed.hasScaleKeys) {
+          warnings.push(
+            `${name}.psa contains ActorX scale keys; translation and rotation were converted, while per-frame bone scale remains unsupported.`,
+          );
+        }
+      } catch (error) {
+        failed.push({
+          package: animationPackages.find((entry) => basename(entry.package, extname(entry.package)) === name)?.package ?? name,
+          reason: `ActorX PSA conversion failed: ${error instanceof Error ? error.message : "unknown error"}`,
+        });
+      }
+    }
+    if (animationAssets.psa.size === 0 && animationFailures.every((entry) => entry === undefined)) {
+      for (const entry of animationPackages) {
+        failed.push({
+          package: entry.package,
+          reason: "UE Viewer recognized animation content but produced no ActorX PSA output.",
+        });
+      }
+    }
+  }
+
+  let uncookedConverter: ExternalTool | undefined;
+  let uncookedGlbs = new Map<string, string>();
+  let modernConverter: ExternalTool | undefined;
+  let modernGlbs = new Map<string, string>();
+  const modernSceneModelSources: {
+    readonly entry: PackageClassification;
+    readonly name: string;
+    readonly glb: string;
+    readonly assets: ExportedAssets;
+  }[] = [];
+  const sceneSources = join(staging, "scene-sources");
+  const sceneSourcePaths = new Map<string, string>();
+  const sceneSourcePathFor = (entry: PackageClassification): string =>
+    assertContained(sceneSources, `${entry.package.slice(0, -extname(entry.package).length)}.scene-source.json`);
+  if (uncooked.length > 0 || mapPackages.length > 0) {
+    uncookedConverter = request.uncookedConverter ?? (await ensureUncookedConverter(environment, log));
+    const uncookedRaw = join(staging, "uncooked");
+    const args =
+      uncooked.length > 0
+        ? [sourceDir, "--export-dir", uncookedRaw, "--skip-textures"]
+        : [sourceDir, "--export-dir", uncookedRaw, "--skip-export"];
+    if (uncooked.length > 0 && request.onlyPackages?.length === 1 && request.onlyPackages[0]) {
+      args.push("--filter", request.onlyPackages[0]);
+    }
+    if (mapPackages.length > 0) args.push("--scene-json-dir", sceneSources);
+    const actions = [
+      ...(uncooked.length > 0
+        ? [`${uncooked.length} uncooked MeshDescription package${uncooked.length === 1 ? "" : "s"}`]
+        : []),
+      ...(mapPackages.length > 0
+        ? [`${mapPackages.length} Unreal level${mapPackages.length === 1 ? "" : "s"}`]
+        : []),
+    ];
+    log(`Decoding ${actions.join(" and ")}…`);
+    const converted = await runBounded(uncookedConverter.path, args, {
+      timeoutMs: 1_800_000,
+      maxOutputBytes: 64 * 1024 * 1024,
+    });
+    if (converted.code !== 0) {
+      throw new ToolchainError(
+        "UNREAL_TOOL_FAILED",
+        `The uncooked MeshDescription converter exited ${converted.code}; no partial output was promoted.`,
+      );
+    }
+    if (uncooked.length > 0) {
+      uncookedGlbs = await indexGlbs(uncookedRaw);
+      warnings.push(
+        `Decoded ${uncooked.length} requested uncooked UE4 MeshDescription GLB${uncooked.length === 1 ? "" : "s"} without Unreal Engine; UE Viewer supplied their source textures and material metadata.`,
+      );
+    }
+    for (const entry of mapPackages) {
+      sceneSourcePaths.set(entry.file, join(sceneSources, `${basename(entry.package, extname(entry.package))}.scene-source.json`));
+    }
+  }
+  const uncookedNames = new Set(uncooked.map((entry) => basename(entry.package, extname(entry.package))));
+  const modernAssetCount = modernPackages.length + modernTexturePackages.length;
+  if (modernAssetCount > 0) {
+    modernConverter = request.modernConverter ?? (await ensureModernConverter(environment, log));
+    const modernRaw = join(staging, "modern");
+    const args: string[] = [];
+    if (request.onlyPackages?.length === 1 && request.onlyPackages[0]) {
+      args.push("--filter", request.onlyPackages[0]);
+    }
+    log(`Decoding ${modernAssetCount} modern UE5 asset package${modernAssetCount === 1 ? "" : "s"}…`);
+    const converted = await runModernConverter(modernConverter.path, sourceDir, modernRaw, args, {
+      timeoutMs: 1_800_000,
+      maxOutputBytes: 64 * 1024 * 1024,
+    });
+    if (converted.code !== 0) {
+      const diagnosticLines = converted.stderr.trim().split(/\r?\n/);
+      const diagnostic =
+        diagnosticLines.find((line) => line.includes(".usmap")) ??
+        diagnosticLines.find((line) => /exception:/i.test(line)) ??
+        diagnosticLines.at(-1);
+      throw new ToolchainError(
+        "UNREAL_TOOL_FAILED",
+        `The modern UE5 asset converter exited ${converted.code}; no partial output was promoted.${diagnostic ? ` ${diagnostic.trim()}` : ""}`,
+      );
+    }
+    modernGlbs = await indexGlbs(modernRaw);
+    assets = mergeExported(assets, await indexExported(modernRaw));
+    for (const entry of modernTexturePackages) {
+      const name = basename(entry.package, extname(entry.package));
+      const source = assets.png.get(name);
+      if (source) textureSources.set(entry.file, source);
+      else failed.push({
+        package: entry.package,
+        reason: "The modern UE5 texture converter produced no PNG for this package.",
+      });
+    }
+    warnings.push(
+      `Decoded ${modernAssetCount} requested modern UE5 asset package${modernAssetCount === 1 ? "" : "s"} without Unreal Engine.`,
+    );
+  }
+  if (modernMapPackages.length > 0) {
+    modernConverter ??= request.modernConverter ?? (await ensureModernConverter(environment, log));
+    const mapRoot = join(staging, "modern-scenes");
+    await mkdir(mapRoot, { recursive: true });
+    await mkdir(sceneSources, { recursive: true });
+    log(`Decoding ${modernMapPackages.length} modern Unreal level${modernMapPackages.length === 1 ? "" : "s"}…`);
+    const results = await mapWithConcurrency(modernMapPackages, Math.min(2, concurrency), async (entry, index) => {
+      const name = basename(entry.package, extname(entry.package));
+      const isolated = join(mapRoot, String(index).padStart(5, "0"));
+      await mkdir(isolated, { recursive: true });
+      const converted = await runModernConverter(
+        modernConverter!.path,
+        sourceDir,
+        isolated,
+        ["--filter", entry.selector],
+        { timeoutMs: 1_800_000, maxOutputBytes: 64 * 1024 * 1024 },
+      );
+      if (converted.code !== 0) return { entry, spriteDescriptors: [] as string[], modelSources: [] as { name: string; glb: string }[], reason: `The modern level converter exited ${converted.code}.` };
+      const emitted = await listFiles(isolated);
+      const scene = emitted.find((file) => basename(file.path).toLowerCase() === `${name}.scene-source.json`.toLowerCase())?.path;
+      const spriteDescriptors = emitted.filter((file) => file.path.toLowerCase().endsWith(".sprite.json")).map((file) => file.path);
+      const glbs = await indexGlbs(isolated);
+      const modelSources = [...glbs].map(([modelName, glb]) => ({ name: modelName, glb }));
+      const exported = await indexExported(isolated);
+      return scene ? { entry, scene, spriteDescriptors, modelSources, exported } : { entry, spriteDescriptors, modelSources, exported, reason: "The modern level converter produced no scene descriptor." };
+    });
+    for (const result of results) {
+      for (const descriptor of result.spriteDescriptors) paperSpriteSources.push({ entry: result.entry, descriptor });
+      if (result.exported) {
+        for (const model of result.modelSources) modernSceneModelSources.push({ entry: result.entry, ...model, assets: result.exported });
+      }
+      if (result.scene) {
+        const target = sceneSourcePathFor(result.entry);
+        await mkdir(dirname(target), { recursive: true });
+        await writeFile(target, await readFile(result.scene));
+        sceneSourcePaths.set(result.entry.file, target);
+      }
+      else failed.push({ package: result.entry.package, reason: result.reason ?? "Modern level conversion failed." });
+    }
+    warnings.push(`Decoded ${modernMapPackages.length} modern Unreal level${modernMapPackages.length === 1 ? "" : "s"} without Unreal Engine.`);
+  }
+  if (modernPrefabPackages.length > 0) {
+    modernConverter ??= request.modernConverter ?? (await ensureModernConverter(environment, log));
+    const prefabRoot = join(staging, "modern-prefabs");
+    await mkdir(prefabRoot, { recursive: true });
+    await mkdir(sceneSources, { recursive: true });
+    log(`Decoding ${modernPrefabPackages.length} serialized Blueprint prefab${modernPrefabPackages.length === 1 ? "" : "s"}…`);
+    const results = await mapWithConcurrency(modernPrefabPackages, Math.min(2, concurrency), async (entry, index) => {
+      const name = basename(entry.package, extname(entry.package));
+      const isolated = join(prefabRoot, String(index).padStart(5, "0"));
+      const converted = await runModernConverter(
+        modernConverter!.path,
+        sourceDir,
+        isolated,
+        ["--filter", entry.selector],
+        { timeoutMs: 1_800_000, maxOutputBytes: 64 * 1024 * 1024 },
+      );
+      if (converted.code !== 0) return { entry, modelSources: [] as { name: string; glb: string }[], reason: `The Blueprint prefab converter exited ${converted.code}.` };
+      const emitted = await listFiles(isolated);
+      const scene = emitted.find((file) => basename(file.path).toLowerCase() === `${name}.prefab-source.json`.toLowerCase())?.path;
+      const glbs = await indexGlbs(isolated);
+      const modelSources = [...glbs].map(([modelName, glb]) => ({ name: modelName, glb }));
+      const exported = await indexExported(isolated);
+      return scene ? { entry, scene, modelSources, exported } : { entry, modelSources, exported, reason: "The Blueprint converter produced no prefab descriptor." };
+    });
+    for (const result of results) {
+      if (result.exported) {
+        for (const model of result.modelSources) modernSceneModelSources.push({ entry: result.entry, ...model, assets: result.exported });
+      }
+      if (result.scene) {
+        const target = sceneSourcePathFor(result.entry);
+        await mkdir(dirname(target), { recursive: true });
+        await writeFile(target, await readFile(result.scene));
+        sceneSourcePaths.set(result.entry.file, target);
+      }
+      else failed.push({ package: result.entry.package, reason: result.reason ?? "Blueprint prefab conversion failed." });
+    }
+    warnings.push(`Decoded ${modernPrefabPackages.length} serialized Blueprint prefab${modernPrefabPackages.length === 1 ? "" : "s"} without executing Unreal bytecode.`);
+  }
+  const modernMaterialCandidates = [...new Map(
+    [...modernMaterialPackages, ...materialFallbackPackages].map((entry) => [entry.file, entry]),
+  ).values()];
+  if (modernMaterialCandidates.length > 0) {
+    modernConverter ??= request.modernConverter ?? (await ensureModernConverter(environment, log));
+    const materialRoot = join(staging, "modern-materials");
+    await mkdir(materialRoot, { recursive: true });
+    log(`Decoding ${modernMaterialCandidates.length} modern/fallback Material package${modernMaterialCandidates.length === 1 ? "" : "s"}…`);
+    const results = await mapWithConcurrency(modernMaterialCandidates, Math.min(4, concurrency), async (entry, index) => {
+      const name = basename(entry.package, extname(entry.package));
+      const isolated = join(materialRoot, String(index).padStart(5, "0"));
+      await mkdir(isolated, { recursive: true });
+      const converted = await runModernConverter(
+        modernConverter!.path,
+        sourceDir,
+        isolated,
+        ["--filter", entry.selector],
+        { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
+      );
+      if (converted.code !== 0) return { entry, reason: `The modern Material converter exited ${converted.code}.` };
+      const exported = await indexExported(isolated);
+      return exported.mat.has(name) || exported.props.has(name)
+        ? { entry, exported }
+        : { entry, reason: "The modern Material converter produced no metadata." };
+    });
+    for (const result of results) {
+      if (result.exported) {
+        materialAssetsByFile.set(result.entry.file, result.exported);
+        const name = basename(result.entry.package, extname(result.entry.package));
+        if (materialNameCounts.get(name) === 1) assets = mergeExported(assets, result.exported);
+      } else {
+        failed.push({ package: result.entry.package, reason: result.reason ?? "Modern Material conversion failed." });
+      }
+    }
+    warnings.push(`Decoded ${modernMaterialCandidates.length} modern or UE Viewer-incompatible Unreal Material package${modernMaterialCandidates.length === 1 ? "" : "s"} without Unreal Engine.`);
+  }
+  if (modernSoundPackages.length > 0) {
+    modernConverter ??= request.modernConverter ?? (await ensureModernConverter(environment, log));
+    const modernAudioRoot = join(staging, "modern-audio");
+    await mkdir(modernAudioRoot, { recursive: true });
+    log(`Decoding ${modernSoundPackages.length} modern UE5 SoundWave package${modernSoundPackages.length === 1 ? "" : "s"}…`);
+    const results = await mapWithConcurrency(modernSoundPackages, Math.min(4, concurrency), async (entry, index) => {
+      const name = basename(entry.package, extname(entry.package));
+      const isolated = join(modernAudioRoot, String(index).padStart(5, "0"));
+      const converted = await runModernConverter(
+        modernConverter!.path,
+        sourceDir,
+        isolated,
+        ["--filter", entry.selector],
+        { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
+      );
+      if (converted.code !== 0) return { entry, reason: `The modern UE5 sound converter exited ${converted.code}.` };
+      const exported = await indexExported(isolated);
+      const source = exported.audio.get(name);
+      return source
+        ? { entry, source }
+        : { entry, reason: "The modern UE5 sound converter produced no web-decodable audio file." };
+    });
+    for (const result of results) {
+      if (result.source) audioSources.set(result.entry.file, result.source);
+      else failed.push({ package: result.entry.package, reason: result.reason ?? "Modern sound conversion failed." });
+    }
+    warnings.push(
+      `Decoded ${modernSoundPackages.length} requested modern UE5 SoundWave package${modernSoundPackages.length === 1 ? "" : "s"} without Unreal Engine.`,
+    );
+  }
+  if (cubemapPackages.length > 0) {
+    modernConverter ??= request.modernConverter ?? (await ensureModernConverter(environment, log));
+    const cubemapRoot = join(staging, "cubemaps");
+    await mkdir(cubemapRoot, { recursive: true });
+    log(`Decoding ${cubemapPackages.length} TextureCube package${cubemapPackages.length === 1 ? "" : "s"} to equirectangular environment maps…`);
+    // Isolate each package: Unreal permits duplicate object names in separate content paths, while
+    // the converter names its image after the object. A shared directory would silently collide.
+    const results = await mapWithConcurrency(cubemapPackages, Math.min(4, concurrency), async (entry, index) => {
+      const name = basename(entry.package, extname(entry.package));
+      const isolated = join(cubemapRoot, String(index).padStart(5, "0"));
+      await mkdir(isolated, { recursive: true });
+      const converted = await runModernConverter(
+        modernConverter!.path,
+        sourceDir,
+        isolated,
+        ["--filter", entry.selector],
+        { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
+      );
+      if (converted.code !== 0) return { entry, reason: `The TextureCube converter exited ${converted.code}.` };
+      const source = (await listFiles(isolated)).find((file) =>
+        basename(file.path, extname(file.path)).toLowerCase() === name.toLowerCase() &&
+          [".png", ".hdr"].includes(extname(file.path).toLowerCase()),
+      )?.path;
+      return source
+        ? { entry, source }
+        : { entry, reason: "The TextureCube converter produced no equirectangular PNG." };
+    });
+    for (const result of results) {
+      if (result.source) cubemapSources.set(result.entry.file, result.source);
+      else failed.push({ package: result.entry.package, reason: result.reason ?? "TextureCube conversion failed." });
+    }
+    warnings.push(
+      `Decoded ${cubemapPackages.length} requested TextureCube package${cubemapPackages.length === 1 ? "" : "s"} to Three.js equirectangular environment map${cubemapPackages.length === 1 ? "" : "s"} without Unreal Engine.`,
+    );
+  }
+  if (dataPackages.length > 0) {
+    modernConverter ??= request.modernConverter ?? (await ensureModernConverter(environment, log));
+    const dataRoot = join(staging, "data-assets");
+    await mkdir(dataRoot, { recursive: true });
+    log(`Decoding ${dataPackages.length} structured-data package${dataPackages.length === 1 ? "" : "s"} to JSON…`);
+    const results = await mapWithConcurrency(dataPackages, Math.min(4, concurrency), async (entry, index) => {
+      const name = basename(entry.package, extname(entry.package));
+      const isolated = join(dataRoot, String(index).padStart(5, "0"));
+      await mkdir(isolated, { recursive: true });
+      const converted = await runModernConverter(
+        modernConverter!.path,
+        sourceDir,
+        isolated,
+        ["--filter", entry.selector],
+        { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
+      );
+      if (converted.code !== 0) {
+        const diagnostic = converted.stderr.trim().split(/\r?\n/).find((line) => /exception:|\.usmap/i.test(line));
+        return { entry, reason: `The structured-data converter exited ${converted.code}.${diagnostic ? ` ${diagnostic.trim()}` : ""}` };
+      }
+      const source = (await listFiles(isolated)).find((file) =>
+        basename(file.path).toLowerCase() === `${name}.json`.toLowerCase(),
+      )?.path;
+      return source
+        ? { entry, source }
+        : { entry, reason: "The structured-data converter produced no JSON." };
+    });
+    for (const result of results) {
+      if (result.source) dataSources.set(result.entry.file, result.source);
+      else failed.push({ package: result.entry.package, reason: result.reason ?? "Structured-data conversion failed." });
+    }
+    warnings.push(
+      `Decoded ${dataPackages.length} requested Unreal structured-data package${dataPackages.length === 1 ? "" : "s"} to reusable JSON without Unreal Engine.`,
+    );
+  }
+  if (textureStackPackages.length > 0) {
+    modernConverter ??= request.modernConverter ?? (await ensureModernConverter(environment, log));
+    const stackRoot = join(staging, "texture-stacks");
+    await mkdir(stackRoot, { recursive: true });
+    log(`Decoding ${textureStackPackages.length} multidimensional texture package${textureStackPackages.length === 1 ? "" : "s"}…`);
+    const results = await mapWithConcurrency(textureStackPackages, Math.min(4, concurrency), async (entry, index) => {
+      const name = basename(entry.package, extname(entry.package));
+      const isolated = join(stackRoot, String(index).padStart(5, "0"));
+      await mkdir(isolated, { recursive: true });
+      const converted = await runModernConverter(
+        modernConverter!.path,
+        sourceDir,
+        isolated,
+        ["--filter", entry.selector],
+        { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
+      );
+      if (converted.code !== 0) {
+        const diagnostic = converted.stderr.trim().split(/\r?\n/).find((line) => /exception:|\.usmap/i.test(line));
+        return { entry, reason: `The multidimensional texture converter exited ${converted.code}.${diagnostic ? ` ${diagnostic.trim()}` : ""}` };
+      }
+      const descriptor = (await listFiles(isolated)).find((file) =>
+        basename(file.path).toLowerCase() === `${name}.texture.json`.toLowerCase(),
+      )?.path;
+      return descriptor
+        ? { entry, descriptor }
+        : { entry, reason: "The multidimensional texture converter produced no descriptor." };
+    });
+    for (const result of results) {
+      if (result.descriptor) textureStackSources.set(result.entry.file, result.descriptor);
+      else failed.push({ package: result.entry.package, reason: result.reason ?? "Multidimensional texture conversion failed." });
+    }
+    warnings.push(
+      `Decoded ${textureStackPackages.length} requested multidimensional texture package${textureStackPackages.length === 1 ? "" : "s"} without Unreal Engine.`,
+    );
+  }
+  if (offlineFontPackages.length > 0) {
+    modernConverter ??= request.modernConverter ?? (await ensureModernConverter(environment, log));
+    const fontRoot = join(staging, "offline-fonts");
+    await mkdir(fontRoot, { recursive: true });
+    log(`Decoding ${offlineFontPackages.length} offline bitmap font package${offlineFontPackages.length === 1 ? "" : "s"}…`);
+    const results = await mapWithConcurrency(offlineFontPackages, Math.min(4, concurrency), async (entry, index) => {
+      const name = basename(entry.package, extname(entry.package));
+      const isolated = join(fontRoot, String(index).padStart(5, "0"));
+      await mkdir(isolated, { recursive: true });
+      const converted = await runModernConverter(
+        modernConverter!.path,
+        sourceDir,
+        isolated,
+        ["--filter", entry.selector],
+        { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
+      );
+      if (converted.code !== 0) return { entry, reason: `The offline font converter exited ${converted.code}.` };
+      const descriptor = (await listFiles(isolated)).find((file) =>
+        basename(file.path).toLowerCase() === `${name}.font.json`.toLowerCase(),
+      )?.path;
+      return descriptor ? { entry, descriptor } : { entry, reason: "The offline Font converter produced no atlas descriptor." };
+    });
+    for (const result of results) {
+      if (result.descriptor) offlineFontSources.set(result.entry.file, result.descriptor);
+    }
+    warnings.push(`Decoded ${offlineFontPackages.length} offline Unreal font package${offlineFontPackages.length === 1 ? "" : "s"} without Unreal Engine.`);
+  }
+  if (paperPackages.length > 0) {
+    modernConverter ??= request.modernConverter ?? (await ensureModernConverter(environment, log));
+    const paperRoot = join(staging, "paper2d");
+    await mkdir(paperRoot, { recursive: true });
+    log(`Decoding ${paperPackages.length} Paper2D asset package${paperPackages.length === 1 ? "" : "s"}…`);
+    const results = await mapWithConcurrency(paperPackages, Math.min(4, concurrency), async (entry, index) => {
+      const name = basename(entry.package, extname(entry.package));
+      const isolated = join(paperRoot, String(index).padStart(5, "0"));
+      await mkdir(isolated, { recursive: true });
+      const converted = await runModernConverter(
+        modernConverter!.path,
+        sourceDir,
+        isolated,
+        ["--filter", entry.selector],
+        { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
+      );
+      if (converted.code !== 0) {
+        const diagnostic = converted.stderr.trim().split(/\r?\n/).find((line) => /exception:|\.usmap/i.test(line));
+        return { entry, spriteDescriptors: [] as string[], reason: `The Paper2D converter exited ${converted.code}.${diagnostic ? ` ${diagnostic.trim()}` : ""}` };
+      }
+      const emitted = await listFiles(isolated);
+      const spriteDescriptors = emitted.filter((file) => file.path.toLowerCase().endsWith(".sprite.json")).map((file) => file.path);
+      const flipbookDescriptor = emitted.find((file) => basename(file.path).toLowerCase() === `${name}.flipbook.json`.toLowerCase())?.path;
+      const tileDescriptor = emitted.find((file) => basename(file.path).toLowerCase() === `${name}.tile.json`.toLowerCase())?.path;
+      const primarySprite = emitted.find((file) => basename(file.path).toLowerCase() === `${name}.sprite.json`.toLowerCase())?.path;
+      const valid = entry.paperClass === "PaperSprite" ? primarySprite !== undefined
+        : entry.paperClass === "PaperFlipbook" ? flipbookDescriptor !== undefined
+        : tileDescriptor !== undefined;
+      return valid
+        ? { entry, spriteDescriptors, flipbookDescriptor, tileDescriptor }
+        : { entry, spriteDescriptors, reason: `The Paper2D converter produced no ${entry.paperClass} descriptor.` };
+    });
+    for (const result of results) {
+      for (const descriptor of result.spriteDescriptors) paperSpriteSources.push({ entry: result.entry, descriptor });
+      if (result.flipbookDescriptor) paperFlipbookSources.set(result.entry.file, result.flipbookDescriptor);
+      if (result.tileDescriptor) paperTileSources.push({ entry: result.entry, descriptor: result.tileDescriptor });
+      if (result.reason) failed.push({ package: result.entry.package, reason: result.reason });
+    }
+    warnings.push(`Decoded ${paperPackages.length} requested Paper2D package${paperPackages.length === 1 ? "" : "s"} without Unreal Engine.`);
+  }
+  const modernNames = new Set(
+    modernPackages.map(({ entry }) => basename(entry.package, extname(entry.package))),
+  );
+
   const promotion = await mkdtemp(join(promotionParent, ".threenative-import-"));
 
   // Only a verified entitlement earns a copyright line. A local pack whose licence nobody
@@ -928,20 +2389,55 @@ export async function importUnrealDirectory(
       ? `${request.license.slugs.join(", ")} (Fab listing ${request.listingId ?? "unknown"}) via threenative-asset-mcp`
       : undefined;
   const models: ImportedModel[] = [];
+  const textures: ImportedTexture[] = [];
+  const cubemaps: ImportedCubemap[] = [];
+  const standaloneMaterials: ImportedMaterialAsset[] = [];
+  const audio: ImportedAudio[] = [];
+  const dataAssets: ImportedDataAsset[] = [];
+  const textureStacks: ImportedTextureStack[] = [];
+  const fonts: ImportedFont[] = [];
+  const bitmapFonts: ImportedBitmapFont[] = [];
+  const sprites: ImportedSprite[] = [];
+  const flipbooks: ImportedFlipbook[] = [];
+  const scenes: ImportedScene[] = [];
+  const modernSceneModelsByFile = new Map<string, ImportedModel[]>();
+  const modernSceneModelPackages = new Set<string>();
   const imageCache = new TransformedImageCache();
+  // Textures the importer refused to bind, kept so the game can rebuild the surface Unreal
+  // composed in its material graph. Written once, beside the models that name them.
+  const sidecars = new Map<string, string>();
   const transforms: Record<string, number> = {};
   let prunedUvSets = 0;
   let droppedTangents = 0;
+  const rejectedMasks: UnsupportedTexture[] = [];
+  const attachedPsa = new Set<string>();
+  const existingPsa = new Set<string>();
+  const incompatiblePsa = new Set<string>();
 
   try {
-    for (const entry of meshPackages) {
+    for (const entry of assetMeshPackages) {
       const name = basename(entry.package, extname(entry.package));
-      const gltfPath = assets.gltf.get(name);
+      const fromMeshDescription = uncookedNames.has(name);
+      const fromModernConverter = modernNames.has(name);
+      const gltfPath = fromMeshDescription
+        ? uncookedGlbs.get(name)
+        : fromModernConverter
+          ? modernGlbs.get(name)
+          : assets.gltf.get(name);
       if (!gltfPath) {
-        failed.push({ package: entry.package, reason: "UE Viewer produced no glTF for this package." });
+        failed.push({
+          package: entry.package,
+          reason: fromMeshDescription
+            ? "The uncooked MeshDescription converter produced no GLB for this package."
+            : fromModernConverter
+              ? "The modern UE5 mesh converter produced no GLB for this package."
+            : "UE Viewer produced no glTF for this package.",
+        });
         continue;
       }
-      const relativeGlb = `${relative(raw, gltfPath).split(sep).join("/").slice(0, -".gltf".length)}.glb`;
+      const relativeGlb = fromMeshDescription || fromModernConverter
+        ? `Models/${name}.glb`
+        : `${relative(raw, gltfPath).split(sep).join("/").slice(0, -".gltf".length)}.glb`;
       const glbPath = assertContained(promotion, relativeGlb);
       try {
         const packaged = await packageGlb({
@@ -952,9 +2448,15 @@ export async function importUnrealDirectory(
           keepAllUvSets: false,
           imageCache,
           copyright,
+          sidecars,
+          geometryScale: fromMeshDescription ? 0.01 : 1,
+          psaFiles: entry.meshKind === "skeletal" ? psaFiles : [],
         });
         prunedUvSets += packaged.prunedUvSets;
         droppedTangents += packaged.droppedTangents;
+        for (const name of packaged.attachedPsa) attachedPsa.add(name);
+        for (const name of packaged.existingPsa) existingPsa.add(name);
+        for (const name of packaged.incompatiblePsa) incompatiblePsa.add(name);
         const validated = await validateGlb(glbPath);
         for (const section of packaged.sections) {
           for (const binding of section.bindings) {
@@ -964,11 +2466,14 @@ export async function importUnrealDirectory(
         models.push({
           name,
           package: entry.package,
+          kind: entry.meshKind ?? "static",
           glb: relativeGlb,
           bytes: validated.bytes,
           sha256: validated.sha256,
           vertices: packaged.vertices,
           primitives: packaged.primitives,
+          skins: packaged.skins,
+          animations: packaged.animations,
           boundsMetres: packaged.bounds,
           materials: packaged.sections,
         });
@@ -982,10 +2487,793 @@ export async function importUnrealDirectory(
       }
     }
 
-    if (models.length === 0) {
+    for (const source of modernSceneModelSources) {
+      const packageStem = source.entry.package.slice(0, -extname(source.entry.package).length).split(sep).join("/");
+      const ownerDirectory = extname(source.entry.package).toLowerCase() === ".umap" ? "__maps" : "__prefabs";
+      const relativeGlb = `Models/${ownerDirectory}/${packageStem}/${source.name}.glb`;
+      const glbPath = assertContained(promotion, relativeGlb);
+      const dependencyPackage = `${source.entry.package}#${source.name}`;
+      try {
+        const packaged = await packageGlb({
+          gltfPath: source.glb,
+          glbPath,
+          assets: source.assets,
+          maxTextureSize: request.maxTextureSize,
+          keepAllUvSets: false,
+          imageCache,
+          copyright,
+          sidecars,
+          geometryScale: 1,
+        });
+        prunedUvSets += packaged.prunedUvSets;
+        droppedTangents += packaged.droppedTangents;
+        const validated = await validateGlb(glbPath);
+        const model: ImportedModel = {
+          name: source.name,
+          package: dependencyPackage,
+          kind: packaged.skins > 0 ? "skeletal" : "static",
+          glb: relativeGlb,
+          bytes: validated.bytes,
+          sha256: validated.sha256,
+          vertices: packaged.vertices,
+          primitives: packaged.primitives,
+          skins: packaged.skins,
+          animations: packaged.animations,
+          boundsMetres: packaged.bounds,
+          materials: packaged.sections,
+        };
+        models.push(model);
+        modernSceneModelPackages.add(dependencyPackage);
+        const scoped = modernSceneModelsByFile.get(source.entry.file) ?? [];
+        scoped.push(model);
+        modernSceneModelsByFile.set(source.entry.file, scoped);
+      } catch (error) {
+        await rm(glbPath, { force: true });
+        failed.push({
+          package: dependencyPackage,
+          reason: `Scene-referenced mesh packaging failed: ${error instanceof Error ? error.message : "unknown error"}`,
+        });
+      }
+    }
+    if (modernSceneModelSources.length > 0) {
+      warnings.push(`Promoted ${[...modernSceneModelsByFile.values()].reduce((count, entries) => count + entries.length, 0)} mesh dependencies emitted from modern Unreal levels and Blueprint prefabs.`);
+    }
+
+    if (attachedPsa.size > 0) {
+      warnings.push(
+        `Attached ${attachedPsa.size} standalone ActorX animation clip${attachedPsa.size === 1 ? "" : "s"} to compatible skeletal GLBs by joint name.`,
+      );
+    }
+    if (existingPsa.size > 0) {
+      warnings.push(
+        `Kept ${existingPsa.size} animation clip${existingPsa.size === 1 ? "" : "s"} already present in UE Viewer's skeletal GLB instead of duplicating the matching PSA clip.`,
+      );
+    }
+    if (psaFiles.length > 0 && attachedPsa.size === 0 && existingPsa.size === 0) {
+      for (const entry of animationPackages) {
+        failed.push({
+          package: entry.package,
+          reason: "ActorX PSA was decoded, but no imported SkeletalMesh matched at least 80% of its bone names.",
+        });
+      }
+    } else if (incompatiblePsa.size > 0) {
+      warnings.push(
+        `${incompatiblePsa.size} ActorX animation clip${incompatiblePsa.size === 1 ? " was" : "s were"} not attached to at least one skeletal model because fewer than 80% of bone names matched.`,
+      );
+    }
+
+    const materialEntries = materialPackages
+      .filter((entry) => materialAssetsByFile.has(entry.file))
+      .map((entry) => ({
+        entry,
+        libraryName: entry.package.slice(0, -extname(entry.package).length),
+      }));
+    if (materialEntries.length > 0) {
+      const source = join(staging, "material-library.gltf");
+      const relativeGlb = "Materials/UnrealMaterialLibrary.glb";
+      const glbPath = assertContained(promotion, relativeGlb);
+      try {
+        await writeMaterialLibrarySource(
+          source,
+          materialEntries.map(({ entry, libraryName }) => ({ libraryName, package: entry.package })),
+        );
+        const lookupNames = new Map(
+          materialEntries.map(({ entry, libraryName }) => [
+            libraryName,
+            basename(entry.package, extname(entry.package)),
+          ]),
+        );
+        const isolatedAssets = new Map(
+          materialEntries.map(({ entry, libraryName }) => [
+            libraryName,
+            materialAssetsByFile.get(entry.file) ?? assets,
+          ]),
+        );
+        const packaged = await packageGlb({
+          gltfPath: source,
+          glbPath,
+          assets,
+          maxTextureSize: request.maxTextureSize,
+          keepAllUvSets: false,
+          imageCache,
+          copyright,
+          materialLookupNames: lookupNames,
+          materialAssets: isolatedAssets,
+        });
+        await validateGlb(glbPath);
+        const sections = new Map(packaged.sections.map((section) => [section.name, section]));
+        for (const { entry, libraryName } of materialEntries) {
+          const section = sections.get(libraryName);
+          if (!section) throw new Error(`Material library omitted ${libraryName}.`);
+          standaloneMaterials.push({
+            ...section,
+            resolved:
+              (isolatedAssets.get(libraryName)?.mat.has(lookupNames.get(libraryName) ?? "") ?? false) ||
+              (isolatedAssets.get(libraryName)?.props.has(lookupNames.get(libraryName) ?? "") ?? false),
+            name: basename(entry.package, extname(entry.package)),
+            package: entry.package,
+            glb: relativeGlb,
+            libraryName,
+          });
+          for (const binding of section.bindings) {
+            transforms[binding.transform] = (transforms[binding.transform] ?? 0) + 1;
+          }
+        }
+        log(`Packaged ${relativeGlb} with ${standaloneMaterials.length} reusable material swatches.`);
+        const approximated = standaloneMaterials.filter((material) => !material.resolved).length;
+        if (approximated > 0) {
+          warnings.push(
+            `${approximated} standalone Material package${approximated === 1 ? " had" : "s had"} no UE Viewer PBR metadata and use named glass/light/mirror or neutral fallbacks in the material library.`,
+          );
+        }
+      } catch (error) {
+        await rm(glbPath, { force: true });
+        for (const { entry } of materialEntries) {
+          failed.push({
+            package: entry.package,
+            reason: `Material library packaging failed: ${error instanceof Error ? error.message : "unknown error"}`,
+          });
+        }
+      }
+    }
+
+    if (sidecars.size > 0) {
+      const directory = join(promotion, "textures");
+      await mkdir(directory, { recursive: true });
+      for (const [name, source] of sidecars) {
+        await writeFile(assertContained(directory, `${name}.png`), await readFile(source));
+      }
+      warnings.push(
+        `Wrote ${sidecars.size} unmappable textures to textures/ — they are extra Unreal material inputs with no single glTF PBR slot. Use the per-section report to rebuild layered or custom surfaces.`,
+      );
+    }
+
+    for (const entry of texturePackages) {
+      const source = textureSources.get(entry.file);
+      if (!source) continue;
+      const name = basename(entry.package, extname(entry.package));
+      const relativePng = `textures/${entry.package.slice(0, -extname(entry.package).length)}.png`;
+      const output = assertContained(promotion, relativePng);
+      try {
+        const transformed = await applyTextureTransform(
+          await readFile(source),
+          "none",
+          request.maxTextureSize,
+        );
+        await mkdir(dirname(output), { recursive: true });
+        await writeFile(output, transformed.data);
+        const metadata = await (await import("sharp")).default(transformed.data).metadata();
+        if (!metadata.width || !metadata.height) throw new Error("PNG dimensions are missing.");
+        textures.push({
+          name,
+          package: entry.package,
+          png: relativePng,
+          bytes: transformed.data.byteLength,
+          sha256: createHash("sha256").update(transformed.data).digest("hex"),
+          width: metadata.width,
+          height: metadata.height,
+        });
+      } catch (error) {
+        await rm(output, { force: true });
+        failed.push({
+          package: entry.package,
+          reason: `Texture packaging failed: ${error instanceof Error ? error.message : "unknown error"}`,
+        });
+      }
+    }
+    if (textures.length > 0) log(`Promoted ${textures.length} standalone Texture2D PNGs.`);
+
+    for (const entry of cubemapPackages) {
+      const source = cubemapSources.get(entry.file);
+      if (!source) continue;
+      const name = basename(entry.package, extname(entry.package));
+      const extension = extname(source).toLowerCase();
+      const relativeFile = `cubemaps/${entry.package.slice(0, -extname(entry.package).length)}${extension}`;
+      const output = assertContained(promotion, relativeFile);
+      try {
+        const input = await readFile(source);
+        let width: number;
+        let height: number;
+        let data = input;
+        if (extension === ".hdr") {
+          const inspected = inspectRadiance(input);
+          if (!inspected) throw new Error("converter output is not a valid Radiance RGBE file");
+          ({ width, height } = inspected);
+          if (request.maxTextureSize !== undefined && width > request.maxTextureSize) {
+            warnings.push(
+              `${entry.package} is HDR and remains ${width}x${height}; maxTextureSize is not applied because lossy 8-bit resizing would destroy environment-light intensity.`,
+            );
+          }
+        } else if (extension === ".png") {
+          const { default: sharp } = await import("sharp");
+          const sourceMetadata = await sharp(input, { limitInputPixels: 268_435_456, unlimited: true }).metadata();
+          if (!sourceMetadata.width || !sourceMetadata.height) throw new Error("PNG dimensions are missing");
+          width = sourceMetadata.width;
+          height = sourceMetadata.height;
+          const cappedWidth = request.maxTextureSize !== undefined && width > request.maxTextureSize
+            ? Math.max(2, request.maxTextureSize - (request.maxTextureSize % 2))
+            : width;
+          if (cappedWidth !== width) {
+            data = await sharp(input, { limitInputPixels: 268_435_456, unlimited: true })
+              .resize(cappedWidth, cappedWidth / 2, { fit: "fill" })
+              .png({ compressionLevel: 6 })
+              .toBuffer();
+            width = cappedWidth;
+            height = cappedWidth / 2;
+          }
+        } else {
+          throw new Error(`unsupported converter extension ${extension}`);
+        }
+        if (width !== height * 2) {
+          throw new Error(
+            `converter output must be a 2:1 equirectangular image, got ${width}x${height}`,
+          );
+        }
+        await mkdir(dirname(output), { recursive: true });
+        await writeFile(output, data);
+        cubemaps.push({
+          name,
+          package: entry.package,
+          file: relativeFile,
+          mimeType: extension === ".hdr" ? "image/vnd.radiance" : "image/png",
+          bytes: data.byteLength,
+          sha256: createHash("sha256").update(data).digest("hex"),
+          width,
+          height,
+          dynamicRange: extension === ".hdr" ? "hdr" : "ldr",
+          mapping: "EquirectangularReflectionMapping",
+        });
+      } catch (error) {
+        await rm(output, { force: true });
+        failed.push({
+          package: entry.package,
+          reason: `Cubemap packaging failed: ${error instanceof Error ? error.message : "unknown error"}`,
+        });
+      }
+    }
+    if (cubemaps.length > 0) log(`Promoted ${cubemaps.length} equirectangular TextureCube environment maps.`);
+
+    for (const entry of soundPackages) {
+      const source = audioSources.get(entry.file);
+      if (!source) continue;
+      const name = basename(entry.package, extname(entry.package));
+      try {
+        const data = await readFile(source);
+        const inspected = inspectWebAudio(data);
+        if (!inspected) throw new Error("output is not a supported WAV, Ogg, MP3, or FLAC stream");
+        const relativeAudio = `audio/${entry.package.slice(0, -extname(entry.package).length)}.${inspected.extension}`;
+        const output = assertContained(promotion, relativeAudio);
+        await mkdir(dirname(output), { recursive: true });
+        await writeFile(output, data);
+        audio.push({
+          name,
+          package: entry.package,
+          file: relativeAudio,
+          mimeType: inspected.mimeType,
+          bytes: data.byteLength,
+          sha256: createHash("sha256").update(data).digest("hex"),
+          durationSeconds: inspected.durationSeconds,
+          channels: inspected.channels,
+          sampleRate: inspected.sampleRate,
+        });
+      } catch (error) {
+        failed.push({
+          package: entry.package,
+          reason: `Audio packaging failed: ${error instanceof Error ? error.message : "unknown error"}`,
+        });
+      }
+    }
+    if (audio.length > 0) log(`Promoted ${audio.length} standalone SoundWave audio file${audio.length === 1 ? "" : "s"}.`);
+
+    for (const entry of dataPackages) {
+      const source = dataSources.get(entry.file);
+      if (!source) continue;
+      const name = basename(entry.package, extname(entry.package));
+      const relativeJson = `data/${entry.package.slice(0, -extname(entry.package).length)}.json`;
+      const output = assertContained(promotion, relativeJson);
+      try {
+        if ((await stat(source)).size > 256 * 1024 * 1024) throw new Error("JSON exceeds the 256 MiB safety limit");
+        const data = await readFile(source);
+        const parsed: unknown = JSON.parse(data.toString("utf8"));
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+          throw new Error("converter output must be a JSON object");
+        }
+        await mkdir(dirname(output), { recursive: true });
+        await writeFile(output, data);
+        dataAssets.push({
+          name,
+          package: entry.package,
+          className: entry.dataClass ?? "Unknown",
+          json: relativeJson,
+          bytes: data.byteLength,
+          sha256: createHash("sha256").update(data).digest("hex"),
+        });
+      } catch (error) {
+        await rm(output, { force: true });
+        failed.push({
+          package: entry.package,
+          reason: `Structured-data packaging failed: ${error instanceof Error ? error.message : "unknown error"}`,
+        });
+      }
+    }
+    if (dataAssets.length > 0) log(`Promoted ${dataAssets.length} reusable structured-data JSON file${dataAssets.length === 1 ? "" : "s"}.`);
+
+    for (const entry of textureStackPackages) {
+      const descriptorPath = textureStackSources.get(entry.file);
+      if (!descriptorPath) continue;
+      const name = basename(entry.package, extname(entry.package));
+      const relativeBase = `textures3d/${entry.package.slice(0, -extname(entry.package).length)}`;
+      const relativeData = `${relativeBase}.rgba`;
+      const relativeManifest = `${relativeBase}.texture.json`;
+      const outputData = assertContained(promotion, relativeData);
+      const outputManifest = assertContained(promotion, relativeManifest);
+      try {
+        const descriptor = JSON.parse(await readFile(descriptorPath, "utf8")) as Record<string, unknown>;
+        const sourceClass = descriptor.Class;
+        const sourceWidth = descriptor.Width;
+        const sourceHeight = descriptor.Height;
+        const sourceDepth = descriptor.Depth;
+        const layout = descriptor.Layout;
+        const layers = descriptor.Layers;
+        if (!TEXTURE_STACK_CLASSES.has(String(sourceClass)) || sourceClass !== entry.textureStackClass) {
+          throw new Error(`descriptor class ${String(sourceClass)} does not match ${entry.textureStackClass ?? "the package"}`);
+        }
+        if (![sourceWidth, sourceHeight, sourceDepth].every((value) =>
+          typeof value === "number" && Number.isSafeInteger(value) && value > 0 && value <= 65_536,
+        )) throw new Error("descriptor dimensions are invalid");
+        if ((layout !== "layers" && layout !== "vertical-atlas") || !Array.isArray(layers) ||
+          layers.some((layer) => typeof layer !== "string" || !/^[-A-Za-z0-9_.]+\.(?:png|hdr)$/i.test(layer))) {
+          throw new Error("descriptor layer layout is invalid");
+        }
+        if (layers.some((layer) => extname(String(layer)).toLowerCase() !== ".png")) {
+          throw new Error("HDR multidimensional textures require a floating-point output path that is not yet available");
+        }
+        const width = sourceWidth as number;
+        const height = sourceHeight as number;
+        const depth = sourceDepth as number;
+        if (layout === "layers" && layers.length !== depth) {
+          throw new Error(`descriptor declares ${depth} layers but contains ${layers.length}`);
+        }
+        if (layout === "vertical-atlas" && layers.length !== 1) {
+          throw new Error("vertical atlas must contain exactly one image");
+        }
+        if (sourceClass === "TextureCubeArray" && depth % 6 !== 0) {
+          throw new Error(`cube-array depth ${depth} is not divisible by six faces`);
+        }
+        const scale = request.maxTextureSize === undefined
+          ? 1
+          : Math.min(1, request.maxTextureSize / Math.max(width, height));
+        const outputWidth = Math.max(1, Math.round(width * scale));
+        const outputHeight = Math.max(1, Math.round(height * scale));
+        const expectedBytes = outputWidth * outputHeight * depth * 4;
+        if (!Number.isSafeInteger(expectedBytes) || expectedBytes > 1024 ** 3) {
+          throw new Error("decoded RGBA8 texture stack would exceed the 1 GiB safety limit");
+        }
+        const { default: sharp } = await import("sharp");
+        const rawLayers: Buffer[] = [];
+        if (layout === "layers") {
+          for (const layer of layers as string[]) {
+            const layerPath = assertContained(dirname(descriptorPath), layer);
+            const image = sharp(await readFile(layerPath), { limitInputPixels: 268_435_456, unlimited: true });
+            const metadata = await image.metadata();
+            if (metadata.width !== width || metadata.height !== height) {
+              throw new Error(`${layer} is ${metadata.width ?? "?"}x${metadata.height ?? "?"}; expected ${width}x${height}`);
+            }
+            rawLayers.push(await image
+              .resize(outputWidth, outputHeight, { fit: "fill" })
+              .ensureAlpha()
+              .raw()
+              .toBuffer());
+          }
+        } else {
+          const atlasName = layers[0] as string;
+          const atlasPath = assertContained(dirname(descriptorPath), atlasName);
+          const atlasData = await readFile(atlasPath);
+          const metadata = await sharp(atlasData, { limitInputPixels: 268_435_456, unlimited: true }).metadata();
+          if (metadata.width !== width || metadata.height !== height * depth) {
+            throw new Error(`${atlasName} is ${metadata.width ?? "?"}x${metadata.height ?? "?"}; expected ${width}x${height * depth}`);
+          }
+          for (let layer = 0; layer < depth; layer += 1) {
+            rawLayers.push(await sharp(atlasData, { limitInputPixels: 268_435_456, unlimited: true })
+              .extract({ left: 0, top: layer * height, width, height })
+              .resize(outputWidth, outputHeight, { fit: "fill" })
+              .ensureAlpha()
+              .raw()
+              .toBuffer());
+          }
+        }
+        const data = Buffer.concat(rawLayers);
+        if (data.byteLength !== expectedBytes) throw new Error(`decoded ${data.byteLength} bytes; expected ${expectedBytes}`);
+        const kind = sourceClass === "VolumeTexture" ? "volume" : sourceClass === "TextureCubeArray" ? "cube-array" : "array";
+        const threeTexture = kind === "volume" ? "Data3DTexture" : "DataArrayTexture";
+        await mkdir(dirname(outputData), { recursive: true });
+        await writeFile(outputData, data);
+        await writeFile(outputManifest, `${JSON.stringify({
+          name,
+          kind,
+          format: "RGBA8",
+          width: outputWidth,
+          height: outputHeight,
+          depth,
+          data: basename(relativeData),
+          threeTexture,
+        }, null, 2)}\n`);
+        textureStacks.push({
+          name,
+          package: entry.package,
+          kind,
+          data: relativeData,
+          manifest: relativeManifest,
+          format: "RGBA8",
+          threeTexture,
+          width: outputWidth,
+          height: outputHeight,
+          depth,
+          bytes: data.byteLength,
+          sha256: createHash("sha256").update(data).digest("hex"),
+        });
+      } catch (error) {
+        await rm(outputData, { force: true });
+        await rm(outputManifest, { force: true });
+        failed.push({
+          package: entry.package,
+          reason: `Multidimensional texture packaging failed: ${error instanceof Error ? error.message : "unknown error"}`,
+        });
+      }
+    }
+    if (textureStacks.length > 0) log(`Promoted ${textureStacks.length} Three.js multidimensional texture stack${textureStacks.length === 1 ? "" : "s"}.`);
+
+    for (const entry of fontPackages) {
+      const sourceStem = entry.file.slice(0, -extname(entry.file).length);
+      try {
+        const payloads: Buffer[] = [];
+        let sourceBytes = 0;
+        for (const path of [entry.file, `${sourceStem}.uexp`, `${sourceStem}.ubulk`, `${sourceStem}.uptnl`]) {
+          const info = await stat(path).catch(() => undefined);
+          if (!info?.isFile()) continue;
+          sourceBytes += info.size;
+          if (sourceBytes > 1024 ** 3) throw new Error("font package payloads exceed the 1 GiB safety limit");
+          payloads.push(await readFile(path));
+        }
+        const extracted = extractUnrealFonts(payloads);
+        if (extracted.length === 0 && offlineFontSources.has(entry.file)) {
+          const descriptorPath = offlineFontSources.get(entry.file)!;
+          const descriptor = parseOfflineFontDescriptor(JSON.parse(await readFile(descriptorPath, "utf8")));
+          const relativeDirectory = `bitmap-fonts/${entry.package.slice(0, -extname(entry.package).length)}`;
+          const outputDirectory = assertContained(promotion, relativeDirectory);
+          const packaged = await writeOfflineFont({ descriptor, descriptorPath, outputDirectory });
+          const manifest = `${relativeDirectory}/${packaged.manifest}`;
+          const pagePaths = packaged.pages.map((page) => `${relativeDirectory}/${page}`);
+          const hash = createHash("sha256").update(await readFile(assertContained(promotion, manifest)));
+          for (const page of pagePaths) hash.update(await readFile(assertContained(promotion, page)));
+          bitmapFonts.push({
+            name: descriptor.name,
+            package: entry.package,
+            manifest,
+            pages: pagePaths,
+            glyphs: packaged.glyphs,
+            distanceField: descriptor.isDistanceField,
+            bytes: packaged.bytes,
+            sha256: hash.digest("hex"),
+          });
+          continue;
+        }
+        if (extracted.length === 0) throw new Error("no validated embedded TTF/OTF face or offline glyph atlas was found");
+        const relativeDirectory = `fonts/${entry.package.slice(0, -extname(entry.package).length)}`;
+        for (const [index, font] of extracted.entries()) {
+          const fallbackName = `${font.family}-${font.style}`;
+          const faceName = (font.postscriptName ?? fallbackName)
+            .normalize("NFKD")
+            .replace(/[^-A-Za-z0-9_.]+/g, "-")
+            .replace(/^-+|-+$/g, "") || `face-${index + 1}`;
+          const relativeFile = `${relativeDirectory}/${String(index + 1).padStart(2, "0")}-${faceName}.${font.extension}`;
+          const output = assertContained(promotion, relativeFile);
+          await mkdir(dirname(output), { recursive: true });
+          await writeFile(output, font.data);
+          const normalizedStyle = `${font.style} ${font.postscriptName ?? ""}`.toLowerCase();
+          const weight = normalizedStyle.includes("black") ? 900
+            : normalizedStyle.includes("extra bold") || normalizedStyle.includes("extrabold") ? 800
+            : normalizedStyle.includes("bold") ? 700
+            : normalizedStyle.includes("semi") ? 600
+            : normalizedStyle.includes("medium") ? 500
+            : normalizedStyle.includes("light") ? 300
+            : normalizedStyle.includes("thin") ? 100
+            : 400;
+          fonts.push({
+            name: font.postscriptName ?? fallbackName,
+            package: entry.package,
+            file: relativeFile,
+            mimeType: font.mimeType,
+            family: font.family,
+            style: font.style,
+            weight,
+            fontStyle: normalizedStyle.includes("italic") || normalizedStyle.includes("oblique") ? "italic" : "normal",
+            bytes: font.data.byteLength,
+            sha256: font.sha256,
+          });
+        }
+      } catch (error) {
+        failed.push({
+          package: entry.package,
+          reason: `Font packaging failed: ${error instanceof Error ? error.message : "unknown error"}`,
+        });
+      }
+    }
+    if (fonts.length > 0) log(`Promoted ${fonts.length} browser-loadable font face${fonts.length === 1 ? "" : "s"}.`);
+    if (bitmapFonts.length > 0) log(`Promoted ${bitmapFonts.length} Three.js bitmap font atlas${bitmapFonts.length === 1 ? "" : "es"}.`);
+
+    const spriteRecords = new Map<string, { descriptor: PaperSpriteDescriptor; source: string }>();
+    for (const source of paperSpriteSources) {
+      try {
+        const descriptor = parsePaperSpriteDescriptor(JSON.parse(await readFile(source.descriptor, "utf8")));
+        const packagePath = paperObjectPathToPackage(descriptor.packagePath, descriptor.name);
+        const key = packagePath.toLowerCase();
+        if (!spriteRecords.has(key)) spriteRecords.set(key, { descriptor, source: source.descriptor });
+      } catch (error) {
+        failed.push({
+          package: source.entry.package,
+          reason: `PaperSprite descriptor failed: ${error instanceof Error ? error.message : "unknown error"}`,
+        });
+      }
+    }
+    const spriteByPackage = new Map<string, ImportedSprite>();
+    const spritesByName = new Map<string, ImportedSprite[]>();
+    for (const [packageKey, record] of spriteRecords) {
+      const packagePath = paperObjectPathToPackage(record.descriptor.packagePath, record.descriptor.name);
+      const relativeGlb = `Sprites/${packagePath.slice(0, -extname(packagePath).length)}.glb`;
+      const output = assertContained(promotion, relativeGlb);
+      try {
+        await mkdir(dirname(output), { recursive: true });
+        const packaged = await writePaperSpriteGlb({
+          descriptor: record.descriptor,
+          texturePath: assertContained(dirname(record.source), record.descriptor.texture),
+          outputPath: output,
+          maxTextureSize: request.maxTextureSize,
+        });
+        await validateGlb(output);
+        const data = await readFile(output);
+        const imported: ImportedSprite = {
+          name: record.descriptor.name,
+          package: packagePath,
+          glb: relativeGlb,
+          vertices: packaged.vertices,
+          widthMetres: packaged.widthMetres,
+          heightMetres: packaged.heightMetres,
+          textureWidth: packaged.textureWidth,
+          textureHeight: packaged.textureHeight,
+          bytes: packaged.bytes,
+          sha256: createHash("sha256").update(data).digest("hex"),
+        };
+        sprites.push(imported);
+        spriteByPackage.set(packageKey, imported);
+        const sameName = spritesByName.get(imported.name.toLowerCase()) ?? [];
+        sameName.push(imported);
+        spritesByName.set(imported.name.toLowerCase(), sameName);
+      } catch (error) {
+        await rm(output, { force: true });
+        failed.push({ package: packagePath, reason: `PaperSprite packaging failed: ${error instanceof Error ? error.message : "unknown error"}` });
+      }
+    }
+    if (sprites.length > 0) log(`Promoted ${sprites.length} PaperSprite GLB${sprites.length === 1 ? "" : "s"}.`);
+
+    for (const entry of paperPackages.filter((candidate) => candidate.paperClass === "PaperFlipbook")) {
+      const source = paperFlipbookSources.get(entry.file);
+      if (!source) continue;
+      const relativeManifest = `Flipbooks/${entry.package.slice(0, -extname(entry.package).length)}.flipbook.json`;
+      const output = assertContained(promotion, relativeManifest);
+      try {
+        const descriptor: PaperFlipbookDescriptor = parsePaperFlipbookDescriptor(JSON.parse(await readFile(source, "utf8")));
+        const unresolved = new Set<string>();
+        const frames = descriptor.frames.map((frame) => {
+          const framePackage = paperObjectPathToPackage(frame.spritePath, frame.sprite);
+          const exact = spriteByPackage.get(framePackage.toLowerCase());
+          const named = spritesByName.get(frame.sprite.toLowerCase());
+          const sprite = exact ?? (named?.length === 1 ? named[0] : undefined);
+          if (!sprite) unresolved.add(frame.spritePath || frame.sprite);
+          return {
+            sprite: frame.sprite,
+            package: framePackage,
+            glb: sprite?.glb,
+            frameRun: frame.frameRun,
+            durationSeconds: frame.frameRun / descriptor.framesPerSecond,
+          };
+        });
+        if (frames.every((frame) => frame.glb === undefined)) throw new Error("none of the referenced PaperSprite frames resolved");
+        const frameCount = descriptor.frames.reduce((sum, frame) => sum + frame.frameRun, 0);
+        const durationSeconds = frameCount / descriptor.framesPerSecond;
+        await mkdir(dirname(output), { recursive: true });
+        await writeFile(output, `${JSON.stringify({
+          name: descriptor.name,
+          framesPerSecond: descriptor.framesPerSecond,
+          frameCount,
+          durationSeconds,
+          frames,
+        }, null, 2)}\n`);
+        flipbooks.push({
+          name: descriptor.name,
+          package: entry.package,
+          manifest: relativeManifest,
+          framesPerSecond: descriptor.framesPerSecond,
+          frames: frameCount,
+          durationSeconds,
+          unresolvedSprites: [...unresolved].sort(),
+        });
+        if (unresolved.size > 0) warnings.push(`${descriptor.name} has ${unresolved.size} unresolved PaperSprite reference${unresolved.size === 1 ? "" : "s"}.`);
+      } catch (error) {
+        await rm(output, { force: true });
+        failed.push({ package: entry.package, reason: `PaperFlipbook packaging failed: ${error instanceof Error ? error.message : "unknown error"}` });
+      }
+    }
+    if (flipbooks.length > 0) log(`Promoted ${flipbooks.length} PaperFlipbook manifest${flipbooks.length === 1 ? "" : "s"}.`);
+
+    const tileSets = new Map<string, { descriptor: PaperTileSetDescriptor; source: string }>();
+    const tileMaps: { descriptor: PaperTileMapDescriptor; source: string; entry: PackageClassification }[] = [];
+    for (const source of paperTileSources) {
+      try {
+        const raw = JSON.parse(await readFile(source.descriptor, "utf8")) as { Class?: unknown };
+        if (raw.Class === "PaperTileSet") {
+          const descriptor = parsePaperTileSetDescriptor(raw);
+          tileSets.set(descriptor.name.toLowerCase(), { descriptor, source: source.descriptor });
+        } else if (raw.Class === "PaperTileMap") {
+          tileMaps.push({ descriptor: parsePaperTileMapDescriptor(raw), source: source.descriptor, entry: source.entry });
+        } else throw new Error("descriptor class is not PaperTileMap or PaperTileSet");
+      } catch (error) {
+        failed.push({ package: source.entry.package, reason: `PaperTile descriptor failed: ${error instanceof Error ? error.message : "unknown error"}` });
+      }
+    }
+    for (const tileMap of tileMaps) {
+      const tileSet = tileSets.get(tileMap.descriptor.selectedTileSet.toLowerCase());
+      if (!tileSet) {
+        failed.push({ package: tileMap.entry.package, reason: `PaperTileMap packaging failed: referenced tile set ${tileMap.descriptor.selectedTileSet} was not decoded` });
+        continue;
+      }
+      const relativeGlb = `Models/${tileMap.entry.package.slice(0, -extname(tileMap.entry.package).length)}.glb`;
+      const output = assertContained(promotion, relativeGlb);
+      try {
+        await mkdir(dirname(output), { recursive: true });
+        const packaged = await writePaperTileMapGlb({
+          map: tileMap.descriptor,
+          tileSet: tileSet.descriptor,
+          texturePath: assertContained(dirname(tileSet.source), tileSet.descriptor.texture),
+          outputPath: output,
+        });
+        const validated = await validateGlb(output);
+        models.push({
+          name: tileMap.descriptor.name,
+          package: tileMap.entry.package,
+          kind: "static",
+          glb: relativeGlb,
+          bytes: validated.bytes,
+          sha256: validated.sha256,
+          vertices: packaged.vertices,
+          primitives: 1,
+          skins: 0,
+          animations: 0,
+          boundsMetres: packaged.bounds,
+          materials: [],
+        });
+        log(`Packaged ${relativeGlb} from ${packaged.tiles} PaperTileMap cells.`);
+      } catch (error) {
+        await rm(output, { force: true });
+        failed.push({ package: tileMap.entry.package, reason: `PaperTileMap packaging failed: ${error instanceof Error ? error.message : "unknown error"}` });
+      }
+    }
+
+    const sceneEntries = [...mapPackages, ...modernMapPackages, ...modernPrefabPackages];
+    const sceneBasenameCounts = new Map<string, number>();
+    for (const entry of sceneEntries) {
+      const key = basename(entry.package, extname(entry.package)).toLowerCase();
+      sceneBasenameCounts.set(key, (sceneBasenameCounts.get(key) ?? 0) + 1);
+    }
+    for (const entry of sceneEntries) {
+      const name = basename(entry.package, extname(entry.package));
+      try {
+        const source = parseUnrealSceneSource(
+          await readFile(sceneSourcePaths.get(entry.file) ?? join(sceneSources, `${name}.scene-source.json`), "utf8"),
+        );
+        const scopedSceneModels = modernSceneModelsByFile.get(entry.file) ?? [];
+        const scene = await assembleSceneGlb({
+          source,
+          package: entry.package,
+          outputRoot: promotion,
+          ...((sceneBasenameCounts.get(name.toLowerCase()) ?? 0) > 1
+            ? { outputStem: entry.package.slice(0, -extname(entry.package).length) }
+            : {}),
+          models: [
+            ...models.filter((model) => !modernSceneModelPackages.has(model.package)),
+            ...scopedSceneModels,
+            ...sprites.map((sprite) => ({ name: sprite.name, glb: sprite.glb })),
+          ],
+          bitmapFonts: bitmapFonts.map((font) => ({ name: font.name, manifest: font.manifest })),
+          validate: validateGlb,
+        });
+        scenes.push(scene);
+        if (scene.unresolvedMeshes.length > 0) {
+          warnings.push(
+            `${scene.name} references ${scene.unresolvedMeshes.length} meshes that were not imported: ${scene.unresolvedMeshes.slice(0, 5).join(", ")}${scene.unresolvedMeshes.length > 5 ? ` and ${scene.unresolvedMeshes.length - 5} more` : ""}.`,
+          );
+        }
+        if (scene.generatedEnginePrimitives.length > 0) {
+          warnings.push(
+            `${scene.name} generated installation-only Unreal Engine primitives not shipped in the pack: ${scene.generatedEnginePrimitives.join(", ")}.`,
+          );
+        }
+        if (scene.blueprintComponents > 0) {
+          warnings.push(
+            `${scene.name} reconstructed ${scene.blueprintComponents} serialized Blueprint component defaults without executing Blueprint bytecode.`,
+          );
+        }
+        if (scene.instances > 0) {
+          warnings.push(
+            `${scene.name} decoded ${scene.resolvedInstances}/${scene.instances} ISM/HISM/foliage placements into ${scene.instanceGroups} EXT_mesh_gpu_instancing group${scene.instanceGroups === 1 ? "" : "s"}.`,
+          );
+        }
+        if (scene.landscapes > 0) {
+          warnings.push(
+            `${scene.name} decoded ${scene.landscapeVertices} UE4 Landscape heightfield vertices across ${scene.landscapes} components; material ${scene.landscapes === 1 ? "identity is" : "identities are"} preserved with neutral PBR shading.`,
+          );
+        }
+        if (scene.approximatedAreaLights > 0) {
+          warnings.push(
+            `${scene.name} maps ${scene.approximatedAreaLights} Unreal rectangular area lights to KHR_lights_punctual point lights; their original dimensions remain in node extras and the scene manifest.`,
+          );
+        }
+        if (scene.omittedActors.length > 0) {
+          warnings.push(
+            `${scene.name} reports ${scene.omittedActors.length} serialized component or behavior omission${scene.omittedActors.length === 1 ? "" : "s"}: ${scene.omittedActors.slice(0, 5).map((entry) => `${entry.actor}/${entry.component} (${entry.sourceClass})`).join(", ")}${scene.omittedActors.length > 5 ? ` and ${scene.omittedActors.length - 5} more` : ""}.`,
+          );
+        }
+        log(
+          `Packaged ${scene.glb} with ${scene.resolvedActors}/${scene.actors} mesh actors, ${scene.resolvedInstances}/${scene.instances} mesh instances, and ${scene.landscapes} landscape components.`,
+        );
+      } catch (error) {
+        failed.push({
+          package: entry.package,
+          reason: `Level reconstruction failed: ${error instanceof Error ? error.message : "unknown error"}`,
+        });
+      }
+    }
+
+    if (
+      models.length === 0 &&
+      scenes.length === 0 &&
+      textures.length === 0 &&
+      cubemaps.length === 0 &&
+      standaloneMaterials.length === 0 &&
+      audio.length === 0 &&
+      dataAssets.length === 0 &&
+      textureStacks.length === 0 &&
+      fonts.length === 0 &&
+      bitmapFonts.length === 0 &&
+      sprites.length === 0 &&
+      flipbooks.length === 0
+    ) {
+      const reasons = failed.slice(0, 5).map((entry) => `${entry.package}: ${entry.reason}`);
+      const more = failed.length > reasons.length ? ` (+${failed.length - reasons.length} more)` : "";
       throw new ImportError(
         "UNREAL_EXPORT_EMPTY",
-        "No package produced a valid GLB; nothing was promoted.",
+        "No package produced a valid model, texture, cubemap, material, audio, font, bitmap font, sprite, flipbook, data asset, texture stack, or scene; nothing was promoted." +
+          (reasons.length > 0 ? ` Failures — ${reasons.join("; ")}${more}.` : ""),
       );
     }
 
@@ -1021,7 +3309,7 @@ export async function importUnrealDirectory(
     }
     if (coverage.textured < coverage.sections) {
       warnings.push(
-        `${coverage.sections - coverage.textured} material sections have no base colour texture and use an explicit neutral fallback.`,
+        `${coverage.sections - coverage.textured} material sections have no base colour texture and use an explicit named PBR fallback.`,
       );
     }
 
@@ -1042,28 +3330,58 @@ export async function importUnrealDirectory(
         acquisition: "none",
         license: request.license,
       },
-      toolchain: { umodel: umodel.version, fabcli: request.fabcliVersion },
+      toolchain: {
+        umodel: umodel.version,
+        fabcli: request.fabcliVersion,
+        uncookedConverter: uncookedConverter?.version,
+        modernConverter: modernConverter?.version,
+      },
       cacheKey,
       reused: false,
       materials: coverage.textured === coverage.sections ? "complete" : "degraded",
       counts: {
         packages: candidates.length,
         exported: models.length,
+        textures: textures.length,
+        cubemaps: cubemaps.length,
+        materialAssets: standaloneMaterials.length,
+        audio: audio.length,
+        dataAssets: dataAssets.length,
+        textureStacks: textureStacks.length,
+        fonts: fonts.length,
+        bitmapFonts: bitmapFonts.length,
+        sprites: sprites.length,
+        flipbooks: flipbooks.length,
+        scenes: scenes.length,
         skipped: skipped.length,
         failed: failed.length,
       },
       models,
+      textures,
+      cubemaps,
+      materialAssets: standaloneMaterials,
+      audio,
+      dataAssets,
+      textureStacks,
+      fonts,
+      bitmapFonts,
+      sprites,
+      flipbooks,
+      scenes,
       skipped,
       failed,
       materialCoverage: coverage,
       transforms,
+      sidecarTextures: [...sidecars.keys()].sort().map((name) => `textures/${name}.png`),
       warnings,
       durationMs: Date.now() - started,
     };
 
     await writeFile(join(promotion, "import-report.json"), `${JSON.stringify(report, null, 2)}\n`);
     await rename(promotion, outputDir);
-    log(`Promoted ${models.length} GLBs to ${outputDir}.`);
+    log(
+      `Promoted ${models.length} model GLB${models.length === 1 ? "" : "s"}, ${textures.length} texture PNG${textures.length === 1 ? "" : "s"}, ${cubemaps.length} cubemap environment map${cubemaps.length === 1 ? "" : "s"}, ${textureStacks.length} multidimensional texture stack${textureStacks.length === 1 ? "" : "s"}, ${standaloneMaterials.length} material asset${standaloneMaterials.length === 1 ? "" : "s"}, ${audio.length} audio file${audio.length === 1 ? "" : "s"}, ${fonts.length} font face${fonts.length === 1 ? "" : "s"}, ${bitmapFonts.length} bitmap font${bitmapFonts.length === 1 ? "" : "s"}, ${sprites.length} sprite GLB${sprites.length === 1 ? "" : "s"}, ${flipbooks.length} flipbook manifest${flipbooks.length === 1 ? "" : "s"}, ${dataAssets.length} data JSON file${dataAssets.length === 1 ? "" : "s"}, and ${scenes.length} scene GLB${scenes.length === 1 ? "" : "s"} to ${outputDir}.`,
+    );
     return report;
   } catch (error) {
     await rm(promotion, { recursive: true, force: true });
