@@ -51,7 +51,7 @@ export function toolchainCacheDir(
 /** UE Viewer has no releases; this is the commit the import contract was proven against. */
 export const UEVIEWER_SOURCE = Object.freeze({
   repository: "https://github.com/gildor2/UEViewer.git",
-  commit: "a0bfb460b2b6b1e35f1e7e0e2e8d2e9c00000000",
+  commit: "a0bfb468d42be831b126632fd8a0ae6b3614f981",
   prebuiltLinux: "https://www.gildor.org/down/47/umodel/umodel_linux.tar.gz",
   prebuiltWindows: "https://www.gildor.org/down/47/umodel/umodel_win32.zip",
   referer: "https://www.gildor.org/en/projects/umodel",
@@ -197,15 +197,33 @@ export async function provisionUmodel(
 
     log("Building UE Viewer from source (one time, ~2 minutes)…");
     const source = join(staging, "UEViewer");
-    const clone = await runBounded(
-      "git",
-      ["clone", "--depth", "1", UEVIEWER_SOURCE.repository, source],
-      { timeoutMs: 600_000 },
-    );
-    if (clone.code !== 0) {
+    await mkdir(source, { recursive: true });
+    const initialized = await runBounded("git", ["init", "--quiet"], {
+      cwd: source,
+      timeoutMs: 30_000,
+    });
+    const remote = initialized.code === 0
+      ? await runBounded("git", ["remote", "add", "origin", UEVIEWER_SOURCE.repository], {
+          cwd: source,
+          timeoutMs: 30_000,
+        })
+      : initialized;
+    const fetched = remote.code === 0
+      ? await runBounded("git", ["fetch", "--depth", "1", "origin", UEVIEWER_SOURCE.commit], {
+          cwd: source,
+          timeoutMs: 600_000,
+        })
+      : remote;
+    const checkedOut = fetched.code === 0
+      ? await runBounded("git", ["checkout", "--detach", UEVIEWER_SOURCE.commit], {
+          cwd: source,
+          timeoutMs: 60_000,
+        })
+      : fetched;
+    if (checkedOut.code !== 0) {
       throw new ToolchainError(
         "UNREAL_TOOL_UNUSABLE",
-        "UE Viewer source could not be cloned. Install umodel manually and set THREENATIVE_UMODEL_PATH.",
+        "The pinned UE Viewer source commit could not be fetched. Install umodel manually and set THREENATIVE_UMODEL_PATH.",
       );
     }
     const build = await runBounded("./build.sh", [], {

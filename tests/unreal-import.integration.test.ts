@@ -1,6 +1,6 @@
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { Document, NodeIO } from "@gltf-transform/core";
 import { EXTMeshGPUInstancing, KHRLightsPunctual, type InstancedMesh } from "@gltf-transform/extensions";
@@ -26,6 +26,7 @@ import {
   validateGlb,
 } from "../src/unreal/importer.js";
 import { childEnvironment, resolveExecutable, ToolchainError } from "../src/unreal/toolchain.js";
+import { UEVIEWER_SOURCE } from "../src/unreal/provision.js";
 import { runImportCli } from "../src/cli.js";
 import { writeFakeUmodel, writeMeshFixture, writePng, writePsaFixture, writeWavFixture } from "./helpers/unreal-fixture.js";
 
@@ -539,12 +540,24 @@ describe("path and toolchain guards", () => {
     expect(assertContained("/tmp/out", "Group/Mesh.glb")).toBe("/tmp/out/Group/Mesh.glb");
   });
 
-  it("hashes the source tree by relative path and size, independent of the root", () => {
-    const left = hashSourceTree("/a", [{ path: "/a/x.uasset", size: 10 }]);
-    const right = hashSourceTree("/b", [{ path: "/b/x.uasset", size: 10 }]);
-    const changed = hashSourceTree("/a", [{ path: "/a/x.uasset", size: 11 }]);
+  it("hashes source bytes as well as relative path and size, independent of the root", async () => {
+    const leftRoot = await temporaryDirectory("tn-hash-left-");
+    const rightRoot = await temporaryDirectory("tn-hash-right-");
+    const leftPath = join(leftRoot, "x.uasset");
+    const rightPath = join(rightRoot, "x.uasset");
+    await writeFile(leftPath, "same-size-a");
+    await writeFile(rightPath, "same-size-a");
+    const left = await hashSourceTree(leftRoot, [{ path: leftPath, size: 11 }]);
+    const right = await hashSourceTree(rightRoot, [{ path: rightPath, size: 11 }]);
+    await writeFile(rightPath, "same-size-b");
+    const changed = await hashSourceTree(rightRoot, [{ path: rightPath, size: 11 }]);
     expect(left).toBe(right);
     expect(changed).not.toBe(left);
+  });
+
+  it("pins automatic UE Viewer source builds to the verified commit", () => {
+    expect(UEVIEWER_SOURCE.commit).toBe("a0bfb468d42be831b126632fd8a0ae6b3614f981");
+    expect(UEVIEWER_SOURCE.commit).toMatch(/^[0-9a-f]{40}$/);
   });
 
   it("parses the class table UE Viewer prints for -list", () => {
@@ -1820,6 +1833,25 @@ fs.copyFileSync(${JSON.stringify(converterFixture)}, path.join(out, "Meshes", "S
     await expect(
       importUnrealDirectory({ ...request, maxTextureSize: 256 }),
     ).rejects.toThrow(/already holds a different import/);
+  });
+
+  it("isolates staging for concurrent imports with the same cache key", async () => {
+    const workspace = await unrealWorkspace();
+    const secondOutput = join(dirname(workspace.outputDir), "pack-copy");
+    const request = {
+      sourceDir: workspace.sourceDir,
+      environment: workspace.environment,
+      umodel: { name: "umodel" as const, path: workspace.umodel, version: "Test" },
+    };
+    const [first, second] = await Promise.all([
+      importUnrealDirectory({ ...request, outputDir: workspace.outputDir }),
+      importUnrealDirectory({ ...request, outputDir: secondOutput }),
+    ]);
+    expect(first.cacheKey).toBe(second.cacheKey);
+    expect(first.counts.failed).toBe(0);
+    expect(second.counts.failed).toBe(0);
+    expect((await stat(join(workspace.outputDir, first.models[0]!.glb))).size).toBeGreaterThan(0);
+    expect((await stat(join(secondOutput, second.models[0]!.glb))).size).toBeGreaterThan(0);
   });
 
   it("fails without promoting anything when UE Viewer exits nonzero", async () => {

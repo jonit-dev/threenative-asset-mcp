@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { readdir, mkdir, mkdtemp, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
-import { readFileSync, statfs } from "node:fs";
+import { createReadStream, readFileSync, statfs } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
@@ -45,7 +45,7 @@ import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } fr
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 42;
+export const IMPORTER_VERSION = 43;
 
 export type ImportErrorCode =
   | "UNREAL_SOURCE_NOT_FOUND"
@@ -403,16 +403,18 @@ async function listFiles(root: string): Promise<{ path: string; size: number }[]
   return found;
 }
 
-/** Identity of the input tree: every relative path and its size, in a stable order. */
-export function hashSourceTree(
+/** Identity of the input tree: every relative path, size, and byte, in a stable order. */
+export async function hashSourceTree(
   root: string,
   files: readonly { path: string; size: number }[],
-): string {
+): Promise<string> {
   const hash = createHash("sha256");
   for (const file of files) {
     hash.update(relative(root, file.path).split(sep).join("/"));
     hash.update("\0");
     hash.update(String(file.size));
+    hash.update("\0");
+    for await (const chunk of createReadStream(file.path)) hash.update(chunk);
     hash.update("\n");
   }
   return `sha256:${hash.digest("hex")}`;
@@ -1339,7 +1341,7 @@ export async function importUnrealDirectory(
     );
   }
   const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
-  const sourceHash = hashSourceTree(sourceDir, files);
+  const sourceHash = await hashSourceTree(sourceDir, files);
 
   const umodel = request.umodel ?? (await ensureUmodel(environment, log));
   const cacheKey = createHash("sha256")
@@ -1382,7 +1384,12 @@ export async function importUnrealDirectory(
     }
   }
 
-  const staging = join(cacheRoot(environment), cacheKey);
+  const stagingRoot = join(cacheRoot(environment), cacheKey);
+  await mkdir(stagingRoot, { recursive: true });
+  // The cache key identifies reusable results, not ownership of mutable scratch space. Give every
+  // invocation its own directory so identical concurrent imports cannot delete or mix each
+  // other's converter output.
+  const staging = await mkdtemp(join(stagingRoot, "run-"));
   const raw = join(staging, "raw");
   await mkdir(raw, { recursive: true });
   const promotionParent = dirname(outputDir);
