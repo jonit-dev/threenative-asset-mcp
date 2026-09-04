@@ -78,12 +78,27 @@ function chunkTable(bytes: Buffer): Map<string, Chunk> {
   return chunks;
 }
 
-function position(bytes: Buffer, offset: number): [number, number, number] {
+/**
+ * UE Viewer writes the two chunks in two different frames, and reading them as one mirrors every
+ * clip against the bind pose the same import emits.
+ *
+ * `Exporters/ExportPsk.cpp` writes ANIMKEYS through its `MIRROR_MESH` path — `Position.Y *= -1`,
+ * `Orientation.Y *= -1`, `Orientation.W *= -1` — while the BONENAMES reference pose is written
+ * raw, and `Exporters/ExportGLTF.cpp` writes the glTF bind pose raw too. So the mirror is ours to
+ * undo on the keys and only on the keys: it is an involution, applied before the Y/Z exchange
+ * below. Measured on AnimalVarietyPack/Wolf, bone `Wolf_-Neck`: BONENAMES holds `Y = +4.578`,
+ * ANIMKEYS frame 0 holds `Y = -4.578`, and the bone does not move in that clip.
+ *
+ * Read without it, `@threenative/core`'s loader detects the Z-mirror and repairs all 21 of
+ * SK_Wolf's clips at load, logging `TN_ASSETS_MIRRORED_CLIPS_REPAIRED`.
+ */
+function position(bytes: Buffer, offset: number, mirrored: boolean): [number, number, number] {
   // UE Viewer uses the same conversion in ExportGLTF.cpp: swap Y/Z and centimetres → metres.
+  const ueY = bytes.readFloatLE(offset + 4);
   const value: [number, number, number] = [
     bytes.readFloatLE(offset) * 0.01,
     bytes.readFloatLE(offset + 8) * 0.01,
-    bytes.readFloatLE(offset + 4) * 0.01,
+    (mirrored ? -ueY : ueY) * 0.01,
   ];
   if (value.some((component) => !Number.isFinite(component))) {
     throw new Error("ActorX PSA contains a non-finite translation.");
@@ -91,13 +106,21 @@ function position(bytes: Buffer, offset: number): [number, number, number] {
   return value;
 }
 
-function rotation(bytes: Buffer, offset: number, root: boolean): [number, number, number, number] {
+function rotation(
+  bytes: Buffer,
+  offset: number,
+  root: boolean,
+  mirrored: boolean,
+): [number, number, number, number] {
+  const ueY = bytes.readFloatLE(offset + 4);
+  const ueW = bytes.readFloatLE(offset + 12);
   let value: [number, number, number, number] = [
     bytes.readFloatLE(offset),
     bytes.readFloatLE(offset + 8),
-    bytes.readFloatLE(offset + 4),
-    bytes.readFloatLE(offset + 12),
+    mirrored ? -ueY : ueY,
+    mirrored ? -ueW : ueW,
   ];
+  // UE Viewer conjugates the first bone's rotation in ExportGLTF.cpp, bind pose and clips alike.
   if (root) value = [-value[0], -value[1], -value[2], value[3]];
   const magnitude = Math.hypot(...value);
   if (!Number.isFinite(magnitude) || magnitude < 1e-8) return [0, 0, 0, 1];
@@ -144,8 +167,8 @@ export function parsePsa(bytes: Buffer): PsaFile {
     bones.push({
       name,
       parentIndex,
-      rotation: rotation(bytes, offset + 76, index === 0),
-      translation: position(bytes, offset + 92),
+      rotation: rotation(bytes, offset + 76, index === 0, false),
+      translation: position(bytes, offset + 92, false),
     });
   }
 
@@ -175,8 +198,8 @@ export function parsePsa(bytes: Buffer): PsaFile {
         const keyIndex = (firstFrame + frame) * totalBones + boneIndex;
         const keyOffset = keyChunk.offset + keyIndex * keyChunk.dataSize;
         times[frame] = frame / effectiveRate;
-        translations.set(position(bytes, keyOffset), frame * 3);
-        let quaternion = rotation(bytes, keyOffset + 12, boneIndex === 0);
+        translations.set(position(bytes, keyOffset, true), frame * 3);
+        let quaternion = rotation(bytes, keyOffset + 12, boneIndex === 0, true);
         if (previous && previous.reduce((sum, component, axis) => sum + component * quaternion[axis]!, 0) < 0) {
           quaternion = quaternion.map((component) => component === 0 ? 0 : -component) as [
             number,
