@@ -58,7 +58,52 @@ function fixture(): Buffer {
   ]);
 }
 
+/**
+ * A rig whose one non-root bone never moves, written the way UE Viewer writes it: BONENAMES raw,
+ * ANIMKEYS through its MIRROR_MESH path. Measured on AnimalVarietyPack/Wolf — bone `Wolf_-Neck`
+ * holds `Y = +4.578` in BONENAMES and `Y = -4.578` in ANIMKEYS frame 0, and the quaternion the
+ * same way with `Y` and `W` negated. A correct reader converts both to the same glTF transform.
+ */
+function staticPose(): Buffer {
+  const info = Buffer.alloc(168);
+  name(info, 0, "Stand");
+  name(info, 64, "None");
+  info.writeInt32LE(2, 128);
+  info.writeInt32LE(1, 140);
+  info.writeFloatLE(1, 148);
+  info.writeFloatLE(30, 152);
+  info.writeInt32LE(0, 160);
+  info.writeInt32LE(1, 164);
+  const neck = Buffer.alloc(120);
+  name(neck, 0, "neck");
+  neck.writeInt32LE(0, 72);
+  [0.5, -0.5, -0.5, -0.5].forEach((value, index) => neck.writeFloatLE(value, 76 + index * 4));
+  [26.678, 4.578, 0].forEach((value, index) => neck.writeFloatLE(value, 92 + index * 4));
+  return Buffer.concat([
+    chunk("ANIMHEAD", 0, []),
+    chunk("BONENAMES", 120, [bone("root", -1, [0, 0, 0]), neck]),
+    chunk("ANIMINFO", 168, [info]),
+    chunk("ANIMKEYS", 32, [
+      key([0, 0, 0], [0, 0, 0, 1]),
+      key([26.678, -4.578, 0], [0.5, 0.5, -0.5, 0.5]),
+    ]),
+    chunk("SCALEKEYS", 16, []),
+  ]);
+}
+
 describe("ActorX PSA conversion", () => {
+  it("undoes UE Viewer's key mirror so a still bone's clip matches its bind pose", () => {
+    const parsed = parsePsa(staticPose());
+    const track = parsed.sequences[0]!.tracks[1]!;
+    // Float32 keys against float64 bind values, so compare to single-precision, not exactly.
+    parsed.bones[1]!.translation.forEach((value, axis) => {
+      expect(track.translations[axis]).toBeCloseTo(value, 6);
+    });
+    parsed.bones[1]!.rotation.forEach((value, axis) => {
+      expect(track.rotations[axis]).toBeCloseTo(value, 6);
+    });
+  });
+
   it("parses frame-major keys with UE-to-glTF coordinates and seconds", () => {
     const parsed = parsePsa(fixture());
     expect(parsed.bones).toHaveLength(2);
@@ -67,9 +112,12 @@ describe("ActorX PSA conversion", () => {
     expect(parsed.hasScaleKeys).toBe(false);
     expect(parsed.sequences[0]!.tracks[0]!.times[0]).toBe(0);
     expect(parsed.sequences[0]!.tracks[0]!.times[1]).toBeCloseTo(1 / 30, 7);
-    expect([...parsed.sequences[0]!.tracks[0]!.translations]).toEqual([0, 0, 0, 1, 3, 2]);
-    // Quaternion signs are made continuous, so a negative identity key does not cause a spin.
-    expect([...parsed.sequences[0]!.tracks[1]!.rotations.slice(4)]).toEqual([0, 0, 0, 1]);
+    // ANIMKEYS arrive in UE Viewer's mirrored frame, so glTF Z is the negated UE Y: (x, z, -y).
+    // BONENAMES above is not mirrored, which is why `bones[0].translation` keeps its +2.
+    expect([...parsed.sequences[0]!.tracks[0]!.translations]).toEqual([0, 0, -0, 1, 3, -2]);
+    // Quaternion signs are made continuous, so an opposite-sign identity key does not cause a spin.
+    const rotations = parsed.sequences[0]!.tracks[1]!.rotations;
+    expect([...rotations.slice(4)]).toEqual([...rotations.slice(0, 4)]);
   });
 
   it("attaches a compatible clip to real skin joints", () => {
