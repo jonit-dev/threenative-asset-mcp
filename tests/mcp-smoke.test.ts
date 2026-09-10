@@ -5,7 +5,7 @@ import {
   type ChildProcessWithoutNullStreams,
 } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -462,37 +462,73 @@ describe("built stdio package", () => {
     await stopServer(child);
   });
 
-  it("should serve creature discovery from the installed package bin", async () => {
-    const installed = await installPackedPackage();
-    const { child } = await startInitializedServer({
-      command: installed.command,
-      cwd: installed.cwd,
-    });
+  if (process.platform !== "win32") {
+    it("should not report a non-executable PATH candidate as optional tooling", async () => {
+      const executableDirectory = await mkdtemp(
+        join(tmpdir(), "threenative-asset-mcp-noexec-"),
+      );
+      temporaryDirectories.push(executableDirectory);
+      const candidate = join(executableDirectory, "python3");
+      await writeFile(candidate, "#!/bin/sh\nexit 0\n");
+      await chmod(candidate, 0o644);
+      const { child } = await startInitializedServer({
+        environment: { PATH: executableDirectory },
+      });
 
-    const status = await callTool(child, 3, "creature_status");
-    const guide = await callTool(child, 4, "creature_guide", {
-      section: "syntax",
-    });
+      const response = await callTool(child, 3, "creature_status");
 
-    expect(status).toMatchObject({
-      result: {
-        structuredContent: {
-          operations: {
-            creature_status: { available: true },
-            creature_guide: { available: true },
-            creature_compile: { available: false },
+      expect(response).toMatchObject({
+        result: {
+          structuredContent: {
+            tooling: {
+              pythonSilhouettes: {
+                available: false,
+                executable: "python3",
+              },
+            },
           },
         },
-      },
-    });
-    expect(guide).toMatchObject({
-      result: {
-        structuredContent: {
-          guide: expect.stringContaining("Spec JSON — the whole language on one page"),
-        },
-      },
-    });
+      });
 
-    await stopServer(child);
-  });
+      await stopServer(child);
+    });
+  }
+
+  it(
+    "should serve creature discovery from the installed package bin",
+    async () => {
+      const installed = await installPackedPackage();
+      const { child } = await startInitializedServer({
+        command: installed.command,
+        cwd: installed.cwd,
+      });
+
+      const status = await callTool(child, 3, "creature_status");
+      const guide = await callTool(child, 4, "creature_guide", {
+        section: "syntax",
+      });
+
+      expect(status).toMatchObject({
+        result: {
+          structuredContent: {
+            operations: {
+              creature_status: { available: true },
+              creature_guide: { available: true },
+              creature_compile: { available: false },
+            },
+          },
+        },
+      });
+      expect(guide).toMatchObject({
+        result: {
+          structuredContent: {
+            guide: expect.stringContaining("Spec JSON — the whole language on one page"),
+          },
+        },
+      });
+
+      await stopServer(child);
+    },
+    30_000,
+  );
 });

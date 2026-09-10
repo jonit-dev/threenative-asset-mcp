@@ -1,6 +1,7 @@
-import { access, readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { delimiter, isAbsolute, join } from "node:path";
+import { constants } from "node:fs";
+import { access, readFile, stat } from "node:fs/promises";
+import { delimiter, extname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -174,7 +175,7 @@ type CreatureGuideOutput = z.output<typeof CreatureGuideOutputSchema>;
 class CreaturePayloadError extends Error {}
 
 interface Payload {
-  readonly entries: ReadonlyMap<string, Entry>;
+  readonly guides: Readonly<Record<GuideSection, string>>;
 }
 
 let payloadPromise: Promise<Payload> | undefined;
@@ -212,6 +213,21 @@ function isFileEntry(entry: Entry): entry is FileEntry {
   return !entry.directory;
 }
 
+async function readPayloadText(
+  entries: ReadonlyMap<string, FileEntry>,
+  filename: string,
+  description: string,
+): Promise<string> {
+  const entry = entries.get(`${PAYLOAD_ROOT}${filename}`);
+  if (!entry) {
+    throw new CreaturePayloadError(`The packaged anyCreature ${description} entry is missing.`);
+  }
+  if (entry.uncompressedSize > 128_000) {
+    throw new CreaturePayloadError(`The packaged anyCreature ${description} entry exceeds its size limit.`);
+  }
+  return entry.getData(new TextWriter());
+}
+
 async function loadPayload(): Promise<Payload> {
   const archive = await readFile(PAYLOAD_PATH).catch(() => {
     throw new CreaturePayloadError("The packaged anyCreature payload is missing.");
@@ -234,17 +250,20 @@ async function loadPayload(): Promise<Payload> {
     ) {
       throw new CreaturePayloadError("The packaged anyCreature payload inventory is invalid.");
     }
-    const versionEntry = entries.find(
-      (entry) => entry.filename === `${PAYLOAD_ROOT}VERSION` && !entry.directory,
+    const fileEntries = new Map(
+      entries.filter(isFileEntry).map((entry) => [entry.filename, entry]),
     );
-    if (!versionEntry || !isFileEntry(versionEntry)) {
-      throw new CreaturePayloadError("The packaged anyCreature version entry is missing.");
-    }
-    const version = (await versionEntry.getData(new TextWriter())).trim();
+    const version = (await readPayloadText(fileEntries, "VERSION", "version")).trim();
     if (version !== PAYLOAD_VERSION) {
       throw new CreaturePayloadError("The packaged anyCreature version does not match the pin.");
     }
-    return { entries: new Map(entries.map((entry) => [entry.filename, entry])) };
+    const guides = {} as Record<GuideSection, string>;
+    for (const [section, filename] of Object.entries(GUIDE_FILES) as Array<
+      [GuideSection, string]
+    >) {
+      guides[section] = await readPayloadText(fileEntries, filename, `${section} guide`);
+    }
+    return { guides };
   } finally {
     await reader.close();
   }
@@ -255,16 +274,38 @@ async function payload(): Promise<Payload> {
   return payloadPromise;
 }
 
+function executableNames(executable: string): readonly string[] {
+  if (process.platform !== "win32" || extname(executable)) return [executable];
+  const extensions = (process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD")
+    .split(";")
+    .map((extension) => extension.trim())
+    .filter(Boolean)
+    .map((extension) => (extension.startsWith(".") ? extension : `.${extension}`));
+  return [executable, ...extensions.map((extension) => `${executable}${extension}`)];
+}
+
+async function executableFile(candidate: string): Promise<boolean> {
+  try {
+    if (!(await stat(candidate)).isFile()) return false;
+    await access(
+      candidate,
+      process.platform === "win32" ? constants.F_OK : constants.X_OK,
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function executableAvailable(executable: string): Promise<boolean> {
-  const directories = (process.env.PATH ?? "").split(delimiter).filter(Boolean);
-  for (const directory of directories) {
-    const candidate = isAbsolute(executable) ? executable : join(directory, executable);
-    try {
-      await access(candidate);
-      return true;
-    } catch {
-      // Continue through PATH; a missing optional tool must not prevent guide access.
-    }
+  const candidates = isAbsolute(executable)
+    ? executableNames(executable)
+    : (process.env.PATH ?? "")
+        .split(delimiter)
+        .filter(Boolean)
+        .flatMap((directory) => executableNames(join(directory, executable)));
+  for (const candidate of candidates) {
+    if (await executableFile(candidate)) return true;
   }
   return false;
 }
@@ -315,12 +356,11 @@ async function status(): Promise<CreatureStatusOutput> {
 
 async function guide(section: GuideSection): Promise<CreatureGuideOutput> {
   const archive = await payload();
-  const entry = archive.entries.get(`${PAYLOAD_ROOT}${GUIDE_FILES[section]}`);
-  if (!entry || !isFileEntry(entry)) {
-    throw new CreaturePayloadError("The requested guide entry is missing from the packaged payload.");
-  }
-  const text = await entry.getData(new TextWriter());
-  return CreatureGuideOutputSchema.parse({ section, guide: text, ...metadata() });
+  return CreatureGuideOutputSchema.parse({
+    section,
+    guide: archive.guides[section],
+    ...metadata(),
+  });
 }
 
 export function createCreatureStatusHandler() {
