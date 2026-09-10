@@ -1034,11 +1034,9 @@ export class CreatureRunner {
           const capturedOutputSha256 = await hashExistingFile(rollbackCaptureAbsolute, this.limits.glbBytes).catch(() => undefined);
           if (capturedOutputSha256 !== outputSha256) {
             try {
-              await copyFile(rollbackCaptureAbsolute, outputAbsolute, constants.COPYFILE_EXCL);
-              await unlink(rollbackCaptureAbsolute);
-              rollbackCapture = undefined;
+              await link(rollbackCaptureAbsolute, outputAbsolute);
             } catch {
-              // A later writer at outputAbsolute wins. The displaced bytes stay at rollbackCapture.
+              // A later writer at outputAbsolute wins, or linking failed. The capture stays recoverable.
             }
             rollback.state = "preserved";
             throw new CreatureOperationError(

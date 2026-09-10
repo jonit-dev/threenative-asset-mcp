@@ -21,6 +21,7 @@ import {
   readFile,
   readdir,
   rm,
+  stat,
   symlink,
   writeFile,
 } from "node:fs/promises";
@@ -507,11 +508,13 @@ function sabotageReceiptAfterPublication(
 ): Promise<void> {
   return new Promise((resolveSabotage, reject) => {
     let receiptSabotaged = false;
+    let sabotageComplete = false;
     const timer = setTimeout(() => {
       watcher.close();
       reject(new Error("Timed out waiting for creature publication rename"));
     }, 30_000);
     const watcher = watch(dirname(outputPath), (event, filename) => {
+      if (sabotageComplete) return;
       if (event !== "rename" || filename !== basename(outputPath)) return;
       try {
         if (!receiptSabotaged) {
@@ -522,6 +525,7 @@ function sabotageReceiptAfterPublication(
           receiptSabotaged = true;
           if (timing === "during-rollback") return;
         }
+        sabotageComplete = true;
         sabotage();
         clearTimeout(timer);
         watcher.close();
@@ -998,6 +1002,54 @@ describe("creature_compile installed MCP", () => {
       expect(await readFile(outputPath)).toEqual(external);
       expect(hash(await readFile(join(root, failure.detail?.recoveryPath as string)))).toBe(hash(previous));
       expect(hash(await readFile(join(root, failure.detail?.publishedRecoveryPath as string)))).toBe(hash(replacement));
+    } finally {
+      await runner.close();
+    }
+  }, 60_000);
+
+  it("should hard-link a mismatched rollback capture back without deleting it", async () => {
+    if (process.platform === "win32") return;
+    const root = await createScaffold();
+    const stateRoot = join(root, ".threenative", "creatures");
+    const specPath = join(stateRoot, "wyvern.json");
+    const outputDirectory = join(root, "assets", "creatures");
+    const outputPath = join(root, "assets", "creatures", "in-place-race.glb");
+    const seedPath = join(stateRoot, "large-valid.glb");
+    const previous = validFixtureGlb(0, 9);
+    const replacement = validFixtureGlb(30 * 1_024 * 1_024, 10);
+    const capturedExternal = Buffer.from("captured external writer bytes");
+    await writeFile(specPath, JSON.stringify(WYVERN_SPEC, null, 2));
+    await writeFile(outputPath, previous);
+    await writeFile(seedPath, replacement);
+    const runner = await createSeedCopyRunner(root, seedPath);
+    const sabotaged = sabotageReceiptAfterPublication(stateRoot, outputPath, () => {
+      const rollbackCapture = readdirSync(outputDirectory)
+        .find((name) => name.endsWith(".rollback-published"));
+      if (!rollbackCapture) throw new Error("Rollback capture was not published");
+      writeFileSync(join(outputDirectory, rollbackCapture), capturedExternal);
+    }, "during-rollback");
+    try {
+      const failure = await runner.compile({
+        specPath: ".threenative/creatures/wyvern.json",
+        outputPath: "assets/creatures/in-place-race.glb",
+        expectedOutputSha256: hash(previous),
+      }).catch((error: unknown) => error) as { code?: string; detail?: Record<string, unknown> };
+      await sabotaged;
+      expect(failure).toMatchObject({
+        code: "OUTPUT_CONFLICT",
+        detail: {
+          recoveryPath: expect.stringMatching(/\.rollback$/),
+          displacedOutputPath: expect.stringMatching(/\.rollback-published$/),
+          rollback: "preserved",
+        },
+      });
+      const displacedOutputPath = join(root, failure.detail?.displacedOutputPath as string);
+      const [outputInfo, displacedInfo] = await Promise.all([stat(outputPath), stat(displacedOutputPath)]);
+      expect(outputInfo.ino).toBe(displacedInfo.ino);
+      expect(outputInfo.nlink).toBeGreaterThanOrEqual(2);
+      expect(await readFile(outputPath)).toEqual(capturedExternal);
+      expect(hash(await readFile(displacedOutputPath))).toBe(hash(await readFile(outputPath)));
+      expect(hash(await readFile(join(root, failure.detail?.recoveryPath as string)))).toBe(hash(previous));
     } finally {
       await runner.close();
     }
