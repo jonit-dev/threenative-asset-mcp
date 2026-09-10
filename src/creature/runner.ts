@@ -15,10 +15,12 @@ import {
   rename,
   rm,
   stat,
+  symlink,
   unlink,
   writeFile,
 } from "node:fs/promises";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
 import { basename, delimiter, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { Uint8ArrayReader, Uint8ArrayWriter, ZipReader, type Entry, type FileEntry } from "@zip.js/zip.js";
@@ -64,6 +66,7 @@ const ChecksSchema = z
 
 export type CreatureErrorCode =
   | "INVALID_SPEC"
+  | "INVALID_CLAIMS"
   | "COMPILE_BLOCKED"
   | "OUTPUT_INVALID"
   | "OUTPUT_CONFLICT"
@@ -147,10 +150,84 @@ interface ProcessResult {
 
 interface GlbIdentity {
   readonly clips: readonly string[];
+  readonly clipDetails: readonly GlbClipDetail[];
   readonly joints: number;
   readonly vertices: number;
   readonly faces: number;
   readonly bounds: { readonly width: number; readonly height: number; readonly length: number };
+  readonly materials: readonly GlbMaterialDetail[];
+  readonly meshes: readonly GlbMeshDetail[];
+  readonly skinnedMeshes: number;
+  readonly document: Record<string, unknown>;
+}
+
+export interface GlbClipDetail {
+  readonly name: string;
+  readonly channels: number;
+  readonly tracks: readonly {
+    readonly node: string;
+    readonly path: string;
+    readonly keyframes: number;
+  }[];
+}
+
+export interface GlbMaterialDetail {
+  readonly name: string;
+  readonly authoredName: boolean;
+  readonly baseColor?: readonly number[];
+  readonly roughness?: number;
+  readonly metallic?: number;
+}
+
+export interface GlbMeshDetail {
+  readonly name: string;
+  readonly primitives: number;
+  readonly vertices: number;
+  readonly faces: number;
+  readonly materials: readonly string[];
+}
+
+export interface CreatureGlbInspection {
+  readonly glbPath: string;
+  readonly glbSha256: string;
+  readonly bytes: number;
+  readonly clips: readonly string[];
+  readonly clipDetails: readonly GlbClipDetail[];
+  readonly joints: number;
+  readonly vertices: number;
+  readonly faces: number;
+  readonly bounds: { readonly width: number; readonly height: number; readonly length: number };
+  readonly materials: readonly GlbMaterialDetail[];
+  readonly meshes: readonly GlbMeshDetail[];
+  readonly skinnedMeshes: number;
+  readonly sourceSpec: unknown | null;
+  readonly sourceSpecReason?: string;
+  readonly structuralErrors: readonly string[];
+}
+
+export interface CreatureJudgeRequest {
+  readonly glbAbsolute: string;
+  readonly claims: Uint8Array;
+  readonly outputDirectory: string;
+  readonly name: string;
+  readonly stage: "LOW" | "MID" | "HIGH";
+}
+
+export interface CreatureJudgeResult {
+  readonly exitCode: number | null;
+  readonly signalCode: NodeJS.Signals | null;
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly metricsPath: string;
+  readonly overflow: boolean;
+  readonly spawnError?: string;
+}
+
+export interface CreatureCompileEvidence {
+  readonly receipt?: Record<string, unknown>;
+  readonly receiptPath?: string;
+  readonly checks?: Record<string, unknown>;
+  readonly advisories: readonly string[];
 }
 
 interface StatePaths {
@@ -352,13 +429,97 @@ function dependencySearchPath(): string {
 }
 
 function childEnvironment(): NodeJS.ProcessEnv {
-  const allowed = ["PATH", "SystemRoot", "WINDIR", "TEMP", "TMP", "TMPDIR", "HOME", "USERPROFILE"] as const;
+  const allowed = [
+    "PATH",
+    "SystemRoot",
+    "WINDIR",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "HOME",
+    "USERPROFILE",
+    "LOCALAPPDATA",
+    "PLAYWRIGHT_BROWSERS_PATH",
+    "PW_CHROMIUM_PATH",
+    "PW_NO_SANDBOX",
+  ] as const;
   const environment: NodeJS.ProcessEnv = {};
   for (const name of allowed) {
     if (process.env[name]) environment[name] = process.env[name];
   }
   environment.NODE_PATH = dependencySearchPath();
   return environment;
+}
+
+const THREE_BROWSER_EXPORTS = [
+  "Box3",
+  "Color",
+  "DirectionalLight",
+  "DoubleSide",
+  "HemisphereLight",
+  "LinearSRGBColorSpace",
+  "MeshBasicMaterial",
+  "PerspectiveCamera",
+  "Scene",
+  "SRGBColorSpace",
+  "Vector3",
+  "WebGLRenderer",
+] as const;
+
+const THREE_BROWSER_MODULE = [
+  'import "/assets/three-bundle.js";',
+  "const THREE = globalThis.THREE;",
+  "export default THREE;",
+  ...THREE_BROWSER_EXPORTS.map((name) => `export const ${name} = THREE.${name};`),
+].join("\n");
+
+const GLTF_LOADER_BROWSER_MODULE = [
+  'import "/assets/three-bundle.js";',
+  "export const GLTFLoader = globalThis.GLTFLoader;",
+  "export default globalThis.GLTFLoader;",
+].join("\n");
+
+async function installedPackageRoot(packageName: string): Promise<string> {
+  const require = createRequire(import.meta.url);
+  let candidate = dirname(require.resolve(packageName));
+  for (let depth = 0; depth < 8; depth += 1) {
+    try {
+      const manifest = JSON.parse(await readFile(join(candidate, "package.json"), "utf8")) as Record<string, unknown>;
+      if (manifest.name === packageName) return candidate;
+    } catch {
+      // Walk toward the package root.
+    }
+    candidate = dirname(candidate);
+  }
+  throw new CreatureOperationError("TOOLCHAIN_UNAVAILABLE", `The installed ${packageName} package could not be located for claims measurement.`);
+}
+
+async function createJudgeHarness(payloadRoot: string): Promise<{
+  readonly root: string;
+  readonly scriptRoot: string;
+  readonly cleanup: () => Promise<void>;
+}> {
+  const temporary = await mkdtemp(join(tmpdir(), "threenative-creature-judge-"));
+  const scriptRoot = join(temporary, "harness");
+  const threeBuild = join(temporary, "node_modules", "three", "build");
+  const threeLoaders = join(temporary, "node_modules", "three", "examples", "jsm", "loaders");
+  await mkdir(scriptRoot, { recursive: true, mode: 0o700 });
+  await mkdir(threeBuild, { recursive: true, mode: 0o700 });
+  await mkdir(threeLoaders, { recursive: true, mode: 0o700 });
+  await copyFile(join(payloadRoot, "harness", "judge.mjs"), join(scriptRoot, "judge.mjs"));
+  await copyFile(join(payloadRoot, "harness", "pwlaunch.mjs"), join(scriptRoot, "pwlaunch.mjs"));
+  await copyFile(join(payloadRoot, "harness", "assets", "three-bundle.js"), join(scriptRoot, "assets-three-bundle.js"));
+  await mkdir(join(scriptRoot, "assets"), { recursive: true, mode: 0o700 });
+  await rename(join(scriptRoot, "assets-three-bundle.js"), join(scriptRoot, "assets", "three-bundle.js"));
+  await writeFile(join(threeBuild, "three.module.js"), `${THREE_BROWSER_MODULE}\n`, { mode: 0o600 });
+  await writeFile(join(threeLoaders, "GLTFLoader.js"), `${GLTF_LOADER_BROWSER_MODULE}\n`, { mode: 0o600 });
+  const playwrightRoot = await installedPackageRoot("playwright");
+  await symlink(playwrightRoot, join(temporary, "node_modules", "playwright"), "dir");
+  return {
+    root: temporary,
+    scriptRoot,
+    cleanup: () => rm(temporary, { recursive: true, force: true }),
+  };
 }
 
 function parseGlb(bytes: Buffer): GlbIdentity {
@@ -488,6 +649,7 @@ function parseGlb(bytes: Buffer): GlbIdentity {
   }
   let vertices = 0;
   let faces = 0;
+  const primitiveMaterialIndices: number[] = [];
   const minimum = [Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY];
   const maximum = [Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY];
   for (const primitive of mesh.primitives) {
@@ -498,6 +660,10 @@ function parseGlb(bytes: Buffer): GlbIdentity {
     const jointsIndex = primitive.attributes.JOINTS_0;
     const weightsIndex = primitive.attributes.WEIGHTS_0;
     const indicesIndex = primitive.indices;
+    if (!Number.isInteger(primitive.material) || (primitive.material as number) < 0) {
+      throw new CreatureOperationError("OUTPUT_INVALID", "A GLB creature primitive is missing its material binding.");
+    }
+    primitiveMaterialIndices.push(primitive.material as number);
     if (![positionIndex, jointsIndex, weightsIndex, indicesIndex].every((index) => Number.isInteger(index) && (index as number) >= 0 && (index as number) < accessors.length)) {
       throw new CreatureOperationError("OUTPUT_INVALID", "A GLB creature primitive is missing bounded position, index, joint, or weight accessors.");
     }
@@ -552,10 +718,11 @@ function parseGlb(bytes: Buffer): GlbIdentity {
     throw new CreatureOperationError("OUTPUT_INVALID", "The GLB inverse bind matrices do not match the rig.");
   }
   if (!Array.isArray(animations)) throw new CreatureOperationError("OUTPUT_INVALID", "The GLB animation table is missing.");
-  const clips = animations.map((animation, index) => {
+  const clipDetails = animations.map((animation, index) => {
     if (!isRecord(animation) || typeof animation.name !== "string" || !animation.name || !Array.isArray(animation.channels) || !animation.channels.length || !Array.isArray(animation.samplers) || !animation.samplers.length) {
       throw new CreatureOperationError("OUTPUT_INVALID", `GLB animation ${index} has no usable channels or samplers.`);
     }
+    const tracks: Array<GlbClipDetail["tracks"][number]> = [];
     for (const channel of animation.channels) {
       if (!isRecord(channel) || !isRecord(channel.target) || !Number.isInteger(channel.target.node) || (channel.target.node as number) < 0 || (channel.target.node as number) >= nodes.length || !Number.isInteger(channel.sampler) || (channel.sampler as number) < 0 || (channel.sampler as number) >= animation.samplers.length) {
         throw new CreatureOperationError("OUTPUT_INVALID", `GLB animation '${animation.name}' targets a missing node.`);
@@ -581,11 +748,54 @@ function parseGlb(bytes: Buffer): GlbIdentity {
       ) {
         throw new CreatureOperationError("OUTPUT_INVALID", `GLB animation '${animation.name}' sampler ranges do not match its target path.`);
       }
+      const targetNode = nodes[channel.target.node as number];
+      tracks.push({
+        node: isRecord(targetNode) && typeof targetNode.name === "string"
+          ? targetNode.name
+          : `node-${channel.target.node as number}`,
+        path: channel.target.path as string,
+        keyframes: input.count,
+      });
     }
-    return animation.name;
+    return { name: animation.name, channels: animation.channels.length, tracks };
   });
+  const materialValues = document.materials;
+  if (!Array.isArray(materialValues) || !materialValues.length) {
+    throw new CreatureOperationError("OUTPUT_INVALID", "The GLB creature has no material table.");
+  }
+  const materials = materialValues.map((material, index) => {
+    if (!isRecord(material)) throw new CreatureOperationError("OUTPUT_INVALID", `GLB material ${index} is invalid.`);
+    const pbr = isRecord(material.pbrMetallicRoughness) ? material.pbrMetallicRoughness : undefined;
+    const baseColor = pbr?.baseColorFactor;
+    const roughness = pbr?.roughnessFactor;
+    const metallic = pbr?.metallicFactor;
+    const authoredName = typeof material.name === "string" && material.name.length > 0;
+    return {
+      name: authoredName ? material.name as string : `material-${index}`,
+      authoredName,
+      ...(Array.isArray(baseColor) && baseColor.every((value) => typeof value === "number" && Number.isFinite(value))
+        ? { baseColor: baseColor as number[] }
+        : {}),
+      ...(typeof roughness === "number" && Number.isFinite(roughness) ? { roughness } : {}),
+      ...(typeof metallic === "number" && Number.isFinite(metallic) ? { metallic } : {}),
+    } satisfies GlbMaterialDetail;
+  });
+  const meshName = typeof mesh.name === "string" && mesh.name ? mesh.name : "mesh-0";
+  const meshMaterials = [...new Set(primitiveMaterialIndices)].map((index) => {
+    const material = materials[index];
+    if (!material) throw new CreatureOperationError("OUTPUT_INVALID", "A GLB primitive references a missing material.");
+    return material.name;
+  });
+  const meshDetails: GlbMeshDetail[] = [{
+    name: meshName,
+    primitives: mesh.primitives.length,
+    vertices,
+    faces,
+    materials: meshMaterials,
+  }];
   return {
-    clips,
+    clips: clipDetails.map((clip) => clip.name),
+    clipDetails,
     joints: skin.joints.length,
     vertices,
     faces,
@@ -594,6 +804,10 @@ function parseGlb(bytes: Buffer): GlbIdentity {
       height: Number(((maximum[1] ?? 0) - (minimum[1] ?? 0)).toFixed(3)),
       length: Number(((maximum[2] ?? 0) - (minimum[2] ?? 0)).toFixed(3)),
     },
+    materials,
+    meshes: meshDetails,
+    skinnedMeshes: nodes.filter((node) => isRecord(node) && Number.isInteger(node.mesh) && Number.isInteger(node.skin)).length,
+    document,
   };
 }
 
@@ -793,6 +1007,180 @@ export class CreatureRunner {
       throw new CreatureOperationError("INVALID_SPEC", "The preview artifact directory must be private and real.");
     }
     return { root, directory, relative: projectPath(root, directory) };
+  }
+
+  async createCheckDirectory(
+    checkId: string,
+  ): Promise<{ readonly root: string; readonly directory: string; readonly relative: string }> {
+    if (!/^[a-z0-9-]{8,80}$/u.test(checkId)) {
+      throw new CreatureOperationError("INVALID_CLAIMS", "The check identifier is invalid.");
+    }
+    const root = await realpath(this.launchRoot).catch(() => {
+      throw new CreatureOperationError("INVALID_CLAIMS", "The server launch root is unavailable.");
+    });
+    const state = await this.ensureState(root);
+    const directory = join(state.checks, checkId);
+    const canonical = await canonicalMissingPath(directory);
+    if (!isInside(canonical, state.checks) || canonical !== directory) {
+      throw new CreatureOperationError("INVALID_CLAIMS", "The check artifact path escapes private creature state.");
+    }
+    await mkdir(directory, { recursive: false, mode: 0o700 });
+    const info = await lstat(directory);
+    if (info.isSymbolicLink() || !info.isDirectory() || (await realpath(directory)) !== directory) {
+      throw new CreatureOperationError("INVALID_CLAIMS", "The check artifact directory must be private and real.");
+    }
+    return { root, directory, relative: projectPath(root, directory) };
+  }
+
+  async inspectCreature(requestPath: string): Promise<CreatureGlbInspection> {
+    const file = await this.resolveProjectFile(requestPath, "glbPath");
+    const info = await stat(file.absolute).catch(() => undefined);
+    if (!info?.isFile() || info.size <= 0 || info.size > this.limits.glbBytes) {
+      throw new CreatureOperationError(
+        "OUTPUT_INVALID",
+        `The creature GLB must be a nonempty regular file no larger than ${this.limits.glbBytes} bytes.`,
+        { glbPath: requestPath, maxBytes: this.limits.glbBytes },
+      );
+    }
+    const bytes = await readFile(file.absolute);
+    if (bytes.length !== info.size || bytes.length > this.limits.glbBytes) {
+      throw new CreatureOperationError("OUTPUT_INVALID", "The creature GLB changed while it was being inspected.");
+    }
+    const identity = parseGlb(bytes);
+    const asset = isRecord(identity.document.asset) ? identity.document.asset : undefined;
+    const extras = asset && isRecord(asset.extras) ? asset.extras : undefined;
+    const embedded = extras?.source_spec;
+    let sourceSpec: unknown | null = null;
+    let sourceSpecReason: string | undefined;
+    if (embedded === undefined) {
+      sourceSpecReason = "The GLB does not embed source_spec; use the authored spec file to recompile it.";
+    } else {
+      const encoded = JSON.stringify(embedded);
+      if (encoded === undefined || Buffer.byteLength(encoded, "utf8") > this.limits.specBytes) {
+        throw new CreatureOperationError("OUTPUT_INVALID", `The embedded source_spec exceeds the ${this.limits.specBytes}-byte spec cap.`);
+      }
+      sourceSpec = embedded;
+    }
+    const structuralErrors: string[] = [];
+    if (identity.skinnedMeshes < 1) structuralErrors.push("The GLB has a skin table but no mesh node bound to that skin.");
+    if (identity.materials.some((material) => !material.authoredName)) {
+      structuralErrors.push("At least one GLB material has no authored name.");
+    }
+    return {
+      glbPath: file.relative,
+      glbSha256: sha256(bytes),
+      bytes: bytes.length,
+      clips: identity.clips,
+      clipDetails: identity.clipDetails,
+      joints: identity.joints,
+      vertices: identity.vertices,
+      faces: identity.faces,
+      bounds: identity.bounds,
+      materials: identity.materials,
+      meshes: identity.meshes,
+      skinnedMeshes: identity.skinnedMeshes,
+      sourceSpec,
+      ...(sourceSpecReason ? { sourceSpecReason } : {}),
+      structuralErrors,
+    };
+  }
+
+  async collectCompileEvidence(
+    glbPath: string,
+    glbSha256: string,
+  ): Promise<CreatureCompileEvidence> {
+    const root = await realpath(this.launchRoot).catch(() => undefined);
+    if (!root) return { advisories: [] };
+    const state = await this.ensureState(root);
+    const receipts: Array<{ receipt: Record<string, unknown>; createdAt: string; receiptPath: string }> = [];
+    for (const name of await readdir(state.receipts).catch(() => [] as string[])) {
+      const candidate = join(state.receipts, name);
+      const info = await lstat(candidate).catch(() => undefined);
+      if (!info?.isFile() || info.isSymbolicLink() || info.size > this.limits.diagnosticsBytes) continue;
+      let value: unknown;
+      try {
+        value = JSON.parse((await readFile(candidate)).toString("utf8")) as unknown;
+      } catch {
+        continue;
+      }
+      if (!isRecord(value) || value.operation !== "creature_compile" || value.outputPath !== glbPath || value.outputSha256 !== glbSha256) continue;
+      receipts.push({
+        receipt: value,
+        createdAt: typeof value.createdAt === "string" ? value.createdAt : "",
+        receiptPath: projectPath(root, candidate),
+      });
+    }
+    receipts.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    const latest = receipts.at(-1);
+    const receipt = latest?.receipt;
+    if (!receipt || !latest || typeof receipt.checksPath !== "string") return { advisories: [] };
+    assertRelativePath(receipt.checksPath, "checksPath");
+    const checksAbsolute = await realpath(resolve(root, receipt.checksPath)).catch(() => undefined);
+    if (!checksAbsolute || !isInside(checksAbsolute, state.checks)) return { receipt, receiptPath: latest.receiptPath, advisories: [] };
+    const checksInfo = await lstat(checksAbsolute).catch(() => undefined);
+    if (!checksInfo?.isFile() || checksInfo.isSymbolicLink() || checksInfo.size > this.limits.diagnosticsBytes) {
+      return { receipt, receiptPath: latest.receiptPath, advisories: [] };
+    }
+    let checks: Record<string, unknown> | undefined;
+    try {
+      const parsed = JSON.parse((await readFile(checksAbsolute)).toString("utf8")) as unknown;
+      if (isRecord(parsed)) checks = parsed;
+    } catch {
+      // A missing or malformed prior sidecar is not evidence for this artifact.
+    }
+    const advisories = Array.isArray(checks?.measures)
+      ? checks.measures.filter((entry): entry is string => typeof entry === "string")
+      : [];
+    return { receipt, receiptPath: latest.receiptPath, ...(checks ? { checks } : {}), advisories };
+  }
+
+  async runClaimsJudge(
+    request: CreatureJudgeRequest,
+    signal: AbortSignal,
+  ): Promise<CreatureJudgeResult> {
+    const root = await realpath(this.launchRoot).catch(() => {
+      throw new CreatureOperationError("INVALID_CLAIMS", "The server launch root is unavailable.");
+    });
+    if (!isInside(request.glbAbsolute, root) || !isInside(request.outputDirectory, root)) {
+      throw new CreatureOperationError("INVALID_CLAIMS", "The claims judge paths must remain inside the server launch root.");
+    }
+    if (!/^[a-z0-9-]{8,80}$/u.test(request.name)) {
+      throw new CreatureOperationError("INVALID_CLAIMS", "The claims judge artifact name is invalid.");
+    }
+    const payloadRoot = await this.ensurePayload(signal);
+    const harness = await createJudgeHarness(payloadRoot);
+    const claimsPath = join(harness.root, "claims.json");
+    const metricsPath = join(request.outputDirectory, `${request.name}_metrics.json`);
+    try {
+      await writeFile(claimsPath, request.claims, { flag: "wx", mode: 0o600 });
+      const result = await this.runProcess(
+        process.execPath,
+        [
+          join(harness.scriptRoot, "judge.mjs"),
+          request.glbAbsolute,
+          request.outputDirectory,
+          request.name,
+          "--spec",
+          claimsPath,
+          "--stage",
+          request.stage,
+        ],
+        harness.root,
+        signal,
+      );
+      if (signal.aborted) throw this.abortError(signal);
+      return {
+        exitCode: result.exitCode,
+        signalCode: result.signalCode,
+        stdout: result.stdout.toString("utf8"),
+        stderr: result.stderr.toString("utf8"),
+        metricsPath,
+        overflow: result.overflow,
+        ...(result.spawnError ? { spawnError: result.spawnError.message } : {}),
+      };
+    } finally {
+      await harness.cleanup();
+    }
   }
 
   async compile(request: CreatureCompileRequest, callerSignal?: AbortSignal): Promise<CreatureCompileResult> {
@@ -1363,8 +1751,17 @@ export class CreatureRunner {
   }
 
   private async runCompiler(cliPath: string, specPath: string, outputPath: string, signal: AbortSignal): Promise<ProcessResult> {
-    const child = spawn(process.execPath, [cliPath, specPath, outputPath], {
-      cwd: dirname(cliPath),
+    return this.runProcess(process.execPath, [cliPath, specPath, outputPath], dirname(cliPath), signal);
+  }
+
+  private async runProcess(
+    command: string,
+    args: readonly string[],
+    cwd: string,
+    signal: AbortSignal,
+  ): Promise<ProcessResult> {
+    const child = spawn(command, args, {
+      cwd,
       env: childEnvironment(),
       shell: false,
       detached: process.platform !== "win32",

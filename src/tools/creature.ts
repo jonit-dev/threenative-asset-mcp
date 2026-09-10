@@ -20,6 +20,12 @@ import {
   type CreatureCompileResult,
 } from "../creature/runner.js";
 import {
+  checkCreature,
+  creatureCheckError,
+  CreatureCheckInputSchema,
+  CreatureCheckOutputSchema,
+} from "../creature/check.js";
+import {
   probeChromium,
   probePythonSilhouettes,
   previewCreature,
@@ -460,7 +466,9 @@ async function status(): Promise<CreatureStatusOutput> {
       creature_preview: compileRunner
         ? { available: true }
         : unavailable("Launch the asset MCP from a project root containing .threenative to enable project-local previews."),
-      creature_check: unavailable("Creature inspection is not available until a later asset-MCP increment."),
+      creature_check: compileRunner
+        ? { available: true }
+        : unavailable("Launch the asset MCP from a project root containing .threenative to enable project-local inspection."),
     },
     tooling: {
       compiler: compileRunner
@@ -478,6 +486,9 @@ async function status(): Promise<CreatureStatusOutput> {
       compileRunner
         ? "Use creature_preview with mode 'silhouettes' or 'hero'; missing optional render dependencies return an actionable failure and do not approve the image."
         : "Preview and inspection remain unavailable until a project-local compiler is active.",
+      compileRunner
+        ? "Use creature_check in structural mode for actual GLB measurements, or claims mode with a nonempty LOW, MID or HIGH claims file; visualReview remains notReviewed."
+        : "Claims and structural inspection remain unavailable until a project-local compiler is active.",
     ],
   });
 }
@@ -552,6 +563,23 @@ export function registerCreatureCompileTool(
     },
     createCreaturePreviewHandler(runner),
   );
+  server.registerTool(
+    "creature_check",
+    {
+      title: "Inspect and measure a creature",
+      description:
+        "Inspect actual GLB mesh, rig, materials and animation bindings, or run validated claims through the fixed anyCreature judge; visual review remains independent.",
+      inputSchema: CreatureCheckInputSchema,
+      outputSchema: CreatureCheckOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    createCreatureCheckHandler(runner),
+  );
 }
 
 export function createCreatureCompileHandler(runner: CreatureRunner) {
@@ -624,11 +652,39 @@ export function createCreaturePreviewHandler(runner: CreatureRunner) {
   };
 }
 
+export function createCreatureCheckHandler(runner: CreatureRunner) {
+  return async (
+    rawInput: z.input<typeof CreatureCheckInputSchema>,
+    context: ServerContext,
+  ) => {
+    try {
+      const input = CreatureCheckInputSchema.parse(rawInput);
+      const output = await checkCreature(runner, input, context.mcpReq.signal);
+      const validated = CreatureCheckOutputSchema.parse(output);
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(validated) }],
+        structuredContent: validated,
+      };
+    } catch (error) {
+      const output = CreatureCheckOutputSchema.parse(creatureCheckError(error));
+      return {
+        isError: true as const,
+        content: [{ type: "text" as const, text: JSON.stringify(output) }],
+        structuredContent: output,
+      };
+    }
+  };
+}
+
 async function guide(section: GuideSection): Promise<CreatureGuideOutput> {
   const archive = await payload();
+  const sourceGuide = archive.guides[section];
+  const adaptedGuide = section === "overview"
+    ? `${sourceGuide}\n\n## ThreeNative MCP inspection\n\nAfter creature_compile, call creature_check with mode "structural" to inspect actual mesh, rig, material and clip measurements. Use mode "claims" with a nonempty claims file and stage "LOW", "MID" or "HIGH" to run measurable claims. The result reports visualReview: "notReviewed"; an independent visual review is still required.`
+    : sourceGuide;
   return CreatureGuideOutputSchema.parse({
     section,
-    guide: archive.guides[section],
+    guide: adaptedGuide,
     ...metadata(),
   });
 }

@@ -634,7 +634,68 @@ describe("built stdio package", () => {
 
       expect(names).toContain("creature_compile");
       expect(names).toContain("creature_preview");
+      expect(names).toContain("creature_check");
       await stopServer(child);
+    },
+    30_000,
+  );
+
+  it(
+    "should expose the check schema and adapted guide from an active creature project",
+    async () => {
+      const projectRoot = await mkdtemp(
+        join(tmpdir(), "threenative-asset-mcp-check-schema-"),
+      );
+      temporaryDirectories.push(projectRoot);
+      await mkdir(join(projectRoot, ".threenative"), { recursive: true });
+      const { child } = await startInitializedServer({ cwd: projectRoot });
+
+      try {
+        const listed = jsonResponse(child, 3);
+        send(child, {
+          jsonrpc: "2.0",
+          id: 3,
+          method: "tools/list",
+          params: {},
+        });
+        const tools = (
+          (await listed).result as {
+            tools?: Array<{
+              name: string;
+              inputSchema?: Record<string, unknown>;
+              outputSchema?: Record<string, unknown>;
+            }>;
+          }
+        ).tools ?? [];
+        const check = tools.find((tool) => tool.name === "creature_check");
+        expect(check).toBeDefined();
+        expect(check?.inputSchema).toEqual(
+          expect.objectContaining({
+            properties: expect.objectContaining({
+              glbPath: expect.any(Object),
+              mode: expect.any(Object),
+              claimsPath: expect.any(Object),
+              stage: expect.any(Object),
+            }),
+          }),
+        );
+        expect(check?.outputSchema).toEqual(expect.any(Object));
+
+        const guide = await callTool(child, 4, "creature_guide", {
+          section: "overview",
+        });
+        expect(guide).toMatchObject({
+          result: {
+            structuredContent: {
+              guide: expect.stringMatching(
+                /creature_check[\s\S]*structural[\s\S]*claims[\s\S]*notReviewed/u,
+              ),
+            },
+          },
+        });
+      } finally {
+        await stopServer(child);
+      }
     },
     30_000,
   );
