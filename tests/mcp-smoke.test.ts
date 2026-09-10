@@ -1,5 +1,9 @@
-import { readFileSync } from "node:fs";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import {
+  execFileSync,
+  spawn,
+  type ChildProcessWithoutNullStreams,
+} from "node:child_process";
 import { once } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -86,15 +90,36 @@ function send(
 async function startInitializedServer(): Promise<{
   child: ChildProcessWithoutNullStreams;
   stdout: string[];
+}>;
+async function startInitializedServer(options: {
+  readonly command?: string;
+  readonly cwd?: string;
+  readonly environment?: NodeJS.ProcessEnv;
+}): Promise<{
+  child: ChildProcessWithoutNullStreams;
+  stdout: string[];
+}>;
+async function startInitializedServer({
+  command = resolve("dist/index.js"),
+  cwd = resolve("."),
+  environment,
+}: {
+  readonly command?: string;
+  readonly cwd?: string;
+  readonly environment?: NodeJS.ProcessEnv;
+} = {}): Promise<{
+  child: ChildProcessWithoutNullStreams;
+  stdout: string[];
 }> {
   const profileDir = await mkdtemp(
     join(tmpdir(), "threenative-asset-mcp-smoke-"),
   );
   temporaryDirectories.push(profileDir);
-  const child = spawn(process.execPath, [resolve("dist/index.js")], {
-    cwd: resolve("."),
+  const child = spawn(process.execPath, [command], {
+    cwd,
     env: {
       ...process.env,
+      ...environment,
       FAB_BROWSER_PROFILE_DIR: profileDir,
       FAB_LOG_LEVEL: "debug",
     },
@@ -145,6 +170,71 @@ async function stopServer(
     ),
   ]);
   children.delete(child);
+}
+
+async function callTool(
+  child: ChildProcessWithoutNullStreams,
+  id: number,
+  name: string,
+  arguments_: Record<string, unknown> = {},
+): Promise<Record<string, unknown>> {
+  const response = jsonResponse(child, id);
+  send(child, {
+    jsonrpc: "2.0",
+    id,
+    method: "tools/call",
+    params: { name, arguments: arguments_ },
+  });
+  return response;
+}
+
+function npm(args: readonly string[], cwd: string): string {
+  const npmCli = process.env.npm_execpath;
+  if (!npmCli) throw new Error("npm_execpath is required for packed-package tests");
+  return execFileSync(process.execPath, [npmCli, ...args], {
+    cwd,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+}
+
+async function installPackedPackage(): Promise<{
+  readonly command: string;
+  readonly cwd: string;
+}> {
+  const packageDirectory = await mkdtemp(
+    join(tmpdir(), "threenative-asset-mcp-packed-"),
+  );
+  temporaryDirectories.push(packageDirectory);
+  const packed = JSON.parse(
+    npm(
+      ["pack", "--json", "--pack-destination", packageDirectory],
+      resolve("."),
+    ),
+  ) as Array<{ filename: string }>;
+  const tarball = join(packageDirectory, packed[0]?.filename ?? "");
+  if (!existsSync(tarball)) throw new Error("npm pack did not create a tarball");
+
+  const consumerDirectory = join(packageDirectory, "consumer");
+  npm(
+    [
+      "install",
+      "--ignore-scripts",
+      "--no-package-lock",
+      "--prefix",
+      consumerDirectory,
+      tarball,
+    ],
+    resolve("."),
+  );
+  const command = join(
+    consumerDirectory,
+    "node_modules",
+    ".bin",
+    "threenative-asset-mcp",
+  );
+  if (!existsSync(command)) throw new Error("installed package did not expose its bin");
+  return { command, cwd: consumerDirectory };
 }
 
 describe("Phase 5 reliability", () => {
@@ -253,6 +343,8 @@ describe("built stdio package", () => {
         (tool) => tool.name,
       ),
     ).toEqual([
+      "creature_status",
+      "creature_guide",
       "fab_search_assets",
       "fab_get_asset",
       "fab_list_filters",
@@ -314,5 +406,93 @@ describe("built stdio package", () => {
 
     expect(Date.now() - startedAt).toBeLessThan(5_000);
     expect(child.exitCode).toBe(0);
+  });
+
+  it("should return pinned creature syntax when the client calls creature_guide", async () => {
+    const { child } = await startInitializedServer();
+
+    const response = await callTool(child, 3, "creature_guide", {
+      section: "syntax",
+    });
+
+    expect(response).toMatchObject({
+      result: {
+        structuredContent: {
+          section: "syntax",
+          guide: expect.stringContaining("Spec JSON — the whole language on one page"),
+          upstream: {
+            version: "1.3.1",
+            commit: "44e1abc2c7fe083f19f989c8437c44a141adc7f3",
+          },
+          integrity: {
+            archiveSha256: "cc25c9a9c170d43741803d5531f853bc89ebfd58a98d9fdda90834c53822084d",
+          },
+        },
+      },
+    });
+
+    await stopServer(child);
+  });
+
+  it("should report unavailable tooling when an optional executable is absent", async () => {
+    const { child } = await startInitializedServer({
+      environment: { PATH: "" },
+    });
+
+    const response = await callTool(child, 3, "creature_status");
+
+    expect(response).toMatchObject({
+      result: {
+        structuredContent: {
+          operations: {
+            creature_status: { available: true },
+            creature_guide: { available: true },
+            creature_compile: { available: false },
+          },
+          tooling: {
+            pythonSilhouettes: {
+              available: false,
+              executable: "python3",
+            },
+          },
+        },
+      },
+    });
+
+    await stopServer(child);
+  });
+
+  it("should serve creature discovery from the installed package bin", async () => {
+    const installed = await installPackedPackage();
+    const { child } = await startInitializedServer({
+      command: installed.command,
+      cwd: installed.cwd,
+    });
+
+    const status = await callTool(child, 3, "creature_status");
+    const guide = await callTool(child, 4, "creature_guide", {
+      section: "syntax",
+    });
+
+    expect(status).toMatchObject({
+      result: {
+        structuredContent: {
+          operations: {
+            creature_status: { available: true },
+            creature_guide: { available: true },
+            creature_compile: { available: false },
+          },
+        },
+      },
+    });
+    expect(guide).toMatchObject({
+      result: {
+        structuredContent: {
+          guide: expect.stringContaining("Spec JSON — the whole language on one page"),
+        },
+      },
+    });
+
+    await stopServer(child);
   });
 });

@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 import { McpServer } from "@modelcontextprotocol/server";
 
 import { AmbientCgClient } from "./ambientcg/client.js";
@@ -142,6 +144,24 @@ import {
   FabListOwnedOutputSchema,
   ImportUnrealOutputSchema,
 } from "./tools/import-unreal.js";
+import {
+  CreatureGuideInputSchema,
+  CreatureGuideOutputSchema,
+  CreatureStatusInputSchema,
+  CreatureStatusOutputSchema,
+  createCreatureGuideHandler,
+  createCreatureStatusHandler,
+} from "./tools/creature.js";
+
+function packageVersion(): string {
+  const manifest = JSON.parse(
+    readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+  ) as { version?: unknown };
+  if (typeof manifest.version !== "string") {
+    throw new Error("package.json must provide a string version.");
+  }
+  return manifest.version;
+}
 
 export interface AssetServerClients {
   fab: FabClient;
@@ -181,8 +201,44 @@ export function createAssetServer(
   } = clients;
   const server = new McpServer({
     name: "threenative-asset-mcp",
-    version: "0.7.0",
+    version: packageVersion(),
   });
+
+  server.registerTool(
+    "creature_status",
+    {
+      title: "Get anyCreature availability",
+      description:
+        "Report the pinned anyCreature payload, currently available operations, and optional local tooling without starting a browser or requesting credentials.",
+      inputSchema: CreatureStatusInputSchema,
+      outputSchema: CreatureStatusOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    createCreatureStatusHandler(),
+  );
+
+  server.registerTool(
+    "creature_guide",
+    {
+      title: "Read pinned anyCreature authoring guidance",
+      description:
+        "Read a bounded syntax or workflow section from the verified anyCreature 1.3.1 payload. This does not run or extract the compiler.",
+      inputSchema: CreatureGuideInputSchema,
+      outputSchema: CreatureGuideOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    createCreatureGuideHandler(),
+  );
 
   server.registerTool(
     "fab_search_assets",
