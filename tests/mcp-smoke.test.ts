@@ -87,6 +87,25 @@ function send(
   child.stdin.write(`${JSON.stringify(message)}\n`);
 }
 
+function requiredSets(schema: unknown): string[][] {
+  const found: string[][] = [];
+  const visit = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+    if (typeof value !== "object" || value === null) return;
+    for (const [key, child] of Object.entries(value)) {
+      if (key === "required" && Array.isArray(child) && child.every((entry) => typeof entry === "string")) {
+        found.push(child as string[]);
+      }
+      visit(child);
+    }
+  };
+  visit(schema);
+  return found;
+}
+
 async function startInitializedServer(): Promise<{
   child: ChildProcessWithoutNullStreams;
   stdout: string[];
@@ -669,17 +688,25 @@ describe("built stdio package", () => {
         ).tools ?? [];
         const check = tools.find((tool) => tool.name === "creature_check");
         expect(check).toBeDefined();
-        expect(check?.inputSchema).toEqual(
-          expect.objectContaining({
-            properties: expect.objectContaining({
-              glbPath: expect.any(Object),
-              mode: expect.any(Object),
-              claimsPath: expect.any(Object),
-              stage: expect.any(Object),
-            }),
-          }),
-        );
+        expect(JSON.stringify(check?.inputSchema)).toContain("claimsPath");
+        expect(JSON.stringify(check?.inputSchema)).toContain("stage");
         expect(check?.outputSchema).toEqual(expect.any(Object));
+        const inputRequired = requiredSets(check?.inputSchema);
+        expect(inputRequired).toEqual(
+          expect.arrayContaining([
+            expect.arrayContaining(["glbPath", "mode"]),
+            expect.arrayContaining(["glbPath", "mode", "claimsPath", "stage"]),
+          ]),
+        );
+        const outputSchemaText = JSON.stringify(check?.outputSchema);
+        expect(outputSchemaText).toContain("claims");
+        expect(outputSchemaText).toContain("observations");
+        expect(outputSchemaText).toContain("metricsPath");
+        expect(requiredSets(check?.outputSchema)).toEqual(
+          expect.arrayContaining([
+            expect.arrayContaining(["mode", "claims", "observations"]),
+          ]),
+        );
 
         const guide = await callTool(child, 4, "creature_guide", {
           section: "overview",
@@ -688,7 +715,7 @@ describe("built stdio package", () => {
           result: {
             structuredContent: {
               guide: expect.stringMatching(
-                /creature_check[\s\S]*structural[\s\S]*claims[\s\S]*notReviewed/u,
+                /creature_check[\s\S]*glbPath[\s\S]*claimsPath[\s\S]*stage[\s\S]*part_exists[\s\S]*tri_budget[\s\S]*metricsPath[\s\S]*notReviewed/u,
               ),
             },
           },

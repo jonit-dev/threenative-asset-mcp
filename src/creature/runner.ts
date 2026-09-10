@@ -522,7 +522,12 @@ async function createJudgeHarness(payloadRoot: string): Promise<{
   };
 }
 
-function parseGlb(bytes: Buffer): GlbIdentity {
+interface ParseGlbOptions {
+  readonly requireMaterials?: boolean;
+}
+
+function parseGlb(bytes: Buffer, options: ParseGlbOptions = {}): GlbIdentity {
+  const requireMaterials = options.requireMaterials ?? true;
   if (bytes.length < 28 || bytes.subarray(0, 4).toString("ascii") !== "glTF") {
     throw new CreatureOperationError("OUTPUT_INVALID", "The compiler output is not a GLB container.");
   }
@@ -565,6 +570,45 @@ function parseGlb(bytes: Buffer): GlbIdentity {
   if (!Array.isArray(meshes) || meshes.length !== 1 || !Array.isArray(skins) || skins.length !== 1 || !Array.isArray(nodes) || !Array.isArray(accessors) || !Array.isArray(bufferViews)) {
     throw new CreatureOperationError("OUTPUT_INVALID", "The GLB must contain one mesh, one skin, and a node table.");
   }
+  const indexIn = (value: unknown, length: number, label: string): number => {
+    if (!Number.isInteger(value) || (value as number) < 0 || (value as number) >= length) {
+      throw new CreatureOperationError("OUTPUT_INVALID", `GLB ${label} references an invalid index.`);
+    }
+    return value as number;
+  };
+  for (const [index, node] of nodes.entries()) {
+    if (!isRecord(node)) throw new CreatureOperationError("OUTPUT_INVALID", `GLB node ${index} is invalid.`);
+    if (node.children !== undefined) {
+      if (!Array.isArray(node.children)) throw new CreatureOperationError("OUTPUT_INVALID", `GLB node ${index} has invalid children.`);
+      for (const child of node.children) indexIn(child, nodes.length, `node ${index} child`);
+    }
+    if (node.mesh !== undefined) indexIn(node.mesh, meshes.length, `node ${index} mesh`);
+    if (node.skin !== undefined) indexIn(node.skin, skins.length, `node ${index} skin`);
+  }
+  const scenes = document.scenes;
+  if (!Array.isArray(scenes) || !scenes.length) {
+    throw new CreatureOperationError("OUTPUT_INVALID", "The GLB has no scene table for the loaded creature.");
+  }
+  const sceneRoots = scenes.map((scene, index) => {
+    if (!isRecord(scene) || !Array.isArray(scene.nodes)) {
+      throw new CreatureOperationError("OUTPUT_INVALID", `GLB scene ${index} has invalid root nodes.`);
+    }
+    return scene.nodes.map((node) => indexIn(node, nodes.length, `scene ${index} root`));
+  });
+  const activeSceneIndex = document.scene === undefined ? 0 : indexIn(document.scene, scenes.length, "default scene");
+  const reachableNodes = new Set<number>();
+  const visitingNodes = new Set<number>();
+  const visit = (nodeIndex: number): void => {
+    if (visitingNodes.has(nodeIndex)) throw new CreatureOperationError("OUTPUT_INVALID", "The GLB scene graph contains a cycle.");
+    if (reachableNodes.has(nodeIndex)) return;
+    const node = nodes[nodeIndex];
+    if (!isRecord(node)) throw new CreatureOperationError("OUTPUT_INVALID", `GLB node ${nodeIndex} is invalid.`);
+    visitingNodes.add(nodeIndex);
+    reachableNodes.add(nodeIndex);
+    for (const child of (node.children as number[] | undefined) ?? []) visit(child);
+    visitingNodes.delete(nodeIndex);
+  };
+  for (const root of sceneRoots[activeSceneIndex] ?? []) visit(root);
   if ((Array.isArray(document.images) && document.images.length > 0) || (Array.isArray(document.textures) && document.textures.length > 0) || document.extensionsRequired !== undefined) {
     throw new CreatureOperationError("OUTPUT_INVALID", "The GLB contains externalizable media or required extensions outside the creature output contract.");
   }
@@ -634,14 +678,39 @@ function parseGlb(bytes: Buffer): GlbIdentity {
       accessor,
       count: count as number,
       elementBytes,
+      components,
+      bytesPerComponent,
       stride: stride as number,
       absoluteOffset: (view.byteOffset as number | undefined ?? 0) + (accessorOffset as number),
     };
   };
+  const readComponent = (
+    layout: ReturnType<typeof accessorLayout>,
+    element: number,
+    component: number,
+  ): number => {
+    const valueOffset = layout.absoluteOffset + element * layout.stride + component * layout.bytesPerComponent;
+    switch (layout.accessor.componentType) {
+      case 5120: return binary.readInt8(valueOffset);
+      case 5121: return binary.readUInt8(valueOffset);
+      case 5122: return binary.readInt16LE(valueOffset);
+      case 5123: return binary.readUInt16LE(valueOffset);
+      case 5125: return binary.readUInt32LE(valueOffset);
+      case 5126: return binary.readFloatLE(valueOffset);
+      default: throw new CreatureOperationError("OUTPUT_INVALID", "A GLB accessor uses an unsupported component type.");
+    }
+  };
   for (let index = 0; index < accessors.length; index += 1) accessorLayout(index);
   const skin = skins[0];
-  if (!isRecord(skin) || !Array.isArray(skin.joints) || !skin.joints.length || skin.joints.some((joint) => !Number.isInteger(joint) || joint < 0 || joint >= nodes.length)) {
+  if (!isRecord(skin) || !Array.isArray(skin.joints) || !skin.joints.length || skin.joints.some((joint) => !Number.isInteger(joint) || joint < 0 || joint >= nodes.length) || new Set(skin.joints).size !== skin.joints.length) {
     throw new CreatureOperationError("OUTPUT_INVALID", "The GLB skin has invalid joint bindings.");
+  }
+  if (skin.skeleton !== undefined) {
+    const skeleton = indexIn(skin.skeleton, nodes.length, "skin skeleton");
+    if (!reachableNodes.has(skeleton)) throw new CreatureOperationError("OUTPUT_INVALID", "The GLB skin skeleton is not reachable from the loaded scene.");
+  }
+  if ((skin.joints as number[]).some((joint) => !reachableNodes.has(joint))) {
+    throw new CreatureOperationError("OUTPUT_INVALID", "The GLB skin references a joint that is not reachable from the loaded scene.");
   }
   const mesh = meshes[0];
   if (!isRecord(mesh) || !Array.isArray(mesh.primitives) || !mesh.primitives.length) {
@@ -660,10 +729,13 @@ function parseGlb(bytes: Buffer): GlbIdentity {
     const jointsIndex = primitive.attributes.JOINTS_0;
     const weightsIndex = primitive.attributes.WEIGHTS_0;
     const indicesIndex = primitive.indices;
-    if (!Number.isInteger(primitive.material) || (primitive.material as number) < 0) {
+    if (primitive.material !== undefined && (!Number.isInteger(primitive.material) || (primitive.material as number) < 0)) {
       throw new CreatureOperationError("OUTPUT_INVALID", "A GLB creature primitive is missing its material binding.");
     }
-    primitiveMaterialIndices.push(primitive.material as number);
+    if (primitive.material === undefined && requireMaterials) {
+      throw new CreatureOperationError("OUTPUT_INVALID", "A GLB creature primitive is missing its material binding.");
+    }
+    if (Number.isInteger(primitive.material)) primitiveMaterialIndices.push(primitive.material as number);
     if (![positionIndex, jointsIndex, weightsIndex, indicesIndex].every((index) => Number.isInteger(index) && (index as number) >= 0 && (index as number) < accessors.length)) {
       throw new CreatureOperationError("OUTPUT_INVALID", "A GLB creature primitive is missing bounded position, index, joint, or weight accessors.");
     }
@@ -685,6 +757,28 @@ function parseGlb(bytes: Buffer): GlbIdentity {
       jointsLayout.count !== positionLayout.count || weightsLayout.count !== positionLayout.count
     ) {
       throw new CreatureOperationError("OUTPUT_INVALID", "A GLB creature primitive has incompatible geometry or skin accessor types.");
+    }
+    let hasPositiveWeight = false;
+    for (let vertex = 0; vertex < positionLayout.count; vertex += 1) {
+      let weightSum = 0;
+      for (let component = 0; component < 4; component += 1) {
+        const joint = readComponent(jointsLayout, vertex, component);
+        const weight = readComponent(weightsLayout, vertex, component);
+        if (!Number.isInteger(joint) || joint < 0 || joint >= skin.joints.length) {
+          throw new CreatureOperationError("OUTPUT_INVALID", "A GLB vertex references a joint outside its skin table.");
+        }
+        if (!Number.isFinite(weight) || weight < 0) {
+          throw new CreatureOperationError("OUTPUT_INVALID", "A GLB vertex has a non-finite or negative skin weight.");
+        }
+        weightSum += weight;
+        if (weight > 0) hasPositiveWeight = true;
+      }
+      if (!(weightSum > 0) || !Number.isFinite(weightSum)) {
+        throw new CreatureOperationError("OUTPUT_INVALID", "A GLB vertex has no positive skin weight.");
+      }
+    }
+    if (!hasPositiveWeight) {
+      throw new CreatureOperationError("OUTPUT_INVALID", "The GLB creature has no positive skin weights.");
     }
     for (let index = 0; index < indicesLayout.count; index += 1) {
       const valueOffset = indicesLayout.absoluteOffset + index * indicesLayout.stride;
@@ -760,10 +854,10 @@ function parseGlb(bytes: Buffer): GlbIdentity {
     return { name: animation.name, channels: animation.channels.length, tracks };
   });
   const materialValues = document.materials;
-  if (!Array.isArray(materialValues) || !materialValues.length) {
+  if (requireMaterials && (!Array.isArray(materialValues) || !materialValues.length)) {
     throw new CreatureOperationError("OUTPUT_INVALID", "The GLB creature has no material table.");
   }
-  const materials = materialValues.map((material, index) => {
+  const materials = (Array.isArray(materialValues) ? materialValues : []).map((material, index) => {
     if (!isRecord(material)) throw new CreatureOperationError("OUTPUT_INVALID", `GLB material ${index} is invalid.`);
     const pbr = isRecord(material.pbrMetallicRoughness) ? material.pbrMetallicRoughness : undefined;
     const baseColor = pbr?.baseColorFactor;
@@ -793,6 +887,12 @@ function parseGlb(bytes: Buffer): GlbIdentity {
     faces,
     materials: meshMaterials,
   }];
+  const skinnedMeshes = [...reachableNodes].reduce((count, nodeIndex) => {
+    const node = nodes[nodeIndex];
+    if (!isRecord(node) || node.mesh === undefined || node.skin === undefined) return count;
+    const loadedMesh = meshes[node.mesh as number];
+    return count + (isRecord(loadedMesh) && Array.isArray(loadedMesh.primitives) ? loadedMesh.primitives.length : 0);
+  }, 0);
   return {
     clips: clipDetails.map((clip) => clip.name),
     clipDetails,
@@ -806,7 +906,7 @@ function parseGlb(bytes: Buffer): GlbIdentity {
     },
     materials,
     meshes: meshDetails,
-    skinnedMeshes: nodes.filter((node) => isRecord(node) && Number.isInteger(node.mesh) && Number.isInteger(node.skin)).length,
+    skinnedMeshes,
     document,
   };
 }
@@ -1317,7 +1417,7 @@ export class CreatureRunner {
         });
       }
       const glbBytes = await readFile(stagedOutput);
-      const identity = parseGlb(glbBytes);
+      const identity = parseGlb(glbBytes, { requireMaterials: false });
       // Upstream's `faces` summary counts authored polygons, while the GLB stores
       // triangulated indices. The receipt therefore records the parsed GLB count.
       if (

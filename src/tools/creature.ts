@@ -22,6 +22,7 @@ import {
 import {
   checkCreature,
   creatureCheckError,
+  creatureCheckGuide,
   CreatureCheckInputSchema,
   CreatureCheckOutputSchema,
 } from "../creature/check.js";
@@ -680,7 +681,7 @@ async function guide(section: GuideSection): Promise<CreatureGuideOutput> {
   const archive = await payload();
   const sourceGuide = archive.guides[section];
   const adaptedGuide = section === "overview"
-    ? `${sourceGuide}\n\n## ThreeNative MCP inspection\n\nAfter creature_compile, call creature_check with mode "structural" to inspect actual mesh, rig, material and clip measurements. Use mode "claims" with a nonempty claims file and stage "LOW", "MID" or "HIGH" to run measurable claims. The result reports visualReview: "notReviewed"; an independent visual review is still required.`
+    ? `${sourceGuide}\n\n${creatureCheckGuide()}`
     : sourceGuide;
   return CreatureGuideOutputSchema.parse({
     section,

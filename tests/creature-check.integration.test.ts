@@ -8,7 +8,14 @@ import { join, resolve } from "node:path";
 import { LATEST_PROTOCOL_VERSION } from "@modelcontextprotocol/server";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { validateClaimsMetrics } from "../src/creature/check.js";
+import {
+  checkCreature,
+  validateClaimsMetrics,
+} from "../src/creature/check.js";
+import type {
+  CreatureGlbInspection,
+  CreatureRunner,
+} from "../src/creature/runner.js";
 
 const WYVERN_SPEC = {
   name: "task4_wyvern",
@@ -276,6 +283,80 @@ async function stripAttack(source: string, destination: string): Promise<void> {
   await writeFile(destination, packGlb(document, binary));
 }
 
+async function stripSkinIndex(source: string, destination: string): Promise<void> {
+  const { document, binary } = parseGlb(await readFile(source));
+  const nodes = document.nodes as Array<Record<string, unknown>>;
+  const meshNode = nodes.find((node) => node.mesh === 0 && node.skin === 0);
+  if (!meshNode) throw new Error("The compiled wyvern has no bound mesh node to tamper.");
+  meshNode.skin = 99;
+  await writeFile(destination, packGlb(document, binary));
+}
+
+function malformedMetricsRunner(
+  root: string,
+  glbPath: string,
+  claimsPath: string,
+  metricsPath: string,
+): CreatureRunner {
+  const inspection: CreatureGlbInspection = {
+    glbPath: "model.glb",
+    glbSha256: sha256(Buffer.from("fixture-glb")),
+    bytes: 11,
+    clips: [],
+    clipDetails: [],
+    joints: 1,
+    vertices: 1,
+    faces: 1,
+    bounds: { width: 1, height: 1, length: 1 },
+    materials: [{ name: "body", authoredName: true }],
+    meshes: [{ name: "body", primitives: 1, vertices: 1, faces: 1, materials: ["body"] }],
+    skinnedMeshes: 1,
+    sourceSpec: null,
+    structuralErrors: [],
+  };
+  return {
+    limits: {
+      specBytes: 256 * 1_024,
+      glbBytes: 32 * 1_024 * 1_024,
+      diagnosticsBytes: 1 * 1_024 * 1_024,
+      compileTimeoutMs: 60_000,
+      maxActiveHeavyOperations: 1,
+    },
+    inspectCreature: async () => inspection,
+    collectCompileEvidence: async () => ({ advisories: [] }),
+    resolveProjectFile: async (_path: string, label: string) => ({
+      root,
+      absolute: label === "claimsPath" ? claimsPath : glbPath,
+      relative: label === "claimsPath" ? "claims.json" : "model.glb",
+    }),
+    createCheckDirectory: async () => ({
+      root,
+      directory: root,
+      relative: ".threenative/creatures/checks/check-test",
+    }),
+    withHeavyOperation: async <T>(
+      _timeoutMs: number,
+      _timeoutMessage: string,
+      _callerSignal: AbortSignal | undefined,
+      operation: (signal: AbortSignal) => Promise<T>,
+    ) => operation(new AbortController().signal),
+    runClaimsJudge: async () => {
+      const prefix = Buffer.from('{"name":"');
+      const invalidUtf8 = Buffer.from([0xc3]);
+      const suffix = Buffer.from('","stats":{"triangles":1,"skinnedMeshes":1,"animations":["idle"]},"names":["body"],"parts":{},"lum":{"side":1},"hi_sat_share":{"tq":0.1},"whole":{"size":[1,1,1]}}');
+      await writeFile(metricsPath, Buffer.concat([prefix, invalidUtf8, suffix]), { flag: "wx", mode: 0o600 });
+      return {
+        exitCode: 0,
+        signalCode: null,
+        stdout: "",
+        stderr: "",
+        metricsPath,
+        overflow: false,
+      };
+    },
+  } as unknown as CreatureRunner;
+}
+
 function sha256(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
@@ -341,6 +422,54 @@ describe("creature_check installed MCP", () => {
     }
   }, 120_000);
 
+  it("should preserve original claim indices when an earlier stage is excluded", async () => {
+    const root = await createProject();
+    const child = await startServer(root);
+    try {
+      const compiled = await compileWyvern(child);
+      await writeFile(
+        join(root, ".threenative", "creatures", "indexed-claims.json"),
+        `${JSON.stringify({ claims: [
+          { type: "tri_budget", min: 1, max: 999999, stage: "LOW" },
+          { type: "part_exists", part: "missing_part", stage: "HIGH", enforce: "advise" },
+        ] }, null, 2)}\n`,
+      );
+      const response = await callTool(child, 3, "creature_check", {
+        glbPath: compiled.outputPath,
+        mode: "claims",
+        claimsPath: ".threenative/creatures/indexed-claims.json",
+        stage: "HIGH",
+      });
+      const output = structured(response);
+      expect(resultOf(response).isError).not.toBe(true);
+      expect(output).toMatchObject({ passed: true, claims: [{ index: 1, status: "advisory", enforce: "advise" }] });
+      expect(output.observations).toEqual(expect.arrayContaining([expect.objectContaining({ index: 1, metric: "names" })]));
+    } finally {
+      await stopServer(child);
+    }
+  }, 120_000);
+
+  it("should reject a bound mesh with an invalid skin index", async () => {
+    const root = await createProject();
+    const child = await startServer(root);
+    try {
+      const compiled = await compileWyvern(child);
+      const invalidPath = join(root, "assets", "creatures", "wyvern-invalid-skin.glb");
+      await mkdir(join(root, "assets", "creatures"), { recursive: true });
+      await stripSkinIndex(join(root, compiled.outputPath as string), invalidPath);
+      await writeFile(join(root, ".threenative", "creatures", "high-claims.json"), `${JSON.stringify({ claims: [{ type: "rig_skinned", stage: "HIGH" }] })}\n`);
+      const response = await callTool(child, 3, "creature_check", {
+        glbPath: "assets/creatures/wyvern-invalid-skin.glb",
+        mode: "claims",
+        claimsPath: ".threenative/creatures/high-claims.json",
+        stage: "HIGH",
+      });
+      expect(resultOf(response)).toMatchObject({ isError: true, structuredContent: { operation: "creature_check", code: "OUTPUT_INVALID" } });
+    } finally {
+      await stopServer(child);
+    }
+  }, 120_000);
+
   it("should reject claims when a type is unknown or the selected stage is empty", async () => {
     const root = await createProject();
     const child = await startServer(root);
@@ -380,4 +509,19 @@ describe("creature_check installed MCP", () => {
       await stopServer(child);
     }
   }, 120_000);
+
+  it("should reject metrics containing invalid UTF-8", async () => {
+    const root = await mkdtemp(join(tmpdir(), "creature-check-metrics-"));
+    temporaryDirectories.push(root);
+    const glbPath = join(root, "model.glb");
+    const claimsPath = join(root, "claims.json");
+    const metricsPath = join(root, "metrics.json");
+    await writeFile(glbPath, "fixture-glb");
+    await writeFile(claimsPath, `${JSON.stringify({ claims: [{ type: "tri_budget", min: 0, max: 2 }] })}\n`);
+    const runner = malformedMetricsRunner(root, glbPath, claimsPath, metricsPath);
+    await expect(checkCreature(runner, { glbPath: "model.glb", mode: "claims", claimsPath: "claims.json", stage: "LOW" })).rejects.toMatchObject({
+      code: "OUTPUT_INVALID",
+      message: expect.stringContaining("malformed JSON"),
+    });
+  });
 });

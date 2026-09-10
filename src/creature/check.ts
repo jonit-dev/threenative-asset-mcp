@@ -40,28 +40,33 @@ type ValidatedClaim = RawClaim & {
   readonly stage?: CreatureCheckStage;
   readonly enforce: ClaimEnforcement;
 };
+type IndexedClaim = {
+  readonly index: number;
+  readonly claim: ValidatedClaim;
+};
 type ClaimsDocument = { readonly name?: string; readonly claims: readonly ValidatedClaim[] };
 type MetricsDocument = Record<string, unknown>;
 
-export const CreatureCheckInputSchema = z
+const CreatureCheckStructuralInputSchema = z
   .object({
     glbPath: z.string().trim().min(1).max(1_000),
-    mode: z.enum(["structural", "claims"]),
-    claimsPath: z.string().trim().min(1).max(1_000).optional(),
-    stage: z.enum(CLAIM_STAGES).optional(),
+    mode: z.literal("structural"),
   })
-  .strict()
-  .superRefine((value, context) => {
-    if (value.mode === "claims" && value.claimsPath === undefined) {
-      context.addIssue({ code: "custom", path: ["claimsPath"], message: "claimsPath is required in claims mode." });
-    }
-    if (value.mode === "claims" && value.stage === undefined) {
-      context.addIssue({ code: "custom", path: ["stage"], message: "stage is required in claims mode." });
-    }
-    if (value.mode === "structural" && (value.claimsPath !== undefined || value.stage !== undefined)) {
-      context.addIssue({ code: "custom", path: ["mode"], message: "claimsPath and stage are only valid in claims mode." });
-    }
-  });
+  .strict();
+
+const CreatureCheckClaimsInputSchema = z
+  .object({
+    glbPath: z.string().trim().min(1).max(1_000),
+    mode: z.literal("claims"),
+    claimsPath: z.string().trim().min(1).max(1_000),
+    stage: z.enum(CLAIM_STAGES),
+  })
+  .strict();
+
+export const CreatureCheckInputSchema = z.discriminatedUnion("mode", [
+  CreatureCheckStructuralInputSchema,
+  CreatureCheckClaimsInputSchema,
+]);
 
 const BoundsSchema = z.object({
   width: z.number().finite().nonnegative(),
@@ -133,9 +138,8 @@ const ObservationSchema = z.object({
   required: z.literal(true),
 }).strict();
 
-const CreatureCheckSuccessSchema = z.object({
+const CreatureCheckSuccessBaseSchema = z.object({
   operation: z.literal("creature_check"),
-  mode: z.enum(["structural", "claims"]),
   passed: z.boolean(),
   glbPath: z.string().min(1),
   glbSha256: z.string().regex(/^[a-f0-9]{64}$/u),
@@ -144,12 +148,27 @@ const CreatureCheckSuccessSchema = z.object({
   sourceSpecReason: z.string().max(1_000).optional(),
   structuralErrors: z.array(z.string()),
   upstream: UpstreamSchema,
-  claims: z.array(ClaimResultSchema).optional(),
-  observations: z.array(ObservationSchema).optional(),
-  metricsPath: z.string().min(1).optional(),
   receiptPath: z.string().min(1).optional(),
   visualReview: z.literal("notReviewed"),
 }).strict();
+
+const CreatureCheckStructuralSuccessSchema = CreatureCheckSuccessBaseSchema
+  .extend({ mode: z.literal("structural") })
+  .strict();
+
+const CreatureCheckClaimsSuccessSchema = CreatureCheckSuccessBaseSchema
+  .extend({
+    mode: z.literal("claims"),
+    claims: z.array(ClaimResultSchema),
+    observations: z.array(ObservationSchema),
+    metricsPath: z.string().min(1).optional(),
+  })
+  .strict();
+
+const CreatureCheckSuccessSchema = z.discriminatedUnion("mode", [
+  CreatureCheckStructuralSuccessSchema,
+  CreatureCheckClaimsSuccessSchema,
+]);
 
 const CreatureCheckFailureSchema = z.object({
   operation: z.literal("creature_check"),
@@ -228,6 +247,44 @@ const TYPE_FIELDS: Readonly<Record<ClaimType, readonly string[]>> = {
   focal_contrast: ["a", "b", "view", "min_ratio"],
   saturation_area: ["view", "min", "max"],
 };
+
+const CLAIM_GUIDANCE: Readonly<Record<ClaimType, string>> = {
+  part_exists: "part",
+  part_visible: "part, min_share; view optional",
+  part_signature: "part, min_share, or_min_span; view optional",
+  style_dark: "max_median_lum; view optional",
+  style_light: "min_median_lum; view optional",
+  rig_skinned: "no type-specific fields",
+  anim_named: "names",
+  tri_budget: "min, max",
+  share_hierarchy: "primary, secondary, tertiary; view and tolerance optional",
+  focal_contrast: "a, b; view and min_ratio optional",
+  saturation_area: "view, min and max optional",
+};
+
+export function creatureCheckGuide(): string {
+  const claims = CLAIM_TYPES
+    .map((type) => `- ${type}: ${CLAIM_GUIDANCE[type]}. Common optional fields: stage, enforce (block|advise), when (allocate|verify), label.`)
+    .join("\n");
+  return [
+    "## ThreeNative MCP creature_check",
+    "",
+    "Call creature_check after creature_compile. All paths are project-relative and all wrapper fields are strict.",
+    "",
+    "Input:",
+    "- structural: {\"glbPath\":\"assets/creatures/wyvern.glb\",\"mode\":\"structural\"}",
+    "- claims: {\"glbPath\":\"assets/creatures/wyvern.glb\",\"mode\":\"claims\",\"claimsPath\":\".threenative/creatures/wyvern-claims.json\",\"stage\":\"LOW\"}",
+    "- claimsPath and stage are required only for claims mode; stage is exactly LOW, MID or HIGH.",
+    "",
+    "A claims file is {\"name\":\"optional name\",\"claims\":[...]} with a nonempty claims array. Required fields by claim type:",
+    claims,
+    "part_visible and part_signature view values are front, side, tq, reartq or top; min_share and saturation bounds are 0..1; luminance is 0..255; tri_budget values are ordered nonnegative integers.",
+    "",
+    "Output always includes operation, mode, passed, glbPath, glbSha256, measurements (bytes, vertices, faces, joints, bounds, materials, meshes, rig, clips and clipDetails), sourceSpec, structuralErrors, upstream and visualReview: \"notReviewed\".",
+    "Structural output is read-only and has no claims artifacts. Claims output also has claims and observations; a measured run writes metricsPath and receiptPath under .threenative/creatures/checks/.",
+    "HIGH additionally requires a reachable positively weighted skin and actual nonempty idle, move and attack tracks. A structural pass never approves appearance: visualReview remains notReviewed.",
+  ].join("\n");
+}
 
 function validateClaim(value: unknown, index: number, materials?: ReadonlySet<string>): ValidatedClaim {
   if (!isRecord(value)) throw new CreatureOperationError("INVALID_CLAIMS", "Claim " + index + " must be an object.", { index });
@@ -328,14 +385,16 @@ async function readClaims(runner: CreatureRunner, requestPath: string): Promise<
   return { ...(typeof value.name === "string" ? { name: value.name } : {}), claims };
 }
 
-function selectClaims(claims: readonly ValidatedClaim[], stage: CreatureCheckStage): ValidatedClaim[] {
-  const selected = claims.filter((claim) => claim.stage === undefined || claim.stage === stage);
+function selectClaims(claims: readonly ValidatedClaim[], stage: CreatureCheckStage): IndexedClaim[] {
+  const selected = claims.flatMap((claim, index) =>
+    claim.stage === undefined || claim.stage === stage ? [{ index, claim }] : [],
+  );
   if (!selected.length) throw new CreatureOperationError("INVALID_CLAIMS", "No claims apply to stage " + stage + "; the selected claim set must be nonempty.");
   return selected;
 }
 
-function markedClaims(document: ClaimsDocument, selected: readonly ValidatedClaim[]): { document: ClaimsDocument; markers: Map<number, string> } {
-  const selectedIndexes = new Set(selected.map((claim) => document.claims.indexOf(claim)));
+function markedClaims(document: ClaimsDocument, selected: readonly IndexedClaim[]): { document: ClaimsDocument; markers: Map<number, string> } {
+  const selectedIndexes = new Set(selected.map(({ index }) => index));
   const markers = new Map<number, string>();
   const claims = document.claims.map((claim, index) => {
     if (!selectedIndexes.has(index)) return claim;
@@ -389,12 +448,30 @@ function assertMetricsShape(metrics: MetricsDocument): void {
   if (!isRecord(metricAt(metrics, "whole"))) throw new CreatureOperationError("OUTPUT_INVALID", "Claims judge output has an invalid whole observation.", { observation: "whole" });
 }
 
-function claimObservations(metrics: MetricsDocument, claims: readonly ValidatedClaim[]): z.output<typeof ObservationSchema>[] {
+function assertJudgeMatchesInspection(
+  metrics: MetricsDocument,
+  inspection: CreatureGlbInspection,
+): void {
+  const observed = metricNumber(metrics, "stats.skinnedMeshes");
+  if (observed !== inspection.skinnedMeshes) {
+    throw new CreatureOperationError(
+      "OUTPUT_INVALID",
+      "Claims judge skinned mesh count does not match the actual reachable GLB skin bindings.",
+      {
+        observation: "stats.skinnedMeshes",
+        inspected: inspection.skinnedMeshes,
+        judged: observed,
+      },
+    );
+  }
+}
+
+function claimObservations(metrics: MetricsDocument, selected: readonly IndexedClaim[]): z.output<typeof ObservationSchema>[] {
   assertMetricsShape(metrics);
   const observations: z.output<typeof ObservationSchema>[] = [];
   const add = (index: number, metric: string) => observations.push({ index, metric, value: metricNumber(metrics, metric), required: true });
   const addStrings = (index: number, metric: string) => observations.push({ index, metric, value: metricStrings(metrics, metric), required: true });
-  claims.forEach((claim, index) => {
+  selected.forEach(({ index, claim }) => {
     const view = (claim.view as string | undefined) ?? "side";
     switch (claim.type) {
       case "part_exists": addStrings(index, "names"); break;
@@ -423,15 +500,20 @@ function claimObservations(metrics: MetricsDocument, claims: readonly ValidatedC
 
 export function validateClaimsMetrics(metrics: unknown, claims: readonly RawClaim[]): z.output<typeof ObservationSchema>[] {
   if (!isRecord(metrics)) throw new CreatureOperationError("OUTPUT_INVALID", "Claims judge output is not a JSON object.");
-  return claimObservations(metrics, claims.map((claim, index) => validateClaim(claim, index)));
+  return claimObservations(metrics, claims.map((claim, index) => ({ index, claim: validateClaim(claim, index) })));
 }
 
 async function readMetrics(path: string, maxBytes: number): Promise<MetricsDocument> {
   const info = await lstat(path).catch(() => undefined);
   if (!info?.isFile() || info.isSymbolicLink() || info.size <= 0 || info.size > maxBytes) throw new CreatureOperationError("OUTPUT_INVALID", "The claims judge did not produce a safe, bounded metrics artifact.", { metricsPath: path });
+  const bytes = await readFile(path);
+  if (bytes.length !== info.size || bytes.length <= 0 || bytes.length > maxBytes) {
+    throw new CreatureOperationError("OUTPUT_INVALID", "The claims judge metrics artifact changed or exceeded its byte bound after inspection.", { metricsPath: path, maxBytes });
+  }
   let value: unknown;
   try {
-    value = JSON.parse((await readFile(path)).toString("utf8")) as unknown;
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    value = JSON.parse(text) as unknown;
   } catch {
     throw new CreatureOperationError("OUTPUT_INVALID", "The claims judge metrics artifact is malformed JSON.", { metricsPath: path });
   }
@@ -443,9 +525,9 @@ function markerLine(text: string, marker: string): string | undefined {
   return text.split("\n").map((line) => line.trim()).find((line) => line.includes(marker));
 }
 
-function claimResults(claims: readonly ValidatedClaim[], markers: ReadonlyMap<number, string>, judge: CreatureJudgeResult): z.output<typeof ClaimResultSchema>[] {
+function claimResults(selected: readonly IndexedClaim[], markers: ReadonlyMap<number, string>, judge: CreatureJudgeResult): z.output<typeof ClaimResultSchema>[] {
   const text = judge.stdout + "\n" + judge.stderr;
-  return claims.map((claim, index) => {
+  return selected.map(({ index, claim }) => {
     const marker = markers.get(index);
     const message = marker ? markerLine(text, marker) : undefined;
     const failed = message !== undefined;
@@ -549,7 +631,8 @@ export async function checkCreature(
       ...base,
       structuralErrors,
       passed: false,
-      claims: selected.map((claim, index) => ({ index, type: claim.type, ...(claim.stage ? { stage: claim.stage } : {}), enforce: claim.enforce, status: "failed" as const, message: deliveryErrors.join(" ") })),
+      claims: selected.map(({ index, claim }) => ({ index, type: claim.type, ...(claim.stage ? { stage: claim.stage } : {}), enforce: claim.enforce, status: "failed" as const, message: deliveryErrors.join(" ") })),
+      observations: [],
     });
   }
 
@@ -591,6 +674,7 @@ export async function checkCreature(
     });
   }
   const metrics = await readMetrics(judge.metricsPath, runner.limits.diagnosticsBytes);
+  assertJudgeMatchesInspection(metrics, inspection);
   const observations = claimObservations(metrics, selected);
   const results = claimResults(selected, marked.markers, judge);
   if (judge.exitCode === 1 && !results.some((result) => result.status !== "passed")) throw new CreatureOperationError("OUTPUT_INVALID", "The claims judge failed without identifying a validated claim.", { stdout: judge.stdout.slice(-2_000), stderr: judge.stderr.slice(-2_000) });
