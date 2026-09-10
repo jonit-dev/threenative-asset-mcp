@@ -762,8 +762,10 @@ export class CreatureRunner {
     let ownsLock = false;
     let publicationTemporary: string | undefined;
     let previousOutputBackup: string | undefined;
+    let rollbackCapture: string | undefined;
     let receiptTemporary: string | undefined;
     let publicationCommitted = false;
+    const rollback = { state: "none" as "none" | "prepared" | "complete" | "preserved" };
     try {
       const sourceInfo = await stat(specAbsolute);
       if (!sourceInfo.isFile() || sourceInfo.size > this.limits.specBytes) {
@@ -963,6 +965,7 @@ export class CreatureRunner {
           if ((await hashExistingFile(previousOutputBackup, this.limits.glbBytes)) !== initialOutputSha256) {
             throw new CreatureOperationError("OUTPUT_CONFLICT", "The previous creature output changed while its rollback copy was prepared.");
           }
+          rollback.state = "prepared";
         }
         if ((await hashExistingFile(outputAbsolute, this.limits.glbBytes)) !== initialOutputSha256) {
           throw new CreatureOperationError("OUTPUT_CONFLICT", "The output changed during publication; the stale writer was rejected.");
@@ -979,13 +982,119 @@ export class CreatureRunner {
         receiptTemporary = undefined;
       } catch (error) {
         if (publicationCommitted) {
-          if (previousOutputBackup) {
-            await rename(previousOutputBackup, outputAbsolute);
-            previousOutputBackup = undefined;
-          } else {
-            await unlink(outputAbsolute);
+          const priorRecoveryPath = previousOutputBackup ? projectPath(root, previousOutputBackup) : undefined;
+          let observedOutputSha256: string | undefined;
+          try {
+            observedOutputSha256 = await hashExistingFile(outputAbsolute, this.limits.glbBytes);
+          } catch {
+            rollback.state = "preserved";
+            throw new CreatureOperationError(
+              "OUTPUT_CONFLICT",
+              "Receipt finalization failed and output ownership could not be verified; inspect the retained recovery artifact before retrying.",
+              {
+                publishedOutputSha256: outputSha256,
+                observedOutputSha256: null,
+                recoveryPath: priorRecoveryPath ?? projectPath(root, outputAbsolute),
+                rollback: "preserved",
+              },
+            );
           }
-          publicationCommitted = false;
+          if (observedOutputSha256 !== outputSha256) {
+            rollback.state = "preserved";
+            throw new CreatureOperationError(
+              "OUTPUT_CONFLICT",
+              "Receipt finalization failed after another writer replaced the output; the newer output and prior recovery artifact were preserved.",
+              {
+                publishedOutputSha256: outputSha256,
+                observedOutputSha256: observedOutputSha256 ?? null,
+                recoveryPath: priorRecoveryPath ?? projectPath(root, outputAbsolute),
+                rollback: "preserved",
+              },
+            );
+          }
+
+          rollbackCapture = join(dirname(outputAbsolute), `.${basename(outputAbsolute)}.${randomUUID()}.rollback-published`);
+          const rollbackCaptureAbsolute = rollbackCapture;
+          try {
+            await rename(outputAbsolute, rollbackCaptureAbsolute);
+          } catch {
+            rollback.state = "preserved";
+            throw new CreatureOperationError(
+              "OUTPUT_CONFLICT",
+              "Receipt finalization failed and the published output could not be isolated safely; inspect recoveryPath before retrying.",
+              {
+                publishedOutputSha256: outputSha256,
+                observedOutputSha256,
+                recoveryPath: priorRecoveryPath ?? projectPath(root, outputAbsolute),
+                rollback: "preserved",
+              },
+            );
+          }
+
+          const capturedOutputSha256 = await hashExistingFile(rollbackCaptureAbsolute, this.limits.glbBytes).catch(() => undefined);
+          if (capturedOutputSha256 !== outputSha256) {
+            try {
+              await copyFile(rollbackCaptureAbsolute, outputAbsolute, constants.COPYFILE_EXCL);
+              await unlink(rollbackCaptureAbsolute);
+              rollbackCapture = undefined;
+            } catch {
+              // A later writer at outputAbsolute wins. The displaced bytes stay at rollbackCapture.
+            }
+            rollback.state = "preserved";
+            throw new CreatureOperationError(
+              "OUTPUT_CONFLICT",
+              "Receipt finalization failed while another writer replaced the output; no external bytes were overwritten.",
+              {
+                publishedOutputSha256: outputSha256,
+                observedOutputSha256: capturedOutputSha256 ?? null,
+                recoveryPath: priorRecoveryPath ?? projectPath(root, rollbackCapture ?? outputAbsolute),
+                ...(rollbackCapture ? { displacedOutputPath: projectPath(root, rollbackCapture) } : {}),
+                rollback: "preserved",
+              },
+            );
+          }
+
+          if (previousOutputBackup) {
+            try {
+              await copyFile(previousOutputBackup, outputAbsolute, constants.COPYFILE_EXCL);
+              const restoredOutputSha256 = await hashExistingFile(outputAbsolute, this.limits.glbBytes);
+              if (restoredOutputSha256 !== initialOutputSha256) {
+                throw new Error("The restored output changed before verification.");
+              }
+            } catch {
+              rollback.state = "preserved";
+              throw new CreatureOperationError(
+                "OUTPUT_CONFLICT",
+                "Receipt finalization failed and the previous output could not be restored without overwriting another writer; recover it from recoveryPath.",
+                {
+                  publishedOutputSha256: outputSha256,
+                  observedOutputSha256: await hashExistingFile(outputAbsolute, this.limits.glbBytes).catch(() => undefined) ?? null,
+                  recoveryPath: priorRecoveryPath,
+                  publishedRecoveryPath: projectPath(root, rollbackCaptureAbsolute),
+                  rollback: "preserved",
+                },
+              );
+            }
+          }
+          try {
+            await unlink(rollbackCaptureAbsolute);
+            rollbackCapture = undefined;
+          } catch {
+            rollback.state = "preserved";
+            throw new CreatureOperationError(
+              "OUTPUT_CONFLICT",
+              previousOutputBackup
+                ? "Receipt finalization failed after the previous output was restored, but the published output remains at recoveryPath."
+                : "Receipt finalization failed and the newly published output could not be removed; inspect recoveryPath before retrying.",
+              {
+                publishedOutputSha256: outputSha256,
+                observedOutputSha256,
+                recoveryPath: projectPath(root, rollbackCaptureAbsolute),
+                rollback: "preserved",
+              },
+            );
+          }
+          rollback.state = "complete";
         }
         throw error;
       }
@@ -993,6 +1102,7 @@ export class CreatureRunner {
         await unlink(previousOutputBackup).catch(() => undefined);
         previousOutputBackup = undefined;
       }
+      rollback.state = "complete";
       return {
         ...receipt,
         operation: "creature_compile",
@@ -1009,7 +1119,12 @@ export class CreatureRunner {
       if (ownsLock && lockPath) await unlink(lockPath).catch(() => undefined);
       if (stagingDirectory) await rm(stagingDirectory, { recursive: true, force: true }).catch(() => undefined);
       if (publicationTemporary) await unlink(publicationTemporary).catch(() => undefined);
-      if (previousOutputBackup) await unlink(previousOutputBackup).catch(() => undefined);
+      if (previousOutputBackup && rollback.state !== "preserved") {
+        await unlink(previousOutputBackup).catch(() => undefined);
+      }
+      if (rollbackCapture && rollback.state !== "preserved") {
+        await unlink(rollbackCapture).catch(() => undefined);
+      }
       if (receiptTemporary) await unlink(receiptTemporary).catch(() => undefined);
       this.destinationLocks.delete(outputAbsolute);
     }

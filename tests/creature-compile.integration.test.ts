@@ -5,7 +5,14 @@ import {
   type ChildProcessWithoutNullStreams,
 } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  readdirSync,
+  unlinkSync,
+  watch,
+  writeFileSync,
+} from "node:fs";
 import {
   chmod,
   lstat,
@@ -18,7 +25,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { TextReader, Uint8ArrayWriter, ZipWriter } from "@zip.js/zip.js";
@@ -492,6 +499,42 @@ async function createSeedCopyRunner(root: string, seedPath: string): Promise<Cre
   `);
 }
 
+function sabotageReceiptAfterPublication(
+  stateRoot: string,
+  outputPath: string,
+  sabotage: () => void,
+  timing: "after-publication" | "during-rollback" = "after-publication",
+): Promise<void> {
+  return new Promise((resolveSabotage, reject) => {
+    let receiptSabotaged = false;
+    const timer = setTimeout(() => {
+      watcher.close();
+      reject(new Error("Timed out waiting for creature publication rename"));
+    }, 30_000);
+    const watcher = watch(dirname(outputPath), (event, filename) => {
+      if (event !== "rename" || filename !== basename(outputPath)) return;
+      try {
+        if (!receiptSabotaged) {
+          const receiptTemporary = readdirSync(join(stateRoot, "receipts"))
+            .find((name) => name.endsWith(".tmp"));
+          if (!receiptTemporary) return;
+          unlinkSync(join(stateRoot, "receipts", receiptTemporary));
+          receiptSabotaged = true;
+          if (timing === "during-rollback") return;
+        }
+        sabotage();
+        clearTimeout(timer);
+        watcher.close();
+        resolveSabotage();
+      } catch (error) {
+        clearTimeout(timer);
+        watcher.close();
+        reject(error);
+      }
+    });
+  });
+}
+
 describe("creature_compile installed MCP", () => {
   it("compiles the original three-clip wyvern through the installed bin", async () => {
     const root = await createScaffold();
@@ -917,6 +960,92 @@ describe("creature_compile installed MCP", () => {
       await runner.close();
     }
   }, 30_000);
+
+  it("should preserve an external replacement when receipt finalization fails", async () => {
+    if (process.platform === "win32") return;
+    const root = await createScaffold();
+    const stateRoot = join(root, ".threenative", "creatures");
+    const specPath = join(stateRoot, "wyvern.json");
+    const outputPath = join(root, "assets", "creatures", "external-race.glb");
+    const seedPath = join(stateRoot, "large-valid.glb");
+    const previous = validFixtureGlb(0, 5);
+    const replacement = validFixtureGlb(30 * 1_024 * 1_024, 6);
+    const external = Buffer.from("newer external writer bytes");
+    await writeFile(specPath, JSON.stringify(WYVERN_SPEC, null, 2));
+    await writeFile(outputPath, previous);
+    await writeFile(seedPath, replacement);
+    const runner = await createSeedCopyRunner(root, seedPath);
+    const sabotaged = sabotageReceiptAfterPublication(stateRoot, outputPath, () => {
+      writeFileSync(outputPath, external);
+    }, "during-rollback");
+    try {
+      const failure = await runner.compile({
+        specPath: ".threenative/creatures/wyvern.json",
+        outputPath: "assets/creatures/external-race.glb",
+        expectedOutputSha256: hash(previous),
+      }).catch((error: unknown) => error) as { code?: string; detail?: Record<string, unknown> };
+      await sabotaged;
+      expect(failure).toMatchObject({
+        code: "OUTPUT_CONFLICT",
+        detail: {
+          publishedOutputSha256: hash(replacement),
+          observedOutputSha256: hash(external),
+          recoveryPath: expect.stringMatching(/\.rollback$/),
+          publishedRecoveryPath: expect.stringMatching(/\.rollback-published$/),
+          rollback: "preserved",
+        },
+      });
+      expect(await readFile(outputPath)).toEqual(external);
+      expect(hash(await readFile(join(root, failure.detail?.recoveryPath as string)))).toBe(hash(previous));
+      expect(hash(await readFile(join(root, failure.detail?.publishedRecoveryPath as string)))).toBe(hash(replacement));
+    } finally {
+      await runner.close();
+    }
+  }, 60_000);
+
+  it("should preserve the rollback backup when restoration fails", async () => {
+    if (process.platform === "win32") return;
+    const root = await createScaffold();
+    const stateRoot = join(root, ".threenative", "creatures");
+    const specPath = join(stateRoot, "wyvern.json");
+    const outputDirectory = join(root, "assets", "creatures");
+    const outputPath = join(outputDirectory, "restore-failure.glb");
+    const seedPath = join(stateRoot, "large-valid.glb");
+    const previous = validFixtureGlb(0, 7);
+    const replacement = validFixtureGlb(30 * 1_024 * 1_024, 8);
+    await writeFile(specPath, JSON.stringify(WYVERN_SPEC, null, 2));
+    await writeFile(outputPath, previous);
+    await writeFile(seedPath, replacement);
+    const runner = await createSeedCopyRunner(root, seedPath);
+    const sabotaged = sabotageReceiptAfterPublication(stateRoot, outputPath, () => {
+      chmodSync(outputDirectory, 0o500);
+    }, "during-rollback");
+    try {
+      const failure = await runner.compile({
+        specPath: ".threenative/creatures/wyvern.json",
+        outputPath: "assets/creatures/restore-failure.glb",
+        expectedOutputSha256: hash(previous),
+      }).catch((error: unknown) => error) as { code?: string; detail?: Record<string, unknown> };
+      await sabotaged;
+      await chmod(outputDirectory, 0o700);
+      expect(failure).toMatchObject({
+        code: "OUTPUT_CONFLICT",
+        detail: {
+          publishedOutputSha256: hash(replacement),
+          observedOutputSha256: null,
+          recoveryPath: expect.stringMatching(/\.rollback$/),
+          publishedRecoveryPath: expect.stringMatching(/\.rollback-published$/),
+          rollback: "preserved",
+        },
+      });
+      expect(existsSync(outputPath)).toBe(false);
+      expect(hash(await readFile(join(root, failure.detail?.recoveryPath as string)))).toBe(hash(previous));
+      expect(hash(await readFile(join(root, failure.detail?.publishedRecoveryPath as string)))).toBe(hash(replacement));
+    } finally {
+      await chmod(outputDirectory, 0o700).catch(() => undefined);
+      await runner.close();
+    }
+  }, 60_000);
 
   it("runs the pinned green and red calibrations from their extracted reference paths", async () => {
     const root = await createScaffold();
