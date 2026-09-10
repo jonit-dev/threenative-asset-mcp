@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 
+import { statSync } from "node:fs";
+import { join } from "node:path";
+
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 
 // `import` is the only argument form this bin accepts. No arguments still starts the stdio MCP
@@ -17,6 +20,8 @@ if (process.argv[2] === "import") {
 import { AmbientCgClient } from "./ambientcg/client.js";
 import { AudioCatalogClient } from "./audio/client.js";
 import { BundleAssetClient } from "./bundle/client.js";
+import { loadCreatureConfig } from "./config.js";
+import type { CreatureRunner } from "./creature/runner.js";
 import { DirectAssetDownloader } from "./download/direct-asset-downloader.js";
 import { FabClient } from "./fab/client.js";
 import { ItchAssetClient } from "./itch/client.js";
@@ -24,6 +29,10 @@ import { PolyHavenClient } from "./polyhaven/client.js";
 import { SketchfabClient } from "./sketchfab/client.js";
 import { createAssetServer } from "./server.js";
 import { SmithsonianClient } from "./smithsonian/client.js";
+import {
+  activateCreatureCompilation,
+  registerCreatureCompileTool,
+} from "./tools/creature.js";
 
 const fab = new FabClient();
 const polyhaven = new PolyHavenClient();
@@ -34,10 +43,27 @@ const audio = new AudioCatalogClient();
 const directDownloader = new DirectAssetDownloader();
 const itch = new ItchAssetClient({ downloader: directDownloader });
 const bundle = new BundleAssetClient({ itch });
+let creatureRunner: CreatureRunner | undefined;
+try {
+  if (statSync(join(process.cwd(), ".threenative")).isDirectory()) {
+    creatureRunner = activateCreatureCompilation(
+      loadCreatureConfig(),
+      process.cwd(),
+    );
+  }
+} catch (error) {
+  process.stderr.write(
+    `${JSON.stringify({
+      level: "warn",
+      message: "Creature compilation is unavailable in this launch root",
+      error: error instanceof Error ? error.name : "UnknownError",
+    })}\n`,
+  );
+}
 void fab.prepareBrowser();
 const handle = serveStdio(
-  () =>
-    createAssetServer({
+  () => {
+    const server = createAssetServer({
       fab,
       polyhaven,
       ambientcg,
@@ -47,7 +73,10 @@ const handle = serveStdio(
       directDownloader,
       itch,
       bundle,
-    }),
+    });
+    if (creatureRunner) registerCreatureCompileTool(server, creatureRunner);
+    return server;
+  },
   {
   onerror(error) {
     process.stderr.write(
@@ -65,7 +94,11 @@ let closing = false;
 async function shutdown(): Promise<void> {
   if (closing) return;
   closing = true;
-  await Promise.allSettled([fab.close(), handle.close()]);
+  await Promise.allSettled([
+    fab.close(),
+    handle.close(),
+    creatureRunner?.close(),
+  ]);
 }
 
 process.once("SIGINT", () => {

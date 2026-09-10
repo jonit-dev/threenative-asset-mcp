@@ -1,7 +1,11 @@
-import { readFileSync } from "node:fs";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import {
+  execFileSync,
+  spawn,
+  type ChildProcessWithoutNullStreams,
+} from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -83,7 +87,46 @@ function send(
   child.stdin.write(`${JSON.stringify(message)}\n`);
 }
 
+function requiredSets(schema: unknown): string[][] {
+  const found: string[][] = [];
+  const visit = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+    if (typeof value !== "object" || value === null) return;
+    for (const [key, child] of Object.entries(value)) {
+      if (key === "required" && Array.isArray(child) && child.every((entry) => typeof entry === "string")) {
+        found.push(child as string[]);
+      }
+      visit(child);
+    }
+  };
+  visit(schema);
+  return found;
+}
+
 async function startInitializedServer(): Promise<{
+  child: ChildProcessWithoutNullStreams;
+  stdout: string[];
+}>;
+async function startInitializedServer(options: {
+  readonly command?: string;
+  readonly cwd?: string;
+  readonly environment?: NodeJS.ProcessEnv;
+}): Promise<{
+  child: ChildProcessWithoutNullStreams;
+  stdout: string[];
+}>;
+async function startInitializedServer({
+  command = resolve("dist/index.js"),
+  cwd = resolve("."),
+  environment,
+}: {
+  readonly command?: string;
+  readonly cwd?: string;
+  readonly environment?: NodeJS.ProcessEnv;
+} = {}): Promise<{
   child: ChildProcessWithoutNullStreams;
   stdout: string[];
 }> {
@@ -91,10 +134,11 @@ async function startInitializedServer(): Promise<{
     join(tmpdir(), "threenative-asset-mcp-smoke-"),
   );
   temporaryDirectories.push(profileDir);
-  const child = spawn(process.execPath, [resolve("dist/index.js")], {
-    cwd: resolve("."),
+  const child = spawn(process.execPath, [command], {
+    cwd,
     env: {
       ...process.env,
+      ...environment,
       FAB_BROWSER_PROFILE_DIR: profileDir,
       FAB_LOG_LEVEL: "debug",
     },
@@ -145,6 +189,71 @@ async function stopServer(
     ),
   ]);
   children.delete(child);
+}
+
+async function callTool(
+  child: ChildProcessWithoutNullStreams,
+  id: number,
+  name: string,
+  arguments_: Record<string, unknown> = {},
+): Promise<Record<string, unknown>> {
+  const response = jsonResponse(child, id);
+  send(child, {
+    jsonrpc: "2.0",
+    id,
+    method: "tools/call",
+    params: { name, arguments: arguments_ },
+  });
+  return response;
+}
+
+function npm(args: readonly string[], cwd: string): string {
+  const npmCli = process.env.npm_execpath;
+  if (!npmCli) throw new Error("npm_execpath is required for packed-package tests");
+  return execFileSync(process.execPath, [npmCli, ...args], {
+    cwd,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+}
+
+async function installPackedPackage(): Promise<{
+  readonly command: string;
+  readonly cwd: string;
+}> {
+  const packageDirectory = await mkdtemp(
+    join(tmpdir(), "threenative-asset-mcp-packed-"),
+  );
+  temporaryDirectories.push(packageDirectory);
+  const packed = JSON.parse(
+    npm(
+      ["pack", "--json", "--pack-destination", packageDirectory],
+      resolve("."),
+    ),
+  ) as Array<{ filename: string }>;
+  const tarball = join(packageDirectory, packed[0]?.filename ?? "");
+  if (!existsSync(tarball)) throw new Error("npm pack did not create a tarball");
+
+  const consumerDirectory = join(packageDirectory, "consumer");
+  npm(
+    [
+      "install",
+      "--ignore-scripts",
+      "--no-package-lock",
+      "--prefix",
+      consumerDirectory,
+      tarball,
+    ],
+    resolve("."),
+  );
+  const command = join(
+    consumerDirectory,
+    "node_modules",
+    ".bin",
+    "threenative-asset-mcp",
+  );
+  if (!existsSync(command)) throw new Error("installed package did not expose its bin");
+  return { command, cwd: consumerDirectory };
 }
 
 describe("Phase 5 reliability", () => {
@@ -253,6 +362,8 @@ describe("built stdio package", () => {
         (tool) => tool.name,
       ),
     ).toEqual([
+      "creature_status",
+      "creature_guide",
       "fab_search_assets",
       "fab_get_asset",
       "fab_list_filters",
@@ -315,4 +426,304 @@ describe("built stdio package", () => {
     expect(Date.now() - startedAt).toBeLessThan(5_000);
     expect(child.exitCode).toBe(0);
   });
+
+  it("should return pinned creature syntax when the client calls creature_guide", async () => {
+    const { child } = await startInitializedServer();
+
+    const response = await callTool(child, 3, "creature_guide", {
+      section: "syntax",
+    });
+
+    expect(response).toMatchObject({
+      result: {
+        structuredContent: {
+          section: "syntax",
+          guide: expect.stringContaining("Spec JSON — the whole language on one page"),
+          upstream: {
+            version: "1.3.1",
+            commit: "44e1abc2c7fe083f19f989c8437c44a141adc7f3",
+          },
+          integrity: {
+            archiveSha256: "cc25c9a9c170d43741803d5531f853bc89ebfd58a98d9fdda90834c53822084d",
+          },
+        },
+      },
+    });
+
+    await stopServer(child);
+  });
+
+  it("should report unavailable tooling when an optional executable is absent", async () => {
+    const { child } = await startInitializedServer({
+      environment: { PATH: "" },
+    });
+
+    const response = await callTool(child, 3, "creature_status");
+
+    expect(response).toMatchObject({
+      result: {
+        structuredContent: {
+          operations: {
+            creature_status: { available: true },
+            creature_guide: { available: true },
+            creature_compile: { available: false },
+          },
+          tooling: {
+            pythonSilhouettes: {
+              available: false,
+              executable: "python3",
+            },
+          },
+        },
+      },
+    });
+
+    await stopServer(child);
+  });
+
+  if (process.platform !== "win32") {
+    it("should not report a non-executable PATH candidate as optional tooling", async () => {
+      const executableDirectory = await mkdtemp(
+        join(tmpdir(), "threenative-asset-mcp-noexec-"),
+      );
+      temporaryDirectories.push(executableDirectory);
+      const candidate = join(executableDirectory, "python3");
+      await writeFile(candidate, "#!/bin/sh\nexit 0\n");
+      await chmod(candidate, 0o644);
+      const { child } = await startInitializedServer({
+        environment: { PATH: executableDirectory },
+      });
+
+      const response = await callTool(child, 3, "creature_status");
+
+      expect(response).toMatchObject({
+        result: {
+          structuredContent: {
+            tooling: {
+              pythonSilhouettes: {
+                available: false,
+                executable: "python3",
+              },
+            },
+          },
+        },
+      });
+
+      await stopServer(child);
+    });
+
+    it("should probe NumPy and Pillow instead of trusting an executable bit", async () => {
+      const executableDirectory = await mkdtemp(
+        join(tmpdir(), "threenative-asset-mcp-python-no-deps-"),
+      );
+      temporaryDirectories.push(executableDirectory);
+      const candidate = join(executableDirectory, "python3");
+      await writeFile(
+        candidate,
+        "#!/bin/sh\nprintf '%s\\n' 'ModuleNotFoundError: No module named numpy' >&2\nexit 1\n",
+      );
+      await chmod(candidate, 0o755);
+      const { child } = await startInitializedServer({
+        environment: { PATH: executableDirectory },
+      });
+
+      const response = await callTool(child, 3, "creature_status");
+
+      expect(response).toMatchObject({
+        result: {
+          structuredContent: {
+            tooling: {
+              pythonSilhouettes: {
+                available: false,
+                executable: "python3",
+                reason: expect.stringMatching(/NumPy|Pillow/u),
+              },
+            },
+          },
+        },
+      });
+
+      await stopServer(child);
+    });
+
+    it("should probe Chromium launch availability in an active creature project", async () => {
+      const projectRoot = await mkdtemp(
+        join(tmpdir(), "threenative-asset-mcp-no-chromium-"),
+      );
+      temporaryDirectories.push(projectRoot);
+      await mkdir(join(projectRoot, ".threenative"), { recursive: true });
+      const emptyHome = join(projectRoot, "empty-home");
+      const emptyBrowsers = join(projectRoot, "empty-browsers");
+      const cache = join(projectRoot, "cache");
+      await mkdir(emptyHome, { recursive: true });
+      await mkdir(emptyBrowsers, { recursive: true });
+      const { child } = await startInitializedServer({
+        cwd: projectRoot,
+        environment: {
+          HOME: emptyHome,
+          XDG_CACHE_HOME: cache,
+          PLAYWRIGHT_BROWSERS_PATH: emptyBrowsers,
+          PW_CHROMIUM_PATH: join(projectRoot, "missing-chromium"),
+        },
+      });
+
+      const response = await callTool(child, 3, "creature_status");
+
+      expect(response).toMatchObject({
+        result: {
+          structuredContent: {
+            operations: {
+              creature_compile: { available: true },
+              creature_preview: { available: true },
+            },
+            tooling: {
+              chromiumRender: {
+                available: false,
+                reason: expect.stringMatching(/playwright install chromium|Chromium/u),
+              },
+            },
+          },
+        },
+      });
+
+      await stopServer(child);
+    }, 30_000);
+  }
+
+  it(
+    "should serve creature discovery from the installed package bin",
+    async () => {
+      const installed = await installPackedPackage();
+      const { child } = await startInitializedServer({
+        command: installed.command,
+        cwd: installed.cwd,
+      });
+
+      const status = await callTool(child, 3, "creature_status");
+      const guide = await callTool(child, 4, "creature_guide", {
+        section: "syntax",
+      });
+
+      expect(status).toMatchObject({
+        result: {
+          structuredContent: {
+            operations: {
+              creature_status: { available: true },
+              creature_guide: { available: true },
+              creature_compile: { available: false },
+            },
+          },
+        },
+      });
+      expect(guide).toMatchObject({
+        result: {
+          structuredContent: {
+            guide: expect.stringContaining("Spec JSON — the whole language on one page"),
+          },
+        },
+      });
+
+      await stopServer(child);
+    },
+    30_000,
+  );
+
+  it(
+    "should register creature_preview for an installed package launched from a creature project",
+    async () => {
+      const installed = await installPackedPackage();
+      await mkdir(join(installed.cwd, ".threenative", "creatures"), {
+        recursive: true,
+      });
+      const { child } = await startInitializedServer({
+        command: installed.command,
+        cwd: installed.cwd,
+      });
+
+      const listed = jsonResponse(child, 3);
+      send(child, {
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/list",
+        params: {},
+      });
+      const names = (
+        (await listed).result as { tools?: Array<{ name: string }> }
+      ).tools?.map((tool) => tool.name);
+
+      expect(names).toContain("creature_compile");
+      expect(names).toContain("creature_preview");
+      expect(names).toContain("creature_check");
+      await stopServer(child);
+    },
+    30_000,
+  );
+
+  it(
+    "should expose the check schema and adapted guide from an active creature project",
+    async () => {
+      const projectRoot = await mkdtemp(
+        join(tmpdir(), "threenative-asset-mcp-check-schema-"),
+      );
+      temporaryDirectories.push(projectRoot);
+      await mkdir(join(projectRoot, ".threenative"), { recursive: true });
+      const { child } = await startInitializedServer({ cwd: projectRoot });
+
+      try {
+        const listed = jsonResponse(child, 3);
+        send(child, {
+          jsonrpc: "2.0",
+          id: 3,
+          method: "tools/list",
+          params: {},
+        });
+        const tools = (
+          (await listed).result as {
+            tools?: Array<{
+              name: string;
+              inputSchema?: Record<string, unknown>;
+              outputSchema?: Record<string, unknown>;
+            }>;
+          }
+        ).tools ?? [];
+        const check = tools.find((tool) => tool.name === "creature_check");
+        expect(check).toBeDefined();
+        expect(JSON.stringify(check?.inputSchema)).toContain("claimsPath");
+        expect(JSON.stringify(check?.inputSchema)).toContain("stage");
+        expect(check?.outputSchema).toEqual(expect.any(Object));
+        const inputRequired = requiredSets(check?.inputSchema);
+        expect(inputRequired).toEqual(
+          expect.arrayContaining([
+            expect.arrayContaining(["glbPath", "mode"]),
+            expect.arrayContaining(["glbPath", "mode", "claimsPath", "stage"]),
+          ]),
+        );
+        const outputSchemaText = JSON.stringify(check?.outputSchema);
+        expect(outputSchemaText).toContain("claims");
+        expect(outputSchemaText).toContain("observations");
+        expect(outputSchemaText).toContain("metricsPath");
+        expect(requiredSets(check?.outputSchema)).toEqual(
+          expect.arrayContaining([
+            expect.arrayContaining(["mode", "claims", "observations"]),
+          ]),
+        );
+
+        const guide = await callTool(child, 4, "creature_guide", {
+          section: "overview",
+        });
+        expect(guide).toMatchObject({
+          result: {
+            structuredContent: {
+              guide: expect.stringMatching(
+                /creature_check[\s\S]*glbPath[\s\S]*claimsPath[\s\S]*stage[\s\S]*part_exists[\s\S]*tri_budget[\s\S]*metricsPath[\s\S]*notReviewed/u,
+              ),
+            },
+          },
+        });
+      } finally {
+        await stopServer(child);
+      }
+    },
+    30_000,
+  );
 });
