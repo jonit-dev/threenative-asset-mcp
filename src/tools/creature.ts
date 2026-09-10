@@ -20,6 +20,10 @@ import {
   CreatureRunner,
   type CreatureCompileResult,
 } from "../creature/runner.js";
+import {
+  previewCreature,
+  previewError,
+} from "../creature/preview.js";
 
 const PAYLOAD_VERSION = "1.3.1";
 const PAYLOAD_COMMIT = "44e1abc2c7fe083f19f989c8437c44a141adc7f3";
@@ -194,6 +198,75 @@ const CreatureCompileFailureSchema = z.object({
 export const CreatureCompileOutputSchema = z.union([
   CreatureCompileSuccessSchema,
   CreatureCompileFailureSchema,
+]);
+
+export const CreaturePreviewInputSchema = z
+  .object({
+    glbPath: z.string().trim().min(1).max(1_000),
+    mode: z.enum(["silhouettes", "hero"]),
+    previousPreviewId: z.string().regex(/^[a-z0-9-]{8,80}$/u).optional(),
+  })
+  .strict();
+
+const PreviewArtifactSchema = z.object({
+  path: z.string().min(1),
+  sha256: z.string().regex(/^[a-f0-9]{64}$/u),
+  bytes: z.number().int().positive(),
+  included: z.boolean(),
+  omittedReason: z.string().max(500).optional(),
+});
+
+const PreviewViewSchema = z.object({
+  name: z.string().min(1),
+  image: PreviewArtifactSchema,
+  thumbnail: PreviewArtifactSchema,
+  measurements: z.record(z.string(), z.unknown()),
+});
+
+const PreviewBackendSchema = z.object({
+  id: z.enum(["python-outline", "browser-silmetrics", "browser-hero"]),
+  nativeViewNames: z.array(z.string().min(1)).min(1),
+  camera: z.object({
+    projection: z.literal("perspective"),
+    fovDegrees: z.number().finite().positive(),
+    resolution: z.object({ width: z.number().int().positive(), height: z.number().int().positive() }),
+    distanceMultiplier: z.number().finite().positive().optional(),
+    initialDistanceMultiplier: z.number().finite().positive().optional(),
+    fitFraction: z.number().finite().positive().optional(),
+  }),
+});
+
+const CreaturePreviewSuccessSchema = z.object({
+  operation: z.literal("creature_preview"),
+  mode: z.enum(["silhouettes", "hero"]),
+  glbPath: z.string().min(1),
+  glbSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+  previewId: z.string().regex(/^[a-z0-9-]{8,80}$/u),
+  receiptPath: z.string().min(1),
+  backend: PreviewBackendSchema,
+  views: z.array(PreviewViewSchema).min(1),
+  encodedImageBudgetBytes: z.literal(4 * 1_024 * 1_024),
+  visualReview: z.literal("notReviewed"),
+  comparison: z.object({ previousPreviewId: z.string(), compatible: z.literal(true) }).optional(),
+});
+
+const CreaturePreviewFailureSchema = z.object({
+  operation: z.literal("creature_preview"),
+  code: z.enum([
+    "INVALID_SPEC",
+    "TOOLCHAIN_UNAVAILABLE",
+    "TIMEOUT",
+    "CANCELLED",
+    "BUSY",
+    "PREVIEW_COMPARISON",
+  ]),
+  message: z.string().min(1).max(2_000),
+  detail: z.record(z.string(), z.unknown()),
+});
+
+export const CreaturePreviewOutputSchema = z.union([
+  CreaturePreviewSuccessSchema,
+  CreaturePreviewFailureSchema,
 ]);
 
 const AvailabilitySchema = z.object({
@@ -416,7 +489,9 @@ async function status(): Promise<CreatureStatusOutput> {
       creature_compile: compileRunner
         ? { available: true }
         : unavailable("Launch the asset MCP from a project root containing .threenative to enable project-local compilation."),
-      creature_preview: unavailable("Preview rendering is not available until a later asset-MCP increment."),
+      creature_preview: compileRunner
+        ? { available: true }
+        : unavailable("Launch the asset MCP from a project root containing .threenative to enable project-local previews."),
       creature_check: unavailable("Creature inspection is not available until a later asset-MCP increment."),
     },
     tooling: {
@@ -430,7 +505,9 @@ async function status(): Promise<CreatureStatusOutput> {
             executable: "python3",
             reason: "python3 is optional and was not found on PATH.",
           },
-      chromiumRender: unavailable("Chromium rendering is not available until the preview increment."),
+      chromiumRender: compileRunner
+        ? { available: true, reason: "Chromium is probed when a browser preview is requested; missing browsers return an actionable operation error." }
+        : unavailable("Chromium rendering is probed when the preview increment is active."),
     },
     limits: compileRunner?.limits ?? CREATURE_LIMITS,
     setup: [
@@ -438,7 +515,9 @@ async function status(): Promise<CreatureStatusOutput> {
       compileRunner
         ? "Use creature_compile with project-relative specPath and outputPath values; no browser, credential, setup script, or runtime download is required."
         : "Create .threenative/creatures in the project launch root and restart this server to activate creature_compile.",
-      "Preview and inspection remain unavailable until later increments.",
+      compileRunner
+        ? "Use creature_preview with mode 'silhouettes' or 'hero'; missing optional render dependencies return an actionable failure and do not approve the image."
+        : "Preview and inspection remain unavailable until a project-local compiler is active.",
     ],
   });
 }
@@ -496,6 +575,23 @@ export function registerCreatureCompileTool(
     },
     createCreatureCompileHandler(runner),
   );
+  server.registerTool(
+    "creature_preview",
+    {
+      title: "Preview a compiled creature",
+      description:
+        "Render fresh, bounded silhouettes or a hero image for a project-relative creature GLB and return image artifacts with backend and camera identity; visual approval remains independent.",
+      inputSchema: CreaturePreviewInputSchema,
+      outputSchema: CreaturePreviewOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    createCreaturePreviewHandler(runner),
+  );
 }
 
 export function createCreatureCompileHandler(runner: CreatureRunner) {
@@ -522,6 +618,43 @@ export function createCreatureCompileHandler(runner: CreatureRunner) {
       };
     } catch (error) {
       const output = compileFailure(error);
+      return {
+        isError: true as const,
+        content: [{ type: "text" as const, text: JSON.stringify(output) }],
+        structuredContent: output,
+      };
+    }
+  };
+}
+
+export function createCreaturePreviewHandler(runner: CreatureRunner) {
+  return async (
+    rawInput: z.input<typeof CreaturePreviewInputSchema>,
+    context: ServerContext,
+  ) => {
+    try {
+      const input = CreaturePreviewInputSchema.parse(rawInput);
+      const result = await previewCreature(
+        runner,
+        {
+          glbPath: input.glbPath,
+          mode: input.mode,
+          ...(input.previousPreviewId
+            ? { previousPreviewId: input.previousPreviewId }
+            : {}),
+        },
+        context.mcpReq.signal,
+      );
+      const output = CreaturePreviewSuccessSchema.parse(result.output);
+      return {
+        content: [
+          ...result.content,
+          { type: "text" as const, text: JSON.stringify(output) },
+        ],
+        structuredContent: output,
+      };
+    } catch (error) {
+      const output = CreaturePreviewOutputSchema.parse(previewError(error));
       return {
         isError: true as const,
         content: [{ type: "text" as const, text: JSON.stringify(output) }],

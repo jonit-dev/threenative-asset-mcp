@@ -70,7 +70,8 @@ export type CreatureErrorCode =
   | "TOOLCHAIN_UNAVAILABLE"
   | "TIMEOUT"
   | "CANCELLED"
-  | "BUSY";
+  | "BUSY"
+  | "PREVIEW_COMPARISON";
 
 export class CreatureOperationError extends Error {
   readonly code: CreatureErrorCode;
@@ -160,6 +161,7 @@ interface StatePaths {
   readonly diagnostics: string;
   readonly checks: string;
   readonly receipts: string;
+  readonly previews: string;
 }
 
 function sha256(bytes: Uint8Array): string {
@@ -706,10 +708,24 @@ export class CreatureRunner {
     await active.done;
   }
 
-  async compile(request: CreatureCompileRequest, callerSignal?: AbortSignal): Promise<CreatureCompileResult> {
-    if (this.closing) throw new CreatureOperationError("CANCELLED", "The creature compiler is shutting down; start the server again and retry.");
+  async withHeavyOperation<T>(
+    timeoutMs: number,
+    timeoutMessage: string,
+    callerSignal: AbortSignal | undefined,
+    operation: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
+    if (this.closing) {
+      throw new CreatureOperationError(
+        "CANCELLED",
+        "The creature toolchain is shutting down; start the server again and retry.",
+      );
+    }
     if (this.active || this.limits.maxActiveHeavyOperations !== 1) {
-      throw new CreatureOperationError("BUSY", "Another creature operation is active; retry after it finishes.", { retryable: true });
+      throw new CreatureOperationError(
+        "BUSY",
+        "Another creature operation is active; retry after it finishes.",
+        { retryable: true },
+      );
     }
     const controller = new AbortController();
     let finish!: () => void;
@@ -720,15 +736,72 @@ export class CreatureRunner {
     const onCancel = () => controller.abort({ kind: "cancelled", source: "client" });
     callerSignal?.addEventListener("abort", onCancel, { once: true });
     if (callerSignal?.aborted) onCancel();
-    const timer = setTimeout(() => controller.abort({ kind: "timeout" }), this.limits.compileTimeoutMs);
+    const timer = setTimeout(() => controller.abort({ kind: "timeout" }), timeoutMs);
     try {
-      return await this.compileActive(request, controller.signal);
+      const result = await operation(controller.signal);
+      if (controller.signal.aborted) {
+        throw this.abortError(controller.signal, undefined, undefined, timeoutMessage);
+      }
+      return result;
     } finally {
       clearTimeout(timer);
       callerSignal?.removeEventListener("abort", onCancel);
       this.active = undefined;
       finish();
     }
+  }
+
+  async resolveProjectFile(
+    requestPath: string,
+    label: string,
+  ): Promise<{ readonly root: string; readonly absolute: string; readonly relative: string }> {
+    assertRelativePath(requestPath, label);
+    const root = await realpath(this.launchRoot).catch(() => {
+      throw new CreatureOperationError("INVALID_SPEC", "The server launch root is unavailable.");
+    });
+    const absolute = await realpath(resolve(root, requestPath)).catch(() => {
+      throw new CreatureOperationError("INVALID_SPEC", `${label} '${requestPath}' does not exist.`, { field: label });
+    });
+    if (!isInside(absolute, root)) {
+      throw new CreatureOperationError("INVALID_SPEC", `${label} escapes the server launch root.`, { field: label });
+    }
+    const info = await lstat(absolute).catch(() => undefined);
+    if (!info?.isFile() || info.isSymbolicLink()) {
+      throw new CreatureOperationError("INVALID_SPEC", `${label} must resolve to a regular file.`, { field: label });
+    }
+    return { root, absolute, relative: projectPath(root, absolute) };
+  }
+
+  async createPreviewDirectory(
+    previewId: string,
+  ): Promise<{ readonly root: string; readonly directory: string; readonly relative: string }> {
+    if (!/^[a-z0-9-]{8,80}$/u.test(previewId)) {
+      throw new CreatureOperationError("INVALID_SPEC", "The preview identifier is invalid.");
+    }
+    const root = await realpath(this.launchRoot).catch(() => {
+      throw new CreatureOperationError("INVALID_SPEC", "The server launch root is unavailable.");
+    });
+    const state = await this.ensureState(root);
+    const directory = join(state.previews, previewId);
+    const canonical = await canonicalMissingPath(directory);
+    if (!isInside(canonical, state.previews) || canonical !== directory) {
+      throw new CreatureOperationError("INVALID_SPEC", "The preview artifact path escapes private creature state.");
+    }
+    await mkdir(directory, { recursive: false, mode: 0o700 });
+    const info = await lstat(directory);
+    if (info.isSymbolicLink() || !info.isDirectory() || (await realpath(directory)) !== directory) {
+      throw new CreatureOperationError("INVALID_SPEC", "The preview artifact directory must be private and real.");
+    }
+    return { root, directory, relative: projectPath(root, directory) };
+  }
+
+  async compile(request: CreatureCompileRequest, callerSignal?: AbortSignal): Promise<CreatureCompileResult> {
+    return this.withHeavyOperation(
+      this.limits.compileTimeoutMs,
+      `Creature compilation exceeded ${this.limits.compileTimeoutMs} ms; simplify the spec or retry when the machine is less loaded.`,
+      callerSignal,
+      (signal) => this.compileActive(request, signal),
+    );
   }
 
   private async compileActive(request: CreatureCompileRequest, signal: AbortSignal): Promise<CreatureCompileResult> {
@@ -1128,13 +1201,18 @@ export class CreatureRunner {
     }
   }
 
-  private abortError(signal: AbortSignal, diagnosticsPath?: string, root?: string): CreatureOperationError {
+  private abortError(
+    signal: AbortSignal,
+    diagnosticsPath?: string,
+    root?: string,
+    timeoutMessage = `Creature compilation exceeded ${this.limits.compileTimeoutMs} ms; simplify the spec or retry when the machine is less loaded.`,
+  ): CreatureOperationError {
     const reason = signal.reason;
     const timedOut = isRecord(reason) && reason.kind === "timeout";
     return new CreatureOperationError(
       timedOut ? "TIMEOUT" : "CANCELLED",
       timedOut
-        ? `Creature compilation exceeded ${this.limits.compileTimeoutMs} ms; simplify the spec or retry when the machine is less loaded.`
+        ? timeoutMessage
         : "Creature compilation was cancelled; the previous output was preserved and the process was terminated.",
       diagnosticsPath && root ? { diagnosticsPath: projectPath(root, diagnosticsPath) } : {},
     );
@@ -1151,6 +1229,7 @@ export class CreatureRunner {
       diagnostics: join(stateRoot, "diagnostics"),
       checks: join(stateRoot, "checks"),
       receipts: join(stateRoot, "receipts"),
+      previews: join(stateRoot, "previews"),
     };
     for (const path of Object.values(paths)) {
       const expected = resolve(path);
@@ -1224,7 +1303,7 @@ export class CreatureRunner {
     }
   }
 
-  private async ensurePayload(signal: AbortSignal): Promise<string> {
+  async ensurePayload(signal: AbortSignal): Promise<string> {
     const files = await this.verifiedArchive(signal);
     await mkdir(this.cacheDir, { recursive: true, mode: 0o700 });
     const cacheParent = await realpath(this.cacheDir);

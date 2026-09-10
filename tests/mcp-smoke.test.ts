@@ -5,7 +5,7 @@ import {
   type ChildProcessWithoutNullStreams,
 } from "node:child_process";
 import { once } from "node:events";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -527,6 +527,36 @@ describe("built stdio package", () => {
         },
       });
 
+      await stopServer(child);
+    },
+    30_000,
+  );
+
+  it(
+    "should register creature_preview for an installed package launched from a creature project",
+    async () => {
+      const installed = await installPackedPackage();
+      await mkdir(join(installed.cwd, ".threenative", "creatures"), {
+        recursive: true,
+      });
+      const { child } = await startInitializedServer({
+        command: installed.command,
+        cwd: installed.cwd,
+      });
+
+      const listed = jsonResponse(child, 3);
+      send(child, {
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/list",
+        params: {},
+      });
+      const names = (
+        (await listed).result as { tools?: Array<{ name: string }> }
+      ).tools?.map((tool) => tool.name);
+
+      expect(names).toContain("creature_compile");
+      expect(names).toContain("creature_preview");
       await stopServer(child);
     },
     30_000,
