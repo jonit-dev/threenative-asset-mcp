@@ -1,13 +1,19 @@
 import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { LATEST_PROTOCOL_VERSION } from "@modelcontextprotocol/server";
 import sharp from "sharp";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import {
+  previewCreature,
+  validatePreviewPng,
+} from "../src/creature/preview.js";
+import type { CreatureRunner } from "../src/creature/runner.js";
 
 const WYVERN_SPEC = {
   name: "ember_crown_wyvern",
@@ -184,6 +190,75 @@ const WYVERN_SPEC = {
 
 const temporaryDirectories: string[] = [];
 let installedCommand = "";
+
+function fakePreviewRunner(
+  projectRoot: string,
+  payloadRoot: string,
+): CreatureRunner {
+  return {
+    withHeavyOperation: <T>(
+      _timeoutMs: number,
+      _timeoutMessage: string,
+      signal: AbortSignal | undefined,
+      operation: (operationSignal: AbortSignal) => Promise<T>,
+    ) => operation(signal ?? new AbortController().signal),
+    resolveProjectFile: async () => ({
+      root: projectRoot,
+      absolute: join(projectRoot, "model.glb"),
+      relative: "model.glb",
+    }),
+    createPreviewDirectory: async (previewId: string) => {
+      const directory = join(
+        projectRoot,
+        ".threenative",
+        "creatures",
+        "previews",
+        previewId,
+      );
+      await mkdir(directory, { recursive: false, mode: 0o700 });
+      return {
+        root: projectRoot,
+        directory,
+        relative: `.threenative/creatures/previews/${previewId}`,
+      };
+    },
+    ensurePayload: async () => payloadRoot,
+  } as unknown as CreatureRunner;
+}
+
+async function createFakePreviewFixture(): Promise<{
+  readonly projectRoot: string;
+  readonly payloadRoot: string;
+}> {
+  const projectRoot = await mkdtemp(join(tmpdir(), "creature-preview-unit-project-"));
+  const payloadRoot = await mkdtemp(join(tmpdir(), "creature-preview-unit-payload-"));
+  temporaryDirectories.push(projectRoot, payloadRoot);
+  await mkdir(join(projectRoot, ".threenative", "creatures", "previews"), {
+    recursive: true,
+  });
+  await writeFile(join(projectRoot, "model.glb"), "fixture-glb");
+  return { projectRoot, payloadRoot };
+}
+
+async function withEnvironment<T>(
+  values: NodeJS.ProcessEnv,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const previous = new Map<string, string | undefined>();
+  for (const [name, value] of Object.entries(values)) {
+    previous.set(name, process.env[name]);
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+  try {
+    return await operation();
+  } finally {
+    for (const [name, value] of previous) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+}
 
 function npm(args: readonly string[], cwd: string): string {
   const npmCli = process.env.npm_execpath;
@@ -377,6 +452,97 @@ async function expectNonblankPng(data: string): Promise<void> {
   expect(light).toBeGreaterThan(100);
 }
 
+describe("creature_preview failure boundaries", () => {
+  it.skipIf(process.platform === "win32")(
+    "should preserve CANCELLED when the Python silhouette process is aborted",
+    async () => {
+      const { projectRoot, payloadRoot } = await createFakePreviewFixture();
+      const python = join(projectRoot, "slow-python");
+      await writeFile(python, "#!/bin/sh\nsleep 30\n");
+      await chmod(python, 0o755);
+
+      const caller = new AbortController();
+      const pending = withEnvironment(
+        { THREENATIVE_CREATURE_PYTHON: python },
+        () =>
+          previewCreature(
+            fakePreviewRunner(projectRoot, payloadRoot),
+            { glbPath: "model.glb", mode: "silhouettes" },
+            caller.signal,
+          ),
+      );
+      const abortTimer = setTimeout(() => caller.abort(), 100);
+      try {
+        await expect(pending).rejects.toMatchObject({ code: "CANCELLED" });
+      } finally {
+        clearTimeout(abortTimer);
+      }
+    },
+  );
+
+  it(
+    "should preserve TIMEOUT when the browser preview process is aborted",
+    async () => {
+      const { projectRoot, payloadRoot } = await createFakePreviewFixture();
+      await mkdir(join(payloadRoot, "harness", "assets"), { recursive: true });
+      await writeFile(join(payloadRoot, "harness", "pwlaunch.mjs"), "");
+      await writeFile(join(payloadRoot, "harness", "pwprobe.mjs"), "");
+      await writeFile(join(payloadRoot, "harness", "silmetrics.mjs"), "");
+      await writeFile(
+        join(payloadRoot, "harness", "hero.mjs"),
+        "setTimeout(() => {}, 30000);\n",
+      );
+      await writeFile(
+        join(payloadRoot, "harness", "assets", "three-bundle.js"),
+        "",
+      );
+
+      const caller = new AbortController();
+      const pending = previewCreature(
+        fakePreviewRunner(projectRoot, payloadRoot),
+        { glbPath: "model.glb", mode: "hero" },
+        caller.signal,
+      );
+      const abortTimer = setTimeout(
+        () => caller.abort({ kind: "timeout" }),
+        100,
+      );
+      try {
+        await expect(pending).rejects.toMatchObject({ code: "TIMEOUT" });
+      } finally {
+        clearTimeout(abortTimer);
+      }
+    },
+  );
+
+  it("should require the exact backend camera dimensions for PNGs", async () => {
+    const { projectRoot } = await createFakePreviewFixture();
+    const path = join(projectRoot, "wrong-size.png");
+    await sharp({
+      create: {
+        width: 320,
+        height: 640,
+        channels: 4,
+        background: { r: 0, g: 0, b: 0, alpha: 1 },
+      },
+    })
+      .png()
+      .toFile(path);
+
+    await expect(
+      validatePreviewPng(path, { width: 640, height: 640 }),
+    ).rejects.toMatchObject({
+      code: "TOOLCHAIN_UNAVAILABLE",
+      detail: {
+        expectedWidth: 640,
+        expectedHeight: 640,
+        actualWidth: 320,
+        actualHeight: 640,
+      },
+    });
+  });
+});
+
 describe("creature_preview installed MCP", () => {
   it(
     "should return four nonblank silhouette views when the wyvern is compiled",
@@ -515,6 +681,144 @@ describe("creature_preview installed MCP", () => {
         await stopServer(child);
       }
     },
+  );
+
+  it(
+    "should reject comparison when a prior artifact hash or byte count is tampered",
+    async () => {
+      const root = await createProject();
+      const child = await startServer(root);
+      try {
+        const compiled = await compileWyvern(child);
+        const first = await callTool(child, 3, "creature_preview", {
+          glbPath: compiled.outputPath,
+          mode: "silhouettes",
+        });
+        const firstOutput = structured(first);
+        const receiptPath = join(root, firstOutput.receiptPath as string);
+        const receipt = JSON.parse(
+          await readFile(receiptPath, "utf8"),
+        ) as Record<string, unknown>;
+        const views = receipt.views as Array<Record<string, unknown>>;
+        const image = views[0]?.image as Record<string, unknown>;
+        image.sha256 = "0".repeat(64);
+        image.bytes = Number(image.bytes) + 1;
+        await writeFile(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`);
+
+        const second = await callTool(child, 4, "creature_preview", {
+          glbPath: compiled.outputPath,
+          mode: "silhouettes",
+          previousPreviewId: firstOutput.previewId,
+        });
+        expect(resultOf(second)).toMatchObject({
+          isError: true,
+          structuredContent: {
+            operation: "creature_preview",
+            code: "PREVIEW_COMPARISON",
+          },
+        });
+      } finally {
+        await stopServer(child);
+      }
+    },
+    120_000,
+  );
+
+  it(
+    "should reject comparison when a prior artifact file is tampered",
+    async () => {
+      const root = await createProject();
+      const child = await startServer(root);
+      try {
+        const compiled = await compileWyvern(child);
+        const first = await callTool(child, 3, "creature_preview", {
+          glbPath: compiled.outputPath,
+          mode: "silhouettes",
+        });
+        const firstOutput = structured(first);
+        const receipt = JSON.parse(
+          await readFile(join(root, firstOutput.receiptPath as string), "utf8"),
+        ) as { views: Array<{ image: { path: string } }> };
+        await writeFile(
+          join(root, receipt.views[0]?.image.path ?? "missing.png"),
+          "tampered preview bytes",
+        );
+
+        const second = await callTool(child, 4, "creature_preview", {
+          glbPath: compiled.outputPath,
+          mode: "silhouettes",
+          previousPreviewId: firstOutput.previewId,
+        });
+        expect(resultOf(second)).toMatchObject({
+          isError: true,
+          structuredContent: {
+            operation: "creature_preview",
+            code: "PREVIEW_COMPARISON",
+          },
+        });
+      } finally {
+        await stopServer(child);
+      }
+    },
+    120_000,
+  );
+
+  it(
+    "should reject comparison when a prior receipt uses a path alias or wrong preview id",
+    async () => {
+      const root = await createProject();
+      const child = await startServer(root);
+      try {
+        const compiled = await compileWyvern(child);
+        const first = await callTool(child, 3, "creature_preview", {
+          glbPath: compiled.outputPath,
+          mode: "silhouettes",
+        });
+        const firstOutput = structured(first);
+        const receiptPath = join(root, firstOutput.receiptPath as string);
+        const receipt = JSON.parse(
+          await readFile(receiptPath, "utf8"),
+        ) as Record<string, unknown>;
+        const views = receipt.views as Array<Record<string, unknown>>;
+        const image = views[0]?.image as Record<string, unknown>;
+        const originalPath = String(image.path);
+        image.path = `./${String(image.path)}`;
+        await writeFile(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`);
+
+        const second = await callTool(child, 4, "creature_preview", {
+          glbPath: compiled.outputPath,
+          mode: "silhouettes",
+          previousPreviewId: firstOutput.previewId,
+        });
+        expect(resultOf(second)).toMatchObject({
+          isError: true,
+          structuredContent: {
+            operation: "creature_preview",
+            code: "PREVIEW_COMPARISON",
+          },
+        });
+
+        image.path = originalPath;
+        receipt.previewId = "different-preview";
+        await writeFile(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`);
+
+        const third = await callTool(child, 5, "creature_preview", {
+          glbPath: compiled.outputPath,
+          mode: "silhouettes",
+          previousPreviewId: firstOutput.previewId,
+        });
+        expect(resultOf(third)).toMatchObject({
+          isError: true,
+          structuredContent: {
+            operation: "creature_preview",
+            code: "PREVIEW_COMPARISON",
+          },
+        });
+      } finally {
+        await stopServer(child);
+      }
+    },
+    120_000,
   );
 
   it(

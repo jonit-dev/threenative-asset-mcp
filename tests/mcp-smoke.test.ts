@@ -492,6 +492,83 @@ describe("built stdio package", () => {
 
       await stopServer(child);
     });
+
+    it("should probe NumPy and Pillow instead of trusting an executable bit", async () => {
+      const executableDirectory = await mkdtemp(
+        join(tmpdir(), "threenative-asset-mcp-python-no-deps-"),
+      );
+      temporaryDirectories.push(executableDirectory);
+      const candidate = join(executableDirectory, "python3");
+      await writeFile(
+        candidate,
+        "#!/bin/sh\nprintf '%s\\n' 'ModuleNotFoundError: No module named numpy' >&2\nexit 1\n",
+      );
+      await chmod(candidate, 0o755);
+      const { child } = await startInitializedServer({
+        environment: { PATH: executableDirectory },
+      });
+
+      const response = await callTool(child, 3, "creature_status");
+
+      expect(response).toMatchObject({
+        result: {
+          structuredContent: {
+            tooling: {
+              pythonSilhouettes: {
+                available: false,
+                executable: "python3",
+                reason: expect.stringMatching(/NumPy|Pillow/u),
+              },
+            },
+          },
+        },
+      });
+
+      await stopServer(child);
+    });
+
+    it("should probe Chromium launch availability in an active creature project", async () => {
+      const projectRoot = await mkdtemp(
+        join(tmpdir(), "threenative-asset-mcp-no-chromium-"),
+      );
+      temporaryDirectories.push(projectRoot);
+      await mkdir(join(projectRoot, ".threenative"), { recursive: true });
+      const emptyHome = join(projectRoot, "empty-home");
+      const emptyBrowsers = join(projectRoot, "empty-browsers");
+      const cache = join(projectRoot, "cache");
+      await mkdir(emptyHome, { recursive: true });
+      await mkdir(emptyBrowsers, { recursive: true });
+      const { child } = await startInitializedServer({
+        cwd: projectRoot,
+        environment: {
+          HOME: emptyHome,
+          XDG_CACHE_HOME: cache,
+          PLAYWRIGHT_BROWSERS_PATH: emptyBrowsers,
+          PW_CHROMIUM_PATH: join(projectRoot, "missing-chromium"),
+        },
+      });
+
+      const response = await callTool(child, 3, "creature_status");
+
+      expect(response).toMatchObject({
+        result: {
+          structuredContent: {
+            operations: {
+              creature_compile: { available: true },
+              creature_preview: { available: true },
+            },
+            tooling: {
+              chromiumRender: {
+                available: false,
+                reason: expect.stringMatching(/playwright install chromium|Chromium/u),
+              },
+            },
+          },
+        },
+      });
+
+      await stopServer(child);
+    }, 30_000);
   }
 
   it(

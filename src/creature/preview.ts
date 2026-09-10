@@ -3,9 +3,11 @@ import { createHash, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import { access, copyFile, lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, delimiter, dirname, extname, isAbsolute, join, relative, sep } from "node:path";
 
+import { chromium } from "playwright";
 import sharp, { type Metadata } from "sharp";
+import { z } from "zod";
 
 import {
   CreatureOperationError,
@@ -88,12 +90,42 @@ interface ImageData {
   readonly channels: number;
 }
 
+interface PreviewResolution {
+  readonly width: number;
+  readonly height: number;
+}
+
+export interface PreviewToolAvailability {
+  readonly available: boolean;
+  readonly reason?: string;
+}
+
+const PYTHON_PROBE_TIMEOUT_MS = 5_000;
+const CHROMIUM_PROBE_TIMEOUT_MS = 10_000;
+const PREVIEW_TIMEOUT_MESSAGE =
+  `Creature preview exceeded ${PREVIEW_TIMEOUT_MS} ms; use a smaller asset or retry when the machine is less loaded.`;
+const PREVIEW_CANCELLED_MESSAGE =
+  "Creature preview rendering was cancelled; no preview approval was recorded.";
+
 function sha256(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function previewAbortError(signal: AbortSignal): CreatureOperationError {
+  const reason = signal.reason;
+  const timedOut = isRecord(reason) && reason.kind === "timeout";
+  return new CreatureOperationError(
+    timedOut ? "TIMEOUT" : "CANCELLED",
+    timedOut ? PREVIEW_TIMEOUT_MESSAGE : PREVIEW_CANCELLED_MESSAGE,
+  );
+}
+
+function throwIfPreviewAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw previewAbortError(signal);
 }
 
 function projectPath(root: string, path: string): string {
@@ -190,9 +222,15 @@ async function runCommand(
 }
 
 async function executableOnPath(name: string): Promise<boolean> {
-  const candidates = process.platform === "win32"
-    ? (process.env.PATH ?? "").split(";").filter(Boolean).map((directory) => join(directory, `${name}.exe`))
-    : (process.env.PATH ?? "").split(":").filter(Boolean).map((directory) => join(directory, name));
+  const names = process.platform === "win32" && !extname(name)
+    ? [name, `${name}.exe`]
+    : [name];
+  const candidates = isAbsolute(name)
+    ? names
+    : (process.env.PATH ?? "")
+        .split(delimiter)
+        .filter(Boolean)
+        .flatMap((directory) => names.map((candidate) => join(directory, candidate)));
   for (const candidate of candidates) {
     try {
       if ((await stat(candidate)).isFile()) {
@@ -206,7 +244,14 @@ async function executableOnPath(name: string): Promise<boolean> {
   return false;
 }
 
-async function readPng(path: string): Promise<ImageData> {
+export async function validatePreviewPng(
+  path: string,
+  resolution: PreviewResolution,
+): Promise<void> {
+  await readPng(path, resolution);
+}
+
+async function readPng(path: string, resolution: PreviewResolution): Promise<ImageData> {
   const bytes = await readFile(path).catch(() => {
     throw new CreatureOperationError("TOOLCHAIN_UNAVAILABLE", `The preview renderer did not produce '${basename(path)}'.`, { path });
   });
@@ -215,8 +260,22 @@ async function readPng(path: string): Promise<ImageData> {
   const metadata = await image.metadata().catch(() => {
     throw new CreatureOperationError("TOOLCHAIN_UNAVAILABLE", `The preview renderer produced an unreadable '${basename(path)}'.`, { path });
   });
-  if (metadata.format !== "png" || !metadata.width || !metadata.height || metadata.width < 240 || metadata.height < 240) {
-    throw new CreatureOperationError("TOOLCHAIN_UNAVAILABLE", `The preview renderer produced an invalid '${basename(path)}'.`, { path });
+  if (
+    metadata.format !== "png" ||
+    metadata.width !== resolution.width ||
+    metadata.height !== resolution.height
+  ) {
+    throw new CreatureOperationError(
+      "TOOLCHAIN_UNAVAILABLE",
+      `The preview renderer produced an invalid '${basename(path)}'; expected ${resolution.width}x${resolution.height} PNG pixels.`,
+      {
+        path,
+        expectedWidth: resolution.width,
+        expectedHeight: resolution.height,
+        actualWidth: metadata.width ?? null,
+        actualHeight: metadata.height ?? null,
+      },
+    );
   }
   const rawResult = await image.ensureAlpha().raw().toBuffer({ resolveWithObject: true });
   const raw = rawResult.data;
@@ -376,7 +435,7 @@ async function createBrowserHarness(payloadRoot: string): Promise<{ readonly roo
   const harness = join(temporary, "harness");
   const assets = join(harness, "assets");
   await mkdir(assets, { recursive: true, mode: 0o700 });
-  for (const name of ["pwlaunch.mjs", "silmetrics.mjs", "hero.mjs"]) {
+  for (const name of ["pwlaunch.mjs", "pwprobe.mjs", "silmetrics.mjs", "hero.mjs"]) {
     await copyFile(join(payloadRoot, "harness", name), join(harness, name));
   }
   await copyFile(join(payloadRoot, "harness", "assets", "three-bundle.js"), join(assets, "three-bundle.js"));
@@ -390,6 +449,115 @@ async function createBrowserHarness(payloadRoot: string): Promise<{ readonly roo
   };
 }
 
+function diagnostic(result: CommandResult): string {
+  return result.stderr.trim().replace(/\s+/gu, " ").slice(-400);
+}
+
+export async function probePythonSilhouettes(): Promise<PreviewToolAvailability> {
+  const pythonName = process.env.THREENATIVE_CREATURE_PYTHON?.trim() || "python3";
+  if (!(await executableOnPath(pythonName))) {
+    return {
+      available: false,
+      reason: "python3 is optional and was not found as an executable; install Python 3 with NumPy and Pillow or set THREENATIVE_CREATURE_PYTHON.",
+    };
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort({ kind: "timeout" }), PYTHON_PROBE_TIMEOUT_MS);
+  timer.unref();
+  try {
+    const result = await runCommand(
+      pythonName,
+      ["-c", "import numpy; from PIL import Image"],
+      process.cwd(),
+      controller.signal,
+    );
+    if (controller.signal.aborted) {
+      return {
+        available: false,
+        reason: "python3 was found, but its NumPy/Pillow availability probe timed out; install the dependencies or inspect the interpreter before retrying.",
+      };
+    }
+    if (result.exitCode === 0 && result.signalCode === null && !result.overflow) {
+      return { available: true };
+    }
+    const detail = diagnostic(result);
+    return {
+      available: false,
+      reason: `python3 is present but NumPy/Pillow could not be imported${detail ? ` (${detail})` : ""}; install them with 'python3 -m pip install numpy pillow'.`,
+    };
+  } catch (error) {
+    return {
+      available: false,
+      reason: `python3 is present but the NumPy/Pillow availability probe failed${error instanceof Error ? ` (${error.message.split("\n")[0]})` : ""}; install them with 'python3 -m pip install numpy pillow'.`,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function probeChromiumWithRunner(
+  runner: CreatureRunner,
+  signal: AbortSignal,
+): Promise<CommandResult> {
+  const payloadRoot = await runner.ensurePayload(signal);
+  const harness = await createBrowserHarness(payloadRoot);
+  try {
+    throwIfPreviewAborted(signal);
+    return await runCommand(
+      process.execPath,
+      [join(harness.scriptRoot, "pwprobe.mjs")],
+      harness.root,
+      signal,
+    );
+  } finally {
+    await harness.cleanup();
+  }
+}
+
+export async function probeChromium(
+  runner?: CreatureRunner,
+): Promise<PreviewToolAvailability> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort({ kind: "timeout" }), CHROMIUM_PROBE_TIMEOUT_MS);
+  timer.unref();
+  try {
+    if (runner) {
+      const result = await probeChromiumWithRunner(runner, controller.signal);
+      if (controller.signal.aborted) {
+        return {
+          available: false,
+          reason: "Chromium launch probing timed out; install Chromium with 'npx playwright install chromium' or set PW_CHROMIUM_PATH to a working browser.",
+        };
+      }
+      if (result.exitCode === 0 && result.signalCode === null && !result.overflow) {
+        return { available: true };
+      }
+      const detail = diagnostic(result);
+      return {
+        available: false,
+        reason: `Chromium could not launch${detail ? ` (${detail})` : ""}; run 'npx playwright install chromium' or set PW_CHROMIUM_PATH to an existing Chromium/Chrome binary.`,
+      };
+    }
+
+    const executablePath = process.env.PW_CHROMIUM_PATH?.trim();
+    const browser = await chromium.launch({
+      ...(executablePath ? { executablePath } : {}),
+      args: ["--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader", ...(process.env.PW_NO_SANDBOX === "1" ? ["--no-sandbox"] : [])],
+      timeout: CHROMIUM_PROBE_TIMEOUT_MS,
+    });
+    await browser.close();
+    return { available: true };
+  } catch (error) {
+    return {
+      available: false,
+      reason: `Chromium could not launch${error instanceof Error ? ` (${error.message.split("\n")[0]})` : ""}; run 'npx playwright install chromium' or set PW_CHROMIUM_PATH to an existing Chromium/Chrome binary.`,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function runSilhouette(
   runner: CreatureRunner,
   glbPath: string,
@@ -398,19 +566,21 @@ async function runSilhouette(
 ): Promise<{ readonly backend: CreaturePreviewBackend; readonly metrics: Record<string, unknown> }> {
   const payloadRoot = await runner.ensurePayload(signal);
   const pythonName = process.env.THREENATIVE_CREATURE_PYTHON?.trim() || "python3";
-  const pythonAvailable = process.env.THREENATIVE_CREATURE_PYTHON?.trim()
-    ? true
-    : await executableOnPath(pythonName);
+  const pythonAvailable = await executableOnPath(pythonName);
   if (pythonAvailable) {
     const result = await runCommand(pythonName, [join(payloadRoot, "harness", "outline.py"), glbPath, outputDirectory, "--views", PYTHON_VIEWS], payloadRoot, signal);
+    throwIfPreviewAborted(signal);
     if (result.exitCode === 0 && !result.overflow) {
       const metrics = JSON.parse(await readFile(join(outputDirectory, "metrics.json"), "utf8")) as Record<string, unknown>;
       return { backend: cameraFor("silhouettes", "python-outline"), metrics };
     }
   }
+  throwIfPreviewAborted(signal);
   const harness = await createBrowserHarness(payloadRoot);
   try {
+    throwIfPreviewAborted(signal);
     const result = await runCommand(process.execPath, [join(harness.scriptRoot, "silmetrics.mjs"), glbPath, outputDirectory], harness.root, signal);
+    throwIfPreviewAborted(signal);
     if (result.exitCode !== 0 || result.overflow) {
       throw new CreatureOperationError(
         "TOOLCHAIN_UNAVAILABLE",
@@ -434,7 +604,9 @@ async function runHero(
   const payloadRoot = await runner.ensurePayload(signal);
   const harness = await createBrowserHarness(payloadRoot);
   try {
+    throwIfPreviewAborted(signal);
     const result = await runCommand(process.execPath, [join(harness.scriptRoot, "hero.mjs"), glbPath, outputDirectory], harness.root, signal);
+    throwIfPreviewAborted(signal);
     if (result.exitCode !== 0 || result.overflow) {
       throw new CreatureOperationError(
         "TOOLCHAIN_UNAVAILABLE",
@@ -448,35 +620,172 @@ async function runHero(
   }
 }
 
+const PriorPreviewArtifactSchema = z
+  .object({
+    path: z.string().min(1),
+    sha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    bytes: z.number().int().positive(),
+    included: z.boolean(),
+    omittedReason: z.string().max(500).optional(),
+  })
+  .strict();
+
+const PriorPreviewViewSchema = z
+  .object({
+    name: z.string().min(1),
+    image: PriorPreviewArtifactSchema,
+    thumbnail: PriorPreviewArtifactSchema,
+    measurements: z.record(z.string(), z.unknown()),
+  })
+  .strict();
+
+const PriorPreviewBackendSchema = z
+  .object({
+    id: z.enum(["python-outline", "browser-silmetrics", "browser-hero"]),
+    nativeViewNames: z.array(z.string().min(1)).min(1),
+    camera: z
+      .object({
+        projection: z.literal("perspective"),
+        fovDegrees: z.number().finite().positive(),
+        resolution: z
+          .object({
+            width: z.number().int().positive(),
+            height: z.number().int().positive(),
+          })
+          .strict(),
+        distanceMultiplier: z.number().finite().positive().optional(),
+        initialDistanceMultiplier: z.number().finite().positive().optional(),
+        fitFraction: z.number().finite().positive().optional(),
+      })
+      .strict(),
+  })
+  .strict();
+
+const PriorPreviewReceiptSchema = z
+  .object({
+    operation: z.literal("creature_preview"),
+    mode: z.enum(["silhouettes", "hero"]),
+    glbPath: z.string().min(1),
+    glbSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+    previewId: z.string().regex(/^[a-z0-9-]{8,80}$/u),
+    backend: PriorPreviewBackendSchema,
+    views: z.array(PriorPreviewViewSchema).min(1),
+    encodedImageBudgetBytes: z.literal(IMAGE_BUDGET_BYTES),
+    visualReview: z.literal("notReviewed"),
+    comparison: z
+      .object({
+        previousPreviewId: z.string().min(1),
+        compatible: z.literal(true),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
+
+type PriorPreviewArtifact = z.output<typeof PriorPreviewArtifactSchema>;
+type PriorPreviewReceipt = z.output<typeof PriorPreviewReceiptSchema>;
+
 async function readPriorReceipt(
   root: string,
   previewId: string,
-): Promise<Record<string, unknown>> {
+): Promise<{ readonly directory: string; readonly receipt: PriorPreviewReceipt }> {
   if (!/^[a-z0-9-]{8,80}$/u.test(previewId)) {
     throw new CreatureOperationError("INVALID_SPEC", "previousPreviewId is invalid.");
   }
-  const candidate = join(root, ".threenative", "creatures", "previews", previewId, "receipt.json");
+  const directory = join(root, ".threenative", "creatures", "previews", previewId);
+  const directoryInfo = await lstat(directory).catch(() => undefined);
+  if (!directoryInfo?.isDirectory() || directoryInfo.isSymbolicLink()) {
+    throw new CreatureOperationError("PREVIEW_COMPARISON", "The previous preview directory is missing or unsafe.", { previousPreviewId: previewId });
+  }
+  if (await realpath(directory).catch(() => undefined) !== directory) {
+    throw new CreatureOperationError("PREVIEW_COMPARISON", "The previous preview directory is not an owned real directory.", { previousPreviewId: previewId });
+  }
+  const candidate = join(directory, "receipt.json");
   const candidateInfo = await lstat(candidate).catch(() => undefined);
   if (candidateInfo?.isSymbolicLink()) throw new CreatureOperationError("PREVIEW_COMPARISON", "The previous preview receipt is a symlink and cannot be compared.", { previousPreviewId: previewId });
   const canonical = await realpath(candidate).catch(() => {
     throw new CreatureOperationError("PREVIEW_COMPARISON", "The previous preview receipt is missing; render a complete prior preview before comparing.", { previousPreviewId: previewId });
   });
-  const canonicalRelative = relative(root, canonical);
-  if (isAbsolute(canonicalRelative) || canonicalRelative === ".." || canonicalRelative.startsWith(`..${sep}`)) throw new CreatureOperationError("PREVIEW_COMPARISON", "The previous preview receipt escapes the project root.");
-  const info = await lstat(candidate);
-  if (!info.isFile() || info.isSymbolicLink()) throw new CreatureOperationError("PREVIEW_COMPARISON", "The previous preview receipt is not a regular file.");
+  if (canonical !== candidate) throw new CreatureOperationError("PREVIEW_COMPARISON", "The previous preview receipt is not an owned file in the requested preview directory.", { previousPreviewId: previewId });
+  if (!candidateInfo?.isFile() || candidateInfo.isSymbolicLink()) throw new CreatureOperationError("PREVIEW_COMPARISON", "The previous preview receipt is not a regular file.");
   let parsed: unknown;
   try {
-    parsed = JSON.parse(await readFile(canonical, "utf8")) as unknown;
+    parsed = JSON.parse(await readFile(candidate, "utf8")) as unknown;
   } catch {
     throw new CreatureOperationError("PREVIEW_COMPARISON", "The previous preview receipt is malformed.", { previousPreviewId: previewId });
   }
-  if (!isRecord(parsed)) throw new CreatureOperationError("PREVIEW_COMPARISON", "The previous preview receipt is malformed.", { previousPreviewId: previewId });
-  return parsed;
+  const result = PriorPreviewReceiptSchema.safeParse(parsed);
+  if (!result.success) {
+    throw new CreatureOperationError("PREVIEW_COMPARISON", "The previous preview receipt is malformed or incomplete.", { previousPreviewId: previewId });
+  }
+  if (result.data.previewId !== previewId) {
+    throw new CreatureOperationError("PREVIEW_COMPARISON", "The previous preview receipt does not belong to the requested preview directory.", { previousPreviewId: previewId, receiptPreviewId: result.data.previewId });
+  }
+  return { directory, receipt: result.data };
 }
 
 function sameBackend(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
+}
+
+async function verifyPriorArtifact(
+  root: string,
+  directory: string,
+  mode: CreaturePreviewMode,
+  viewName: string,
+  key: "image" | "thumbnail",
+  artifactValue: PriorPreviewArtifact,
+  resolution: PreviewResolution,
+): Promise<void> {
+  const stem = mode === "hero" ? "hero" : `sil_${viewName}`;
+  const filename = key === "image" ? `${stem}.png` : `${stem}_thumb48.png`;
+  const expectedPath = join(directory, filename);
+  const expectedProjectPath = projectPath(root, expectedPath);
+  if (artifactValue.path !== expectedProjectPath) {
+    throw new CreatureOperationError(
+      "PREVIEW_COMPARISON",
+      `The previous preview '${viewName}' ${key} artifact must use its owned canonical path.`,
+      { view: viewName, artifact: key },
+    );
+  }
+  const info = await lstat(expectedPath).catch(() => undefined);
+  if (
+    !info?.isFile() ||
+    info.isSymbolicLink() ||
+    (await realpath(expectedPath).catch(() => undefined)) !== expectedPath
+  ) {
+    throw new CreatureOperationError(
+      "PREVIEW_COMPARISON",
+      `The previous preview '${viewName}' ${key} artifact is missing or unsafe.`,
+      { view: viewName, artifact: key },
+    );
+  }
+  if (info.size !== artifactValue.bytes) {
+    throw new CreatureOperationError(
+      "PREVIEW_COMPARISON",
+      `The previous preview '${viewName}' ${key} artifact byte count does not match its receipt.`,
+      { view: viewName, artifact: key, expectedBytes: artifactValue.bytes, actualBytes: info.size },
+    );
+  }
+  const bytes = await readFile(expectedPath);
+  if (bytes.length !== artifactValue.bytes || sha256(bytes) !== artifactValue.sha256) {
+    throw new CreatureOperationError(
+      "PREVIEW_COMPARISON",
+      `The previous preview '${viewName}' ${key} artifact hash does not match its receipt.`,
+      { view: viewName, artifact: key },
+    );
+  }
+  if (key === "image") {
+    try {
+      await readPng(expectedPath, resolution);
+    } catch {
+      throw new CreatureOperationError(
+        "PREVIEW_COMPARISON",
+        `The previous preview '${viewName}' image does not match its declared camera resolution.`,
+        { view: viewName, artifact: key, resolution },
+      );
+    }
+  }
 }
 
 async function completeArtifacts(
@@ -484,6 +793,7 @@ async function completeArtifacts(
   directory: string,
   names: readonly string[],
   metrics: Record<string, unknown>,
+  backend: CreaturePreviewBackend,
   signal: AbortSignal,
 ): Promise<{ readonly views: readonly CreaturePreviewView[]; readonly content: readonly PreviewImageContent[]; readonly encodedBytes: number }> {
   const views: CreaturePreviewView[] = [];
@@ -493,7 +803,7 @@ async function completeArtifacts(
   for (const name of names) {
     if (signal.aborted) throw new CreatureOperationError("CANCELLED", "Creature preview rendering was cancelled; no preview approval was recorded.");
     const imagePath = join(directory, names.length === 1 && name === "hero" ? "hero.png" : `sil_${name}.png`);
-    const image = await readPng(imagePath);
+    const image = await readPng(imagePath, backend.camera.resolution);
     const thumbnailPath = join(directory, `${names.length === 1 && name === "hero" ? "hero" : `sil_${name}`}_thumb48.png`);
     const thumbnailBytes = await thumbnail(image, thumbnailPath);
     images.push({ name, image, imagePath, thumbnailPath, thumbnail: thumbnailBytes });
@@ -531,74 +841,82 @@ export async function previewCreature(
     `Creature preview exceeded ${PREVIEW_TIMEOUT_MS} ms; use a smaller asset or retry when the machine is less loaded.`,
     callerSignal,
     async (signal) => {
-      const input = await runner.resolveProjectFile(request.glbPath, "glbPath");
-      const glbBytes = await readFile(input.absolute);
-      const glbSha256 = sha256(glbBytes);
-      const previewId = randomUUID();
-      const preview = await runner.createPreviewDirectory(previewId);
-      let backend: CreaturePreviewBackend;
-      let metrics: Record<string, unknown> = {};
-      if (request.mode === "silhouettes") {
-        const result = await runSilhouette(runner, input.absolute, preview.directory, signal);
-        backend = result.backend;
-        metrics = result.metrics;
-      } else {
-        backend = await runHero(runner, input.absolute, preview.directory, signal);
-      }
-      const names = request.mode === "silhouettes" ? SILHOUETTE_VIEWS : ["hero"] as const;
-      const completed = await completeArtifacts(input.root, preview.directory, names, metrics, signal);
-      let comparison: CreaturePreviewResult["comparison"];
-      if (request.previousPreviewId !== undefined) {
-        const previous = await readPriorReceipt(input.root, request.previousPreviewId);
-        if (!sameBackend(previous.backend, backend)) {
-          throw new CreatureOperationError("PREVIEW_COMPARISON", "The previous preview used a different backend or camera; rerender it with the same backend before comparing.", { previousPreviewId: request.previousPreviewId, previousBackend: previous.backend, backend });
+      try {
+        const input = await runner.resolveProjectFile(request.glbPath, "glbPath");
+        const glbBytes = await readFile(input.absolute);
+        const glbSha256 = sha256(glbBytes);
+        const previewId = randomUUID();
+        const preview = await runner.createPreviewDirectory(previewId);
+        let backend: CreaturePreviewBackend;
+        let metrics: Record<string, unknown> = {};
+        if (request.mode === "silhouettes") {
+          const result = await runSilhouette(runner, input.absolute, preview.directory, signal);
+          backend = result.backend;
+          metrics = result.metrics;
+        } else {
+          backend = await runHero(runner, input.absolute, preview.directory, signal);
         }
-        const previousViews = previous.views;
-        if (!Array.isArray(previousViews) || previousViews.length !== completed.views.length) {
-          throw new CreatureOperationError("PREVIEW_COMPARISON", "The previous preview is missing one or more referenced views.", { previousPreviewId: request.previousPreviewId });
-        }
-        for (const view of completed.views) {
-          const prior = previousViews.find((candidate) => isRecord(candidate) && candidate.name === view.name);
-          if (!isRecord(prior) || !isRecord(prior.image) || typeof prior.image.path !== "string") {
-            throw new CreatureOperationError("PREVIEW_COMPARISON", `The previous preview is missing the '${view.name}' artifact.`, { previousPreviewId: request.previousPreviewId, view: view.name });
+        const names = request.mode === "silhouettes" ? SILHOUETTE_VIEWS : ["hero"] as const;
+        const completed = await completeArtifacts(input.root, preview.directory, names, metrics, backend, signal);
+        let comparison: CreaturePreviewResult["comparison"];
+        if (request.previousPreviewId !== undefined) {
+          const previous = await readPriorReceipt(input.root, request.previousPreviewId);
+          if (
+            previous.receipt.mode !== request.mode ||
+            previous.receipt.glbPath !== input.relative ||
+            previous.receipt.glbSha256 !== glbSha256
+          ) {
+            throw new CreatureOperationError("PREVIEW_COMPARISON", "The previous preview belongs to a different creature or preview mode; rerender it before comparing.", { previousPreviewId: request.previousPreviewId });
           }
-          for (const key of ["image", "thumbnail"] as const) {
-            const artifactValue = prior[key];
-            if (!isRecord(artifactValue) || typeof artifactValue.path !== "string") {
-              throw new CreatureOperationError("PREVIEW_COMPARISON", `The previous preview is missing the '${view.name}' ${key} artifact.`, { previousPreviewId: request.previousPreviewId, view: view.name });
-            }
-            const priorPath = resolve(input.root, artifactValue.path);
-            const relativePath = relative(input.root, priorPath);
-            if (isAbsolute(relativePath) || relativePath === ".." || relativePath.startsWith(`..${sep}`)) {
-              throw new CreatureOperationError("PREVIEW_COMPARISON", `The previous preview '${view.name}' ${key} artifact escapes the project root.`, { previousPreviewId: request.previousPreviewId, view: view.name });
-            }
-            const priorInfo = await lstat(priorPath).catch(() => undefined);
-            if (!priorInfo?.isFile() || priorInfo.isSymbolicLink()) throw new CreatureOperationError("PREVIEW_COMPARISON", `The previous preview '${view.name}' ${key} artifact is missing or unsafe.`, { previousPreviewId: request.previousPreviewId, view: view.name });
+          if (!sameBackend(previous.receipt.backend, backend)) {
+            throw new CreatureOperationError("PREVIEW_COMPARISON", "The previous preview used a different backend or camera; rerender it with the same backend before comparing.", { previousPreviewId: request.previousPreviewId, previousBackend: previous.receipt.backend, backend });
           }
+          const previousViews = previous.receipt.views;
+          const previousNames = previousViews.map((view) => view.name);
+          const completedNames = completed.views.map((view) => view.name);
+          if (
+            previousNames.length !== completedNames.length ||
+            new Set(previousNames).size !== previousNames.length ||
+            new Set(previousNames).size !== new Set(completedNames).size ||
+            completedNames.some((name) => !previousNames.includes(name))
+          ) {
+            throw new CreatureOperationError("PREVIEW_COMPARISON", "The previous preview is missing one or more referenced views.", { previousPreviewId: request.previousPreviewId });
+          }
+          for (const view of completed.views) {
+            const prior = previousViews.find((candidate) => candidate.name === view.name);
+            if (!prior) {
+              throw new CreatureOperationError("PREVIEW_COMPARISON", `The previous preview is missing the '${view.name}' artifact.`, { previousPreviewId: request.previousPreviewId, view: view.name });
+            }
+            await verifyPriorArtifact(input.root, previous.directory, request.mode, view.name, "image", prior.image, previous.receipt.backend.camera.resolution);
+            await verifyPriorArtifact(input.root, previous.directory, request.mode, view.name, "thumbnail", prior.thumbnail, previous.receipt.backend.camera.resolution);
+          }
+          comparison = { previousPreviewId: request.previousPreviewId, compatible: true };
         }
-        comparison = { previousPreviewId: request.previousPreviewId, compatible: true };
+        const receipt = {
+          operation: "creature_preview",
+          mode: request.mode,
+          glbPath: input.relative,
+          glbSha256,
+          previewId,
+          backend,
+          views: completed.views,
+          encodedImageBudgetBytes: IMAGE_BUDGET_BYTES,
+          visualReview: "notReviewed",
+          ...(comparison ? { comparison } : {}),
+        } satisfies Record<string, unknown>;
+        const receiptPath = join(preview.directory, "receipt.json");
+        await writeFile(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+        return {
+          output: {
+            ...receipt,
+            receiptPath: projectPath(input.root, receiptPath),
+          } as CreaturePreviewResult,
+          content: completed.content,
+        };
+      } catch (error) {
+        if (signal.aborted) throw previewAbortError(signal);
+        throw error;
       }
-      const receipt = {
-        operation: "creature_preview",
-        mode: request.mode,
-        glbPath: input.relative,
-        glbSha256,
-        previewId,
-        backend,
-        views: completed.views,
-        encodedImageBudgetBytes: IMAGE_BUDGET_BYTES,
-        visualReview: "notReviewed",
-        ...(comparison ? { comparison } : {}),
-      } satisfies Record<string, unknown>;
-      const receiptPath = join(preview.directory, "receipt.json");
-      await writeFile(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`, { flag: "wx", mode: 0o600 });
-      return {
-        output: {
-          ...receipt,
-          receiptPath: projectPath(input.root, receiptPath),
-        } as CreaturePreviewResult,
-        content: completed.content,
-      };
     },
   );
 }

@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
-import { constants } from "node:fs";
-import { access, readFile, stat } from "node:fs/promises";
-import { delimiter, extname, isAbsolute, join } from "node:path";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -21,6 +20,8 @@ import {
   type CreatureCompileResult,
 } from "../creature/runner.js";
 import {
+  probeChromium,
+  probePythonSilhouettes,
   previewCreature,
   previewError,
 } from "../creature/preview.js";
@@ -428,42 +429,6 @@ async function payload(): Promise<Payload> {
   return payloadPromise;
 }
 
-function executableNames(executable: string): readonly string[] {
-  if (process.platform !== "win32" || extname(executable)) return [executable];
-  const extensions = (process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD")
-    .split(";")
-    .map((extension) => extension.trim())
-    .filter(Boolean)
-    .map((extension) => (extension.startsWith(".") ? extension : `.${extension}`));
-  return [executable, ...extensions.map((extension) => `${executable}${extension}`)];
-}
-
-async function executableFile(candidate: string): Promise<boolean> {
-  try {
-    if (!(await stat(candidate)).isFile()) return false;
-    await access(
-      candidate,
-      process.platform === "win32" ? constants.F_OK : constants.X_OK,
-    );
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function executableAvailable(executable: string): Promise<boolean> {
-  const candidates = isAbsolute(executable)
-    ? executableNames(executable)
-    : (process.env.PATH ?? "")
-        .split(delimiter)
-        .filter(Boolean)
-        .flatMap((directory) => executableNames(join(directory, executable)));
-  for (const candidate of candidates) {
-    if (await executableFile(candidate)) return true;
-  }
-  return false;
-}
-
 function unavailable(reason: string) {
   return { available: false, reason };
 }
@@ -480,7 +445,10 @@ function safeError(error: unknown) {
 
 async function status(): Promise<CreatureStatusOutput> {
   await payload();
-  const pythonAvailable = await executableAvailable("python3");
+  const [pythonProbe, chromiumProbe] = await Promise.all([
+    probePythonSilhouettes(),
+    probeChromium(compileRunner),
+  ]);
   return CreatureStatusOutputSchema.parse({
     ...metadata(),
     operations: {
@@ -498,16 +466,8 @@ async function status(): Promise<CreatureStatusOutput> {
       compiler: compileRunner
         ? { available: true }
         : unavailable("The pinned compiler is packaged; project-local compilation is inactive in this launch root."),
-      pythonSilhouettes: pythonAvailable
-        ? { available: true, executable: "python3" }
-        : {
-            available: false,
-            executable: "python3",
-            reason: "python3 is optional and was not found on PATH.",
-          },
-      chromiumRender: compileRunner
-        ? { available: true, reason: "Chromium is probed when a browser preview is requested; missing browsers return an actionable operation error." }
-        : unavailable("Chromium rendering is probed when the preview increment is active."),
+      pythonSilhouettes: { ...pythonProbe, executable: "python3" },
+      chromiumRender: chromiumProbe,
     },
     limits: compileRunner?.limits ?? CREATURE_LIMITS,
     setup: [
