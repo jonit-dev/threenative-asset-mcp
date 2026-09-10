@@ -55,6 +55,37 @@ const EnvironmentSchema = z.object({
     .default(600_000),
 });
 
+const CreatureLimitsSchema = z
+  .object({
+    specBytes: z.number().int().positive(),
+    glbBytes: z.number().int().positive(),
+    diagnosticsBytes: z.number().int().positive(),
+    compileTimeoutMs: z.number().int().positive(),
+    maxActiveHeavyOperations: z.number().int().positive(),
+  })
+  .strict();
+
+export const CREATURE_LIMITS = Object.freeze({
+  specBytes: 256 * 1_024,
+  glbBytes: 32 * 1_024 * 1_024,
+  diagnosticsBytes: 1 * 1_024 * 1_024,
+  compileTimeoutMs: 60_000,
+  maxActiveHeavyOperations: 1,
+});
+
+export interface CreatureLimits {
+  specBytes: number;
+  glbBytes: number;
+  diagnosticsBytes: number;
+  compileTimeoutMs: number;
+  maxActiveHeavyOperations: number;
+}
+
+export interface CreatureConfig {
+  cacheDir: string;
+  limits: CreatureLimits;
+}
+
 export interface FabConfig {
   directTimeoutMs: number;
   browserTimeoutMs: number;
@@ -177,5 +208,29 @@ export function loadFabConfig(
       : {}),
     minRequestIntervalMs: parsed.FAB_MIN_REQUEST_INTERVAL_MS,
     downloadTimeoutMs: parsed.FAB_DOWNLOAD_TIMEOUT_MS,
+  };
+}
+
+export function loadCreatureConfig(
+  environment: NodeJS.ProcessEnv = process.env,
+): CreatureConfig {
+  const cacheRoot = canonicalPath(
+    environment.XDG_CACHE_HOME?.trim() || join(homedir(), ".cache"),
+  );
+  const cacheDir = canonicalPath(
+    join(cacheRoot, "threenative-asset-mcp", "creature-toolchains"),
+  );
+  if (
+    cacheDir === canonicalPath(homedir()) ||
+    dirname(cacheDir) === cacheDir
+  ) {
+    throw new Error(
+      "The creature toolchain cache must be a dedicated directory, not a filesystem or home root.",
+    );
+  }
+
+  return {
+    cacheDir,
+    limits: CreatureLimitsSchema.parse(CREATURE_LIMITS),
   };
 }

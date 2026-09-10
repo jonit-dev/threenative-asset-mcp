@@ -11,7 +11,15 @@ import {
   type Entry,
   type FileEntry,
 } from "@zip.js/zip.js";
+import type { McpServer, ServerContext } from "@modelcontextprotocol/server";
 import { z } from "zod";
+
+import { CREATURE_LIMITS, type CreatureConfig } from "../config.js";
+import {
+  CreatureOperationError,
+  CreatureRunner,
+  type CreatureCompileResult,
+} from "../creature/runner.js";
 
 const PAYLOAD_VERSION = "1.3.1";
 const PAYLOAD_COMMIT = "44e1abc2c7fe083f19f989c8437c44a141adc7f3";
@@ -118,6 +126,76 @@ export const CreatureGuideInputSchema = z
   .object({ section: z.enum(["overview", "syntax", "low", "mid", "high", "delivery"]) })
   .strict();
 
+export const CreatureCompileInputSchema = z
+  .object({
+    specPath: z.string().trim().min(1).max(1_000),
+    outputPath: z.string().trim().min(1).max(1_000),
+    expectedOutputSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  })
+  .strict();
+
+const CreatureLimitsOutputSchema = z.object({
+  specBytes: z.literal(CREATURE_LIMITS.specBytes),
+  glbBytes: z.literal(CREATURE_LIMITS.glbBytes),
+  diagnosticsBytes: z.literal(CREATURE_LIMITS.diagnosticsBytes),
+  compileTimeoutMs: z.literal(CREATURE_LIMITS.compileTimeoutMs),
+  maxActiveHeavyOperations: z.literal(CREATURE_LIMITS.maxActiveHeavyOperations),
+});
+
+const CreatureCompileSuccessSchema = z.object({
+  operation: z.literal("creature_compile"),
+  specPath: z.string(),
+  outputPath: z.string(),
+  sourceSnapshotPath: z.string(),
+  checksPath: z.string(),
+  diagnosticsPath: z.string(),
+  receiptPath: z.string(),
+  inputSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  outputSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  checksSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  payload: z.object({
+    version: z.literal(PAYLOAD_VERSION),
+    commit: z.literal(PAYLOAD_COMMIT),
+    archiveSha256: z.literal(PAYLOAD_ARCHIVE_SHA256),
+  }),
+  measurements: z.object({
+    bytes: z.number().int().positive(),
+    bounds: z.object({
+      width: z.number().finite().nonnegative(),
+      height: z.number().finite().nonnegative(),
+      length: z.number().finite().nonnegative(),
+    }),
+    vertices: z.number().int().positive(),
+    faces: z.number().int().positive(),
+    joints: z.number().int().positive(),
+    clips: z.array(z.string().min(1)),
+  }),
+  limits: CreatureLimitsOutputSchema,
+  durationMs: z.number().int().nonnegative(),
+  unchanged: z.boolean(),
+});
+
+const CreatureCompileFailureSchema = z.object({
+  operation: z.literal("creature_compile"),
+  code: z.enum([
+    "INVALID_SPEC",
+    "COMPILE_BLOCKED",
+    "OUTPUT_INVALID",
+    "OUTPUT_CONFLICT",
+    "TOOLCHAIN_UNAVAILABLE",
+    "TIMEOUT",
+    "CANCELLED",
+    "BUSY",
+  ]),
+  message: z.string().min(1).max(2_000),
+  detail: z.record(z.string(), z.unknown()),
+});
+
+export const CreatureCompileOutputSchema = z.union([
+  CreatureCompileSuccessSchema,
+  CreatureCompileFailureSchema,
+]);
+
 const AvailabilitySchema = z.object({
   available: z.boolean(),
   reason: z.string().max(1_000).optional(),
@@ -158,6 +236,7 @@ export const CreatureStatusOutputSchema = z.object({
     pythonSilhouettes: AvailabilitySchema.extend({ executable: z.literal("python3") }),
     chromiumRender: AvailabilitySchema,
   }),
+  limits: CreatureLimitsOutputSchema,
   setup: z.array(z.string().max(1_000)).min(1).max(5),
 });
 
@@ -171,6 +250,8 @@ export const CreatureGuideOutputSchema = z.object({
 
 type CreatureStatusOutput = z.output<typeof CreatureStatusOutputSchema>;
 type CreatureGuideOutput = z.output<typeof CreatureGuideOutputSchema>;
+
+let compileRunner: CreatureRunner | undefined;
 
 class CreaturePayloadError extends Error {}
 
@@ -332,12 +413,16 @@ async function status(): Promise<CreatureStatusOutput> {
     operations: {
       creature_status: { available: true },
       creature_guide: { available: true },
-      creature_compile: unavailable("Compilation is not available until the next asset-MCP increment."),
+      creature_compile: compileRunner
+        ? { available: true }
+        : unavailable("Launch the asset MCP from a project root containing .threenative to enable project-local compilation."),
       creature_preview: unavailable("Preview rendering is not available until a later asset-MCP increment."),
       creature_check: unavailable("Creature inspection is not available until a later asset-MCP increment."),
     },
     tooling: {
-      compiler: unavailable("The pinned compiler is packaged but intentionally not activated in this increment."),
+      compiler: compileRunner
+        ? { available: true }
+        : unavailable("The pinned compiler is packaged; project-local compilation is inactive in this launch root."),
       pythonSilhouettes: pythonAvailable
         ? { available: true, executable: "python3" }
         : {
@@ -347,11 +432,103 @@ async function status(): Promise<CreatureStatusOutput> {
           },
       chromiumRender: unavailable("Chromium rendering is not available until the preview increment."),
     },
+    limits: compileRunner?.limits ?? CREATURE_LIMITS,
     setup: [
       "Use creature_guide with section 'syntax' to author a pinned anyCreature 1.3.1 spec.",
-      "Compilation, preview, and inspection are intentionally unavailable in this increment; no browser, credential, or upstream setup is required for discovery.",
+      compileRunner
+        ? "Use creature_compile with project-relative specPath and outputPath values; no browser, credential, setup script, or runtime download is required."
+        : "Create .threenative/creatures in the project launch root and restart this server to activate creature_compile.",
+      "Preview and inspection remain unavailable until later increments.",
     ],
   });
+}
+
+function compileFailure(error: unknown) {
+  if (error instanceof CreatureOperationError) {
+    return CreatureCompileFailureSchema.parse({
+      operation: "creature_compile",
+      code: error.code,
+      message: error.message,
+      detail: error.detail,
+    });
+  }
+  return CreatureCompileFailureSchema.parse({
+    operation: "creature_compile",
+    code: "TOOLCHAIN_UNAVAILABLE",
+    message: "The creature compiler could not complete the local operation.",
+    detail: {},
+  });
+}
+
+export function activateCreatureCompilation(
+  config: CreatureConfig,
+  launchRoot: string,
+): CreatureRunner {
+  compileRunner = new CreatureRunner(config, launchRoot, {
+    archivePath: PAYLOAD_PATH,
+    archiveSha256: PAYLOAD_ARCHIVE_SHA256,
+    version: PAYLOAD_VERSION,
+    commit: PAYLOAD_COMMIT,
+    root: PAYLOAD_ROOT,
+    files: PAYLOAD_FILES,
+  });
+  return compileRunner;
+}
+
+export function registerCreatureCompileTool(
+  server: McpServer,
+  runner: CreatureRunner,
+): void {
+  server.registerTool(
+    "creature_compile",
+    {
+      title: "Compile a project creature",
+      description:
+        "Compile a bounded project-relative anyCreature JSON spec with the fixed packaged 1.3.1 compiler, validate its GLB, and publish it atomically with hash-bound evidence.",
+      inputSchema: CreatureCompileInputSchema,
+      outputSchema: CreatureCompileOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    createCreatureCompileHandler(runner),
+  );
+}
+
+export function createCreatureCompileHandler(runner: CreatureRunner) {
+  return async (
+    rawInput: z.input<typeof CreatureCompileInputSchema>,
+    context: ServerContext,
+  ) => {
+    try {
+      const input = CreatureCompileInputSchema.parse(rawInput);
+      const output: CreatureCompileResult = await runner.compile(
+        {
+          specPath: input.specPath,
+          outputPath: input.outputPath,
+          ...(input.expectedOutputSha256
+            ? { expectedOutputSha256: input.expectedOutputSha256 }
+            : {}),
+        },
+        context.mcpReq.signal,
+      );
+      const validated = CreatureCompileSuccessSchema.parse(output);
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(validated) }],
+        structuredContent: validated,
+      };
+    } catch (error) {
+      const output = compileFailure(error);
+      return {
+        isError: true as const,
+        content: [{ type: "text" as const, text: JSON.stringify(output) }],
+        structuredContent: output,
+      };
+    }
+  };
 }
 
 async function guide(section: GuideSection): Promise<CreatureGuideOutput> {
