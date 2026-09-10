@@ -7,6 +7,8 @@ import {
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import {
+  chmod,
+  lstat,
   mkdtemp,
   mkdir,
   readFile,
@@ -17,11 +19,12 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 import { TextReader, Uint8ArrayWriter, ZipWriter } from "@zip.js/zip.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { CreatureRunner } from "../src/creature/runner.js";
+import type { CreatureRunner } from "../src/creature/runner.js";
 
 const WYVERN_SPEC = {
   name: "ember_crown_wyvern",
@@ -198,6 +201,7 @@ const WYVERN_SPEC = {
 
 const temporaryDirectories: string[] = [];
 let installedCommand = "";
+let InstalledCreatureRunner: typeof CreatureRunner;
 
 function npm(args: readonly string[], cwd: string): string {
   const npmCli = process.env.npm_execpath;
@@ -219,6 +223,11 @@ beforeAll(async () => {
   const consumerDirectory = join(packageDirectory, "consumer");
   npm(["install", "--ignore-scripts", "--no-package-lock", "--prefix", consumerDirectory, tarball], resolve("."));
   installedCommand = join(consumerDirectory, "node_modules", ".bin", "threenative-asset-mcp");
+  const installedRunnerUrl = pathToFileURL(
+    join(consumerDirectory, "node_modules", "threenative-asset-mcp", "dist", "creature", "runner.js"),
+  ).href;
+  const installedModule = await import(installedRunnerUrl) as { CreatureRunner: typeof CreatureRunner };
+  InstalledCreatureRunner = installedModule.CreatureRunner;
   expect(existsSync(installedCommand)).toBe(true);
 }, 30_000);
 
@@ -366,6 +375,123 @@ async function createScaffold(): Promise<string> {
   return root;
 }
 
+async function createFixtureRunner(root: string, fixtureCli: string): Promise<CreatureRunner> {
+  const archiveWriter = new ZipWriter(new Uint8ArrayWriter());
+  await archiveWriter.add("fixture/engine/cli.js", new TextReader(fixtureCli));
+  const archive = Buffer.from(await archiveWriter.close());
+  const archivePath = join(root, `fixture-${createHash("sha256").update(archive).digest("hex").slice(0, 12)}.zip`);
+  await writeFile(archivePath, archive);
+  return new InstalledCreatureRunner(
+    {
+      cacheDir: join(root, `.fixture-cache-${createHash("sha256").update(archive).digest("hex").slice(0, 12)}`),
+      limits: {
+        specBytes: 262_144,
+        glbBytes: 33_554_432,
+        diagnosticsBytes: 1_048_576,
+        compileTimeoutMs: 10_000,
+        maxActiveHeavyOperations: 1,
+      },
+    },
+    root,
+    {
+      archivePath,
+      archiveSha256: hash(archive),
+      version: "fixture",
+      commit: "fixture",
+      root: "fixture/",
+      files: ["engine/cli.js"],
+    },
+  );
+}
+
+function glbBytes(document: Record<string, unknown>, binary = Buffer.alloc(4)): Buffer {
+  let json = Buffer.from(JSON.stringify(document));
+  const jsonPadding = (4 - (json.length % 4)) % 4;
+  if (jsonPadding) json = Buffer.concat([json, Buffer.alloc(jsonPadding, 0x20)]);
+  const binaryPadding = (4 - (binary.length % 4)) % 4;
+  const paddedBinary = binaryPadding ? Buffer.concat([binary, Buffer.alloc(binaryPadding)]) : binary;
+  const header = Buffer.alloc(12);
+  header.write("glTF");
+  header.writeUInt32LE(2, 4);
+  header.writeUInt32LE(12 + 8 + json.length + 8 + paddedBinary.length, 8);
+  const jsonHeader = Buffer.alloc(8);
+  jsonHeader.writeUInt32LE(json.length, 0);
+  jsonHeader.writeUInt32LE(0x4e4f534a, 4);
+  const binaryHeader = Buffer.alloc(8);
+  binaryHeader.writeUInt32LE(paddedBinary.length, 0);
+  binaryHeader.writeUInt32LE(0x004e4942, 4);
+  return Buffer.concat([header, jsonHeader, json, binaryHeader, paddedBinary]);
+}
+
+function validFixtureGlb(extraBytes: number, marker: number): Buffer {
+  const binary = Buffer.alloc(224 + extraBytes);
+  [0, 0, 0, 1, 0, 0, 0, 1, 1].forEach((value, index) => binary.writeFloatLE(value, index * 4));
+  for (let vertex = 0; vertex < 3; vertex += 1) binary.writeFloatLE(1, 60 + vertex * 16);
+  [0, 1, 2].forEach((value, index) => binary.writeUInt32LE(value, 108 + index * 4));
+  [0, 5, 10, 15].forEach((index) => binary.writeFloatLE(1, 120 + index * 4));
+  binary.writeFloatLE(0, 184);
+  binary.writeFloatLE(1, 188);
+  binary.writeFloatLE(1, 204);
+  binary.writeFloatLE(1, 220);
+  if (extraBytes > 0) binary[binary.length - 1] = marker;
+  return glbBytes({
+    asset: { version: "2.0" },
+    scenes: [{ nodes: [0, 1] }],
+    scene: 0,
+    nodes: [{ name: "Root" }, { name: "creature", mesh: 0, skin: 0 }],
+    buffers: [{ byteLength: binary.length }],
+    bufferViews: [
+      { buffer: 0, byteOffset: 0, byteLength: 36 },
+      { buffer: 0, byteOffset: 36, byteLength: 24 },
+      { buffer: 0, byteOffset: 60, byteLength: 48 },
+      { buffer: 0, byteOffset: 108, byteLength: 12 },
+      { buffer: 0, byteOffset: 120, byteLength: 64 },
+      { buffer: 0, byteOffset: 184, byteLength: 8 },
+      { buffer: 0, byteOffset: 192, byteLength: 32 },
+    ],
+    accessors: [
+      { bufferView: 0, componentType: 5126, count: 3, type: "VEC3", min: [0, 0, 0], max: [1, 1, 1] },
+      { bufferView: 1, componentType: 5123, count: 3, type: "VEC4" },
+      { bufferView: 2, componentType: 5126, count: 3, type: "VEC4" },
+      { bufferView: 3, componentType: 5125, count: 3, type: "SCALAR" },
+      { bufferView: 4, componentType: 5126, count: 1, type: "MAT4" },
+      { bufferView: 5, componentType: 5126, count: 2, type: "SCALAR" },
+      { bufferView: 6, componentType: 5126, count: 2, type: "VEC4" },
+    ],
+    meshes: [{ primitives: [{ attributes: { POSITION: 0, JOINTS_0: 1, WEIGHTS_0: 2 }, indices: 3 }] }],
+    skins: [{ joints: [0], inverseBindMatrices: 4 }],
+    animations: [{
+      name: "idle",
+      samplers: [{ input: 5, output: 6 }],
+      channels: [{ sampler: 0, target: { node: 0, path: "rotation" } }],
+    }],
+  }, binary);
+}
+
+async function createSeedCopyRunner(root: string, seedPath: string): Promise<CreatureRunner> {
+  return createFixtureRunner(root, String.raw`
+    const fs = require("fs");
+    const path = require("path");
+    const [, , specPath, outPath] = process.argv;
+    JSON.parse(fs.readFileSync(specPath, "utf8"));
+    fs.mkdirSync(path.dirname(outPath), { recursive: true });
+    const bytes = fs.readFileSync(${JSON.stringify(seedPath)});
+    fs.writeFileSync(outPath, bytes);
+    fs.writeFileSync(outPath.replace(/\.glb$/i, "") + ".checks.json", JSON.stringify({
+      passed: true,
+      checks: [{ name: "fixture", passed: true }],
+      blocking: [],
+      measures: []
+    }));
+    console.log(JSON.stringify({
+      ok: true, out: outPath, bytes: bytes.length,
+      dims: { width: 1, height: 1, length: 1 },
+      verts: 3, faces: 1, joints: 1, anims: ["idle"],
+      checks: "all green", contract: "ok"
+    }));
+  `);
+}
+
 describe("creature_compile installed MCP", () => {
   it("compiles the original three-clip wyvern through the installed bin", async () => {
     const root = await createScaffold();
@@ -505,6 +631,65 @@ describe("creature_compile installed MCP", () => {
     }
   }, 30_000);
 
+  it("should reject a symlinked state directory without changing its target permissions", async () => {
+    if (process.platform === "win32") return;
+    const root = await createScaffold();
+    const outside = await mkdtemp(join(tmpdir(), "creature-state-escape-"));
+    temporaryDirectories.push(outside);
+    await chmod(outside, 0o755);
+    await symlink(outside, join(root, ".threenative", "creatures", ".staging"), "dir");
+    await writeFile(join(root, ".threenative", "creatures", "wyvern.json"), JSON.stringify(WYVERN_SPEC, null, 2));
+    const { child } = await startServer(root);
+    try {
+      const failure = structured(await callTool(child, 2, "creature_compile", {
+        specPath: ".threenative/creatures/wyvern.json",
+        outputPath: "assets/creatures/wyvern.glb",
+      }));
+      expect(failure).toMatchObject({ code: "INVALID_SPEC", operation: "creature_compile" });
+      expect((await lstat(outside)).mode & 0o777).toBe(0o755);
+    } finally {
+      await stopServer(child);
+    }
+  }, 30_000);
+
+  it("should keep the active owner's lock when a second server is busy", async () => {
+    if (process.platform !== "linux") return;
+    const root = await createScaffold();
+    await writeFile(join(root, ".threenative", "creatures", "wyvern.json"), JSON.stringify(WYVERN_SPEC, null, 2));
+    const owner = await startServer(root);
+    const contender = await startServer(root);
+    try {
+      const ownerResponse = nextResponse(owner.child, 2, 90_000);
+      send(owner.child, {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: "creature_compile",
+          arguments: {
+            specPath: ".threenative/creatures/wyvern.json",
+            outputPath: "assets/creatures/wyvern.glb",
+          },
+        },
+      });
+      await waitForCompilerChild(owner.child.pid ?? 0);
+      const busy = structured(await callTool(contender.child, 2, "creature_compile", {
+        specPath: ".threenative/creatures/wyvern.json",
+        outputPath: "assets/creatures/wyvern.glb",
+      }));
+      expect(busy).toMatchObject({ code: "BUSY", detail: { retryable: true } });
+      const locks = await readdir(join(root, ".threenative", "creatures", ".locks"));
+      expect(locks.filter((name) => name.endsWith(".lock"))).toHaveLength(1);
+      expect(structured(await ownerResponse)).toMatchObject({
+        operation: "creature_compile",
+        outputSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+      });
+      expect(await readdir(join(root, ".threenative", "creatures", ".locks"))).toEqual([]);
+    } finally {
+      await Promise.all([stopServer(owner.child), stopServer(contender.child)]);
+    }
+  }, 120_000);
+
   it("should terminate the compiler when the call is cancelled", async () => {
     if (process.platform !== "linux") return;
     const root = await createScaffold();
@@ -559,6 +744,26 @@ describe("creature_compile installed MCP", () => {
     }
   }, 120_000);
 
+  it("should force-kill a compiler that ignores a late cancellation", async () => {
+    if (process.platform === "win32") return;
+    const root = await createScaffold();
+    await writeFile(join(root, ".threenative", "creatures", "wyvern.json"), JSON.stringify(WYVERN_SPEC, null, 2));
+    const runner = await createFixtureRunner(root, String.raw`
+      process.on("SIGTERM", () => {});
+      setTimeout(() => process.exit(0), 4000);
+    `);
+    const controller = new AbortController();
+    const startedAt = Date.now();
+    const compilation = runner.compile({
+      specPath: ".threenative/creatures/wyvern.json",
+      outputPath: "assets/creatures/resistant.glb",
+    }, controller.signal);
+    setTimeout(() => controller.abort("late cancellation"), 1_000);
+    await expect(compilation).rejects.toMatchObject({ code: "CANCELLED" });
+    expect(Date.now() - startedAt).toBeLessThan(2_500);
+    await runner.close();
+  }, 10_000);
+
   it("should reject a stale writer when the output hash changes", async () => {
     if (process.platform !== "linux") return;
     const root = await createScaffold();
@@ -598,6 +803,120 @@ describe("creature_compile installed MCP", () => {
       await stopServer(child);
     }
   }, 120_000);
+
+  it("should preserve the previous GLB when retained checks conflict", async () => {
+    const root = await createScaffold();
+    const specPath = join(root, ".threenative", "creatures", "wyvern.json");
+    const outputPath = join(root, "assets", "creatures", "wyvern.glb");
+    await writeFile(specPath, JSON.stringify(WYVERN_SPEC, null, 2));
+    const { child } = await startServer(root);
+    try {
+      const first = structured(await callTool(child, 2, "creature_compile", {
+        specPath: ".threenative/creatures/wyvern.json",
+        outputPath: "assets/creatures/wyvern.glb",
+      }));
+      const previous = await readFile(outputPath);
+      const revised = cloneSpec();
+      reviseWing(revised, "#cf5432");
+      await writeFile(specPath, JSON.stringify(revised, null, 2));
+      const probe = structured(await callTool(child, 3, "creature_compile", {
+        specPath: ".threenative/creatures/wyvern.json",
+        outputPath: "assets/creatures/probe.glb",
+      }));
+      const destinationKey = createHash("sha256")
+        .update("assets/creatures/wyvern.glb")
+        .digest("hex")
+        .slice(0, 24);
+      const retainedChecks = join(
+        root,
+        ".threenative",
+        "creatures",
+        "checks",
+        `${destinationKey}-${probe.outputSha256 as string}.checks.json`,
+      );
+      await writeFile(retainedChecks, "conflicting retained checks\n");
+
+      const failure = structured(await callTool(child, 4, "creature_compile", {
+        specPath: ".threenative/creatures/wyvern.json",
+        outputPath: "assets/creatures/wyvern.glb",
+        expectedOutputSha256: first.outputSha256,
+      }));
+      expect(failure).toMatchObject({ code: "OUTPUT_CONFLICT", operation: "creature_compile" });
+      expect(await readFile(outputPath)).toEqual(previous);
+    } finally {
+      await stopServer(child);
+    }
+  }, 120_000);
+
+  it("should preserve the previous GLB when cancelled in the publication window", async () => {
+    if (process.platform === "win32") return;
+    const root = await createScaffold();
+    const specPath = join(root, ".threenative", "creatures", "wyvern.json");
+    const outputPath = join(root, "assets", "creatures", "publication.glb");
+    const seedPath = join(root, ".threenative", "creatures", "large-valid.glb");
+    await writeFile(specPath, JSON.stringify(WYVERN_SPEC, null, 2));
+    const previous = validFixtureGlb(0, 1);
+    const replacement = validFixtureGlb(30 * 1_024 * 1_024, 2);
+    await writeFile(outputPath, previous);
+    await writeFile(seedPath, replacement);
+    const runner = await createSeedCopyRunner(root, seedPath);
+    const controller = new AbortController();
+    const compilation = runner.compile({
+      specPath: ".threenative/creatures/wyvern.json",
+      outputPath: "assets/creatures/publication.glb",
+      expectedOutputSha256: hash(previous),
+    }, controller.signal);
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      const names = await readdir(join(root, "assets", "creatures"));
+      if (names.some((name) => name.startsWith(".publication.glb.") && name.endsWith(".tmp"))) break;
+      await new Promise((resolveWait) => setTimeout(resolveWait, 1));
+    }
+    const publicationTemps = (await readdir(join(root, "assets", "creatures")))
+      .filter((name) => name.startsWith(".publication.glb.") && name.endsWith(".tmp"));
+    expect(publicationTemps).toHaveLength(1);
+    controller.abort("publication-window cancellation");
+    await expect(compilation).rejects.toMatchObject({ code: "CANCELLED" });
+    expect(hash(await readFile(outputPath))).toBe(hash(previous));
+    expect(await readdir(join(root, ".threenative", "creatures", "receipts"))).toEqual([]);
+    await runner.close();
+  }, 30_000);
+
+  it("should roll back the GLB when receipt finalization fails", async () => {
+    if (process.platform === "win32") return;
+    const root = await createScaffold();
+    const stateRoot = join(root, ".threenative", "creatures");
+    const specPath = join(stateRoot, "wyvern.json");
+    const outputPath = join(root, "assets", "creatures", "evidence.glb");
+    const seedPath = join(stateRoot, "large-valid.glb");
+    const receiptsPath = join(stateRoot, "receipts");
+    await writeFile(specPath, JSON.stringify(WYVERN_SPEC, null, 2));
+    const previous = validFixtureGlb(0, 3);
+    await writeFile(outputPath, previous);
+    await writeFile(seedPath, validFixtureGlb(30 * 1_024 * 1_024, 4));
+    const runner = await createSeedCopyRunner(root, seedPath);
+    try {
+      const compilation = runner.compile({
+        specPath: ".threenative/creatures/wyvern.json",
+        outputPath: "assets/creatures/evidence.glb",
+        expectedOutputSha256: hash(previous),
+      });
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        const names = await readdir(join(root, "assets", "creatures"));
+        if (names.some((name) => name.startsWith(".evidence.glb.") && name.endsWith(".tmp"))) break;
+        await new Promise((resolveWait) => setTimeout(resolveWait, 1));
+      }
+      await chmod(receiptsPath, 0o500);
+      await expect(compilation).rejects.toMatchObject({ code: "TOOLCHAIN_UNAVAILABLE" });
+      expect(hash(await readFile(outputPath))).toBe(hash(previous));
+      await chmod(receiptsPath, 0o700);
+      expect((await readdir(receiptsPath)).filter((name) => name.endsWith(".json"))).toEqual([]);
+    } finally {
+      await chmod(receiptsPath, 0o700).catch(() => undefined);
+      await runner.close();
+    }
+  }, 30_000);
 
   it("runs the pinned green and red calibrations from their extracted reference paths", async () => {
     const root = await createScaffold();
@@ -663,32 +982,7 @@ describe("creature_compile installed MCP", () => {
         checks: "all green", contract: "ok"
       }));
     `;
-    const archiveWriter = new ZipWriter(new Uint8ArrayWriter());
-    await archiveWriter.add("fixture/engine/cli.js", new TextReader(fixtureCli));
-    const archive = Buffer.from(await archiveWriter.close());
-    const archivePath = join(root, "fixture.zip");
-    await writeFile(archivePath, archive);
-    const runner = new CreatureRunner(
-      {
-        cacheDir: join(root, ".fixture-cache"),
-        limits: {
-          specBytes: 262_144,
-          glbBytes: 33_554_432,
-          diagnosticsBytes: 1_048_576,
-          compileTimeoutMs: 60_000,
-          maxActiveHeavyOperations: 1,
-        },
-      },
-      root,
-      {
-        archivePath,
-        archiveSha256: hash(archive),
-        version: "fixture",
-        commit: "fixture",
-        root: "fixture/",
-        files: ["engine/cli.js"],
-      },
-    );
+    const runner = await createFixtureRunner(root, fixtureCli);
 
     await expect(
       runner.compile({
@@ -697,6 +991,65 @@ describe("creature_compile installed MCP", () => {
       }),
     ).rejects.toMatchObject({ code: "OUTPUT_INVALID" });
     expect(existsSync(join(root, "assets", "creatures", "corrupt.glb"))).toBe(false);
+    await runner.close();
+  }, 30_000);
+
+  it("rejects a header-valid GLB whose accessors escape the embedded BIN", async () => {
+    const root = await createScaffold();
+    await writeFile(join(root, ".threenative", "creatures", "wyvern.json"), JSON.stringify(WYVERN_SPEC, null, 2));
+    const malformed = glbBytes({
+      asset: { version: "2.0" },
+      scenes: [{ nodes: [0, 1] }],
+      scene: 0,
+      nodes: [{ name: "Root" }, { name: "creature", mesh: 0, skin: 0 }],
+      buffers: [{ byteLength: 4 }],
+      bufferViews: [
+        { buffer: 0, byteOffset: 0, byteLength: 64 },
+      ],
+      accessors: [
+        { bufferView: 0, componentType: 5126, count: 3, type: "VEC3", min: [0, 0, 0], max: [1, 1, 1] },
+        { bufferView: 0, componentType: 5123, count: 3, type: "VEC4" },
+        { bufferView: 0, componentType: 5126, count: 3, type: "VEC4" },
+        { bufferView: 0, componentType: 5125, count: 3, type: "SCALAR" },
+        { bufferView: 0, componentType: 5126, count: 1, type: "MAT4" },
+        { bufferView: 0, componentType: 5126, count: 2, type: "SCALAR" },
+        { bufferView: 0, componentType: 5126, count: 2, type: "VEC4" },
+      ],
+      meshes: [{ primitives: [{ attributes: { POSITION: 0, JOINTS_0: 1, WEIGHTS_0: 2 }, indices: 3 }] }],
+      skins: [{ joints: [0], inverseBindMatrices: 4 }],
+      animations: [{
+        name: "idle",
+        samplers: [{ input: 5, output: 6 }],
+        channels: [{ sampler: 0, target: { node: 0, path: "rotation" } }],
+      }],
+    });
+    const fixtureCli = String.raw`
+      const fs = require("fs");
+      const path = require("path");
+      const [, , specPath, outPath] = process.argv;
+      JSON.parse(fs.readFileSync(specPath, "utf8"));
+      fs.mkdirSync(path.dirname(outPath), { recursive: true });
+      const bytes = Buffer.from("${malformed.toString("base64")}", "base64");
+      fs.writeFileSync(outPath, bytes);
+      fs.writeFileSync(outPath.replace(/\.glb$/i, "") + ".checks.json", JSON.stringify({
+        passed: true,
+        checks: [{ name: "fixture", passed: true }],
+        blocking: [],
+        measures: []
+      }));
+      console.log(JSON.stringify({
+        ok: true, out: outPath, bytes: bytes.length,
+        dims: { width: 1, height: 1, length: 1 },
+        verts: 3, faces: 1, joints: 1, anims: ["idle"],
+        checks: "all green", contract: "ok"
+      }));
+    `;
+    const runner = await createFixtureRunner(root, fixtureCli);
+    await expect(runner.compile({
+      specPath: ".threenative/creatures/wyvern.json",
+      outputPath: "assets/creatures/out-of-range.glb",
+    })).rejects.toMatchObject({ code: "OUTPUT_INVALID" });
+    expect(existsSync(join(root, "assets", "creatures", "out-of-range.glb"))).toBe(false);
     await runner.close();
   }, 30_000);
 });

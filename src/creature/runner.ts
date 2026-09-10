@@ -5,6 +5,7 @@ import {
   copyFile,
   chmod,
   lstat,
+  link,
   mkdir,
   mkdtemp,
   open,
@@ -394,15 +395,87 @@ function parseGlb(bytes: Buffer): GlbIdentity {
   const nodes = document.nodes;
   const animations = document.animations;
   const accessors = document.accessors;
+  const bufferViews = document.bufferViews;
   if (!Array.isArray(buffers) || buffers.length !== 1 || !isRecord(buffers[0]) || "uri" in buffers[0]) {
     throw new CreatureOperationError("OUTPUT_INVALID", "The GLB must have one embedded buffer and no external URI.");
   }
-  if (!Array.isArray(meshes) || meshes.length !== 1 || !Array.isArray(skins) || skins.length !== 1 || !Array.isArray(nodes) || !Array.isArray(accessors)) {
+  if (!Array.isArray(meshes) || meshes.length !== 1 || !Array.isArray(skins) || skins.length !== 1 || !Array.isArray(nodes) || !Array.isArray(accessors) || !Array.isArray(bufferViews)) {
     throw new CreatureOperationError("OUTPUT_INVALID", "The GLB must contain one mesh, one skin, and a node table.");
   }
   if ((Array.isArray(document.images) && document.images.length > 0) || (Array.isArray(document.textures) && document.textures.length > 0) || document.extensionsRequired !== undefined) {
     throw new CreatureOperationError("OUTPUT_INVALID", "The GLB contains externalizable media or required extensions outside the creature output contract.");
   }
+  const binary = chunks[1]?.data;
+  const declaredBinaryLength = buffers[0].byteLength;
+  if (
+    !binary ||
+    !Number.isInteger(declaredBinaryLength) ||
+    (declaredBinaryLength as number) <= 0 ||
+    (declaredBinaryLength as number) > binary.length ||
+    binary.length - (declaredBinaryLength as number) > 3
+  ) {
+    throw new CreatureOperationError("OUTPUT_INVALID", "The GLB embedded BIN length is invalid.");
+  }
+  for (const view of bufferViews) {
+    if (!isRecord(view)) throw new CreatureOperationError("OUTPUT_INVALID", "The GLB contains an invalid bufferView.");
+    const byteOffset = view.byteOffset ?? 0;
+    if (
+      view.buffer !== 0 ||
+      !Number.isInteger(byteOffset) ||
+      (byteOffset as number) < 0 ||
+      !Number.isInteger(view.byteLength) ||
+      (view.byteLength as number) <= 0 ||
+      (byteOffset as number) + (view.byteLength as number) > (declaredBinaryLength as number)
+    ) {
+      throw new CreatureOperationError("OUTPUT_INVALID", "A GLB bufferView escapes the embedded BIN.");
+    }
+  }
+  const componentBytes = new Map<number, number>([
+    [5120, 1], [5121, 1], [5122, 2], [5123, 2], [5125, 4], [5126, 4],
+  ]);
+  const typeComponents = new Map<string, number>([
+    ["SCALAR", 1], ["VEC2", 2], ["VEC3", 3], ["VEC4", 4], ["MAT2", 4], ["MAT3", 9], ["MAT4", 16],
+  ]);
+  const accessorLayout = (index: number) => {
+    const accessor = accessors[index];
+    if (!isRecord(accessor) || "sparse" in accessor || !Number.isInteger(accessor.bufferView)) {
+      throw new CreatureOperationError("OUTPUT_INVALID", "The GLB contains an unsupported or unbound accessor.");
+    }
+    const view = bufferViews[accessor.bufferView as number];
+    if (!isRecord(view)) throw new CreatureOperationError("OUTPUT_INVALID", "A GLB accessor references a missing bufferView.");
+    const bytesPerComponent = componentBytes.get(accessor.componentType as number);
+    const components = typeComponents.get(accessor.type as string);
+    const count = accessor.count;
+    const accessorOffset = accessor.byteOffset ?? 0;
+    if (
+      bytesPerComponent === undefined ||
+      components === undefined ||
+      !Number.isInteger(count) ||
+      (count as number) <= 0 ||
+      !Number.isInteger(accessorOffset) ||
+      (accessorOffset as number) < 0
+    ) {
+      throw new CreatureOperationError("OUTPUT_INVALID", "A GLB accessor has an invalid component, type, count, or offset.");
+    }
+    const elementBytes = bytesPerComponent * components;
+    const stride = view.byteStride ?? elementBytes;
+    if (
+      !Number.isInteger(stride) ||
+      (stride as number) < elementBytes ||
+      (stride as number) % bytesPerComponent !== 0 ||
+      (accessorOffset as number) + ((count as number) - 1) * (stride as number) + elementBytes > (view.byteLength as number)
+    ) {
+      throw new CreatureOperationError("OUTPUT_INVALID", "A GLB accessor range escapes its bufferView.");
+    }
+    return {
+      accessor,
+      count: count as number,
+      elementBytes,
+      stride: stride as number,
+      absoluteOffset: (view.byteOffset as number | undefined ?? 0) + (accessorOffset as number),
+    };
+  };
+  for (let index = 0; index < accessors.length; index += 1) accessorLayout(index);
   const skin = skins[0];
   if (!isRecord(skin) || !Array.isArray(skin.joints) || !skin.joints.length || skin.joints.some((joint) => !Number.isInteger(joint) || joint < 0 || joint >= nodes.length)) {
     throw new CreatureOperationError("OUTPUT_INVALID", "The GLB skin has invalid joint bindings.");
@@ -431,6 +504,31 @@ function parseGlb(bytes: Buffer): GlbIdentity {
     if (!isRecord(position) || !isRecord(indices) || !Number.isInteger(position.count) || !Number.isInteger(indices.count) || (position.count as number) <= 0 || (indices.count as number) <= 0 || (indices.count as number) % 3 !== 0 || !Array.isArray(position.min) || !Array.isArray(position.max) || position.min.length !== 3 || position.max.length !== 3) {
       throw new CreatureOperationError("OUTPUT_INVALID", "A GLB creature primitive has invalid position bounds or triangle counts.");
     }
+    const positionLayout = accessorLayout(positionIndex as number);
+    const jointsLayout = accessorLayout(jointsIndex as number);
+    const weightsLayout = accessorLayout(weightsIndex as number);
+    const indicesLayout = accessorLayout(indicesIndex as number);
+    if (
+      position.componentType !== 5126 || position.type !== "VEC3" ||
+      !isRecord(accessors[jointsIndex as number]) || accessors[jointsIndex as number].type !== "VEC4" ||
+      !new Set([5121, 5123]).has(accessors[jointsIndex as number].componentType as number) ||
+      !isRecord(accessors[weightsIndex as number]) || accessors[weightsIndex as number].componentType !== 5126 || accessors[weightsIndex as number].type !== "VEC4" ||
+      indices.type !== "SCALAR" || !new Set([5121, 5123, 5125]).has(indices.componentType as number) ||
+      jointsLayout.count !== positionLayout.count || weightsLayout.count !== positionLayout.count
+    ) {
+      throw new CreatureOperationError("OUTPUT_INVALID", "A GLB creature primitive has incompatible geometry or skin accessor types.");
+    }
+    for (let index = 0; index < indicesLayout.count; index += 1) {
+      const valueOffset = indicesLayout.absoluteOffset + index * indicesLayout.stride;
+      const value = indices.componentType === 5121
+        ? binary.readUInt8(valueOffset)
+        : indices.componentType === 5123
+          ? binary.readUInt16LE(valueOffset)
+          : binary.readUInt32LE(valueOffset);
+      if (value >= positionLayout.count) {
+        throw new CreatureOperationError("OUTPUT_INVALID", "A GLB index references a missing vertex.");
+      }
+    }
     vertices += position.count as number;
     faces += (indices.count as number) / 3;
     for (let axis = 0; axis < 3; axis += 1) {
@@ -444,17 +542,42 @@ function parseGlb(bytes: Buffer): GlbIdentity {
     }
   }
   const jointNodes = new Set(skin.joints as number[]);
+  if (!Number.isInteger(skin.inverseBindMatrices)) {
+    throw new CreatureOperationError("OUTPUT_INVALID", "The GLB skin is missing inverse bind matrices.");
+  }
+  const inverseBind = accessorLayout(skin.inverseBindMatrices as number);
+  if (inverseBind.accessor.componentType !== 5126 || inverseBind.accessor.type !== "MAT4" || inverseBind.count !== skin.joints.length) {
+    throw new CreatureOperationError("OUTPUT_INVALID", "The GLB inverse bind matrices do not match the rig.");
+  }
   if (!Array.isArray(animations)) throw new CreatureOperationError("OUTPUT_INVALID", "The GLB animation table is missing.");
   const clips = animations.map((animation, index) => {
     if (!isRecord(animation) || typeof animation.name !== "string" || !animation.name || !Array.isArray(animation.channels) || !animation.channels.length || !Array.isArray(animation.samplers) || !animation.samplers.length) {
       throw new CreatureOperationError("OUTPUT_INVALID", `GLB animation ${index} has no usable channels or samplers.`);
     }
     for (const channel of animation.channels) {
-      if (!isRecord(channel) || !isRecord(channel.target) || !Number.isInteger(channel.target.node) || (channel.target.node as number) < 0 || (channel.target.node as number) >= nodes.length) {
+      if (!isRecord(channel) || !isRecord(channel.target) || !Number.isInteger(channel.target.node) || (channel.target.node as number) < 0 || (channel.target.node as number) >= nodes.length || !Number.isInteger(channel.sampler) || (channel.sampler as number) < 0 || (channel.sampler as number) >= animation.samplers.length) {
         throw new CreatureOperationError("OUTPUT_INVALID", `GLB animation '${animation.name}' targets a missing node.`);
       }
       if (!jointNodes.has(channel.target.node as number)) {
         throw new CreatureOperationError("OUTPUT_INVALID", `GLB animation '${animation.name}' has a channel that does not bind to its rig.`);
+      }
+      const sampler = animation.samplers[channel.sampler as number];
+      if (!isRecord(sampler) || !Number.isInteger(sampler.input) || !Number.isInteger(sampler.output)) {
+        throw new CreatureOperationError("OUTPUT_INVALID", `GLB animation '${animation.name}' has an invalid sampler.`);
+      }
+      const input = accessorLayout(sampler.input as number);
+      const output = accessorLayout(sampler.output as number);
+      const expectedOutputType = channel.target.path === "rotation"
+        ? "VEC4"
+        : new Set(["translation", "scale"]).has(channel.target.path as string)
+          ? "VEC3"
+          : undefined;
+      if (
+        input.accessor.componentType !== 5126 || input.accessor.type !== "SCALAR" ||
+        output.accessor.componentType !== 5126 || output.accessor.type !== expectedOutputType ||
+        input.count !== output.count
+      ) {
+        throw new CreatureOperationError("OUTPUT_INVALID", `GLB animation '${animation.name}' sampler ranges do not match its target path.`);
       }
     }
     return animation.name;
@@ -523,6 +646,23 @@ async function atomicWrite(path: string, bytes: Uint8Array): Promise<void> {
   } finally {
     await handle?.close().catch(() => undefined);
     await unlink(temporary).catch(() => undefined);
+  }
+}
+
+async function prepareAtomicWrite(path: string, bytes: Uint8Array): Promise<string> {
+  const temporary = join(dirname(path), `.${basename(path)}.${randomUUID()}.tmp`);
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(temporary, "wx", 0o600);
+    await handle.writeFile(bytes);
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    return temporary;
+  } catch (error) {
+    await handle?.close().catch(() => undefined);
+    await unlink(temporary).catch(() => undefined);
+    throw error;
   }
 }
 
@@ -619,6 +759,11 @@ export class CreatureRunner {
     let stagingDirectory: string | undefined;
     let lockPath: string | undefined;
     let lockHandle: Awaited<ReturnType<typeof open>> | undefined;
+    let ownsLock = false;
+    let publicationTemporary: string | undefined;
+    let previousOutputBackup: string | undefined;
+    let receiptTemporary: string | undefined;
+    let publicationCommitted = false;
     try {
       const sourceInfo = await stat(specAbsolute);
       if (!sourceInfo.isFile() || sourceInfo.size > this.limits.specBytes) {
@@ -648,6 +793,7 @@ export class CreatureRunner {
       lockPath = join(state.locks, `${destinationKey}.lock`);
       try {
         lockHandle = await open(lockPath, "wx", 0o600);
+        ownsLock = true;
         await lockHandle.writeFile(JSON.stringify({ pid: process.pid, outputPath: request.outputPath }));
       } catch (error) {
         if (nodeErrorCode(error) === "EEXIST") {
@@ -763,22 +909,6 @@ export class CreatureRunner {
         throw new CreatureOperationError("OUTPUT_CONFLICT", "The output destination changed or escaped before publication.");
       }
       const unchanged = initialOutputSha256 === outputSha256;
-      if (!unchanged) {
-        const publicationTemporary = join(dirname(outputAbsolute), `.${basename(outputAbsolute)}.${randomUUID()}.tmp`);
-        try {
-          await copyFile(stagedOutput, publicationTemporary, constants.COPYFILE_EXCL);
-          const publicationHandle = await open(publicationTemporary, "r");
-          await publicationHandle.sync();
-          await publicationHandle.close();
-          if ((await hashExistingFile(outputAbsolute, this.limits.glbBytes)) !== initialOutputSha256) {
-            throw new CreatureOperationError("OUTPUT_CONFLICT", "The output changed during publication; the stale writer was rejected.");
-          }
-          await rename(publicationTemporary, outputAbsolute);
-        } finally {
-          await unlink(publicationTemporary).catch(() => undefined);
-        }
-      }
-
       const checksAbsolute = join(state.checks, `${destinationKey}-${outputSha256}.checks.json`);
       await this.writeImmutable(checksAbsolute, checksBytes, checksSha256);
       const measurements: CreatureCompileMeasurements = {
@@ -816,22 +946,71 @@ export class CreatureRunner {
         unchanged,
       };
       const receiptBytes = Buffer.from(`${JSON.stringify(receipt, null, 2)}\n`);
-      await this.writeImmutable(receiptAbsolute, receiptBytes, sha256(receiptBytes));
+      receiptTemporary = await prepareAtomicWrite(receiptAbsolute, receiptBytes);
+
+      if (!unchanged) {
+        publicationTemporary = join(dirname(outputAbsolute), `.${basename(outputAbsolute)}.${randomUUID()}.tmp`);
+        await copyFile(stagedOutput, publicationTemporary, constants.COPYFILE_EXCL);
+        const publicationHandle = await open(publicationTemporary, "r");
+        await publicationHandle.sync();
+        await publicationHandle.close();
+        if (initialOutputSha256 !== undefined) {
+          previousOutputBackup = join(dirname(outputAbsolute), `.${basename(outputAbsolute)}.${randomUUID()}.rollback`);
+          await copyFile(outputAbsolute, previousOutputBackup, constants.COPYFILE_EXCL);
+          const backupHandle = await open(previousOutputBackup, "r");
+          await backupHandle.sync();
+          await backupHandle.close();
+          if ((await hashExistingFile(previousOutputBackup, this.limits.glbBytes)) !== initialOutputSha256) {
+            throw new CreatureOperationError("OUTPUT_CONFLICT", "The previous creature output changed while its rollback copy was prepared.");
+          }
+        }
+        if ((await hashExistingFile(outputAbsolute, this.limits.glbBytes)) !== initialOutputSha256) {
+          throw new CreatureOperationError("OUTPUT_CONFLICT", "The output changed during publication; the stale writer was rejected.");
+        }
+        if (signal.aborted) throw this.abortError(signal, diagnosticsAbsolute, root);
+        await rename(publicationTemporary, outputAbsolute);
+        publicationTemporary = undefined;
+        publicationCommitted = true;
+      }
+
+      try {
+        await link(receiptTemporary, receiptAbsolute);
+        await unlink(receiptTemporary).catch(() => undefined);
+        receiptTemporary = undefined;
+      } catch (error) {
+        if (publicationCommitted) {
+          if (previousOutputBackup) {
+            await rename(previousOutputBackup, outputAbsolute);
+            previousOutputBackup = undefined;
+          } else {
+            await unlink(outputAbsolute);
+          }
+          publicationCommitted = false;
+        }
+        throw error;
+      }
+      if (previousOutputBackup) {
+        await unlink(previousOutputBackup).catch(() => undefined);
+        previousOutputBackup = undefined;
+      }
       return {
         ...receipt,
         operation: "creature_compile",
         receiptPath: projectPath(root, receiptAbsolute),
       };
     } catch (error) {
-      if (signal.aborted && !(error instanceof CreatureOperationError && new Set(["TIMEOUT", "CANCELLED"]).has(error.code))) {
+      if (signal.aborted && !publicationCommitted && !(error instanceof CreatureOperationError && new Set(["TIMEOUT", "CANCELLED"]).has(error.code))) {
         throw this.abortError(signal);
       }
       if (error instanceof CreatureOperationError) throw error;
       throw new CreatureOperationError("TOOLCHAIN_UNAVAILABLE", "The creature compiler could not complete local file or toolchain setup.");
     } finally {
       await lockHandle?.close().catch(() => undefined);
-      if (lockPath) await unlink(lockPath).catch(() => undefined);
+      if (ownsLock && lockPath) await unlink(lockPath).catch(() => undefined);
       if (stagingDirectory) await rm(stagingDirectory, { recursive: true, force: true }).catch(() => undefined);
+      if (publicationTemporary) await unlink(publicationTemporary).catch(() => undefined);
+      if (previousOutputBackup) await unlink(previousOutputBackup).catch(() => undefined);
+      if (receiptTemporary) await unlink(receiptTemporary).catch(() => undefined);
       this.destinationLocks.delete(outputAbsolute);
     }
   }
@@ -860,11 +1039,22 @@ export class CreatureRunner {
       checks: join(stateRoot, "checks"),
       receipts: join(stateRoot, "receipts"),
     };
-    for (const path of Object.values(paths)) await mkdir(path, { recursive: true, mode: 0o700 });
     for (const path of Object.values(paths)) {
-      await chmod(path, 0o700);
+      const expected = resolve(path);
+      const before = await canonicalMissingPath(expected);
+      if (before !== expected || !isInside(before, root)) {
+        throw new CreatureOperationError("INVALID_SPEC", "Creature state storage escapes the launch root through a symlink.");
+      }
+      await mkdir(expected, { recursive: true, mode: 0o700 });
+      const info = await lstat(expected);
+      if (info.isSymbolicLink() || !info.isDirectory()) {
+        throw new CreatureOperationError("INVALID_SPEC", "Creature state storage must contain only private directories.");
+      }
       const canonical = await realpath(path);
-      if (!isInside(canonical, root)) throw new CreatureOperationError("INVALID_SPEC", "Creature state storage escapes the launch root.");
+      if (canonical !== expected || !isInside(canonical, root)) {
+        throw new CreatureOperationError("INVALID_SPEC", "Creature state storage escapes the launch root.");
+      }
+      await chmod(expected, 0o700);
     }
     return paths;
   }
@@ -994,31 +1184,36 @@ export class CreatureRunner {
     let capturedBytes = 0;
     let overflow = false;
     let spawnError: Error | undefined;
+    let forceKill: NodeJS.Timeout | undefined;
+    let terminationRequested = false;
+    const requestTermination = () => {
+      if (terminationRequested) return;
+      terminationRequested = true;
+      processGroupSignal(child, "SIGTERM");
+      forceKill = setTimeout(() => processGroupSignal(child, "SIGKILL"), 750);
+      forceKill.unref();
+    };
     const capture = (target: Buffer[], chunk: Buffer) => {
       const remaining = this.limits.diagnosticsBytes - capturedBytes;
       if (remaining > 0) target.push(chunk.subarray(0, remaining));
       capturedBytes += chunk.length;
       if (capturedBytes > this.limits.diagnosticsBytes && !overflow) {
         overflow = true;
-        processGroupSignal(child, "SIGTERM");
+        requestTermination();
       }
     };
     child.stdout?.on("data", (chunk: Buffer) => capture(stdout, chunk));
     child.stderr?.on("data", (chunk: Buffer) => capture(stderr, chunk));
-    const onAbort = () => processGroupSignal(child, "SIGTERM");
+    const onAbort = () => requestTermination();
     signal.addEventListener("abort", onAbort, { once: true });
     if (signal.aborted) onAbort();
-    const forceKill = setTimeout(() => {
-      if (signal.aborted || overflow) processGroupSignal(child, "SIGKILL");
-    }, 750);
-    forceKill.unref();
     const closed = await new Promise<{ exitCode: number | null; signalCode: NodeJS.Signals | null }>((resolveClose) => {
       child.once("error", (error) => {
         spawnError = error;
       });
       child.once("close", (exitCode, signalCode) => resolveClose({ exitCode, signalCode }));
     });
-    clearTimeout(forceKill);
+    if (forceKill) clearTimeout(forceKill);
     signal.removeEventListener("abort", onAbort);
     return {
       ...closed,
