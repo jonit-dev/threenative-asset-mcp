@@ -221,7 +221,9 @@ async function readPng(path: string): Promise<ImageData> {
   const rawResult = await image.ensureAlpha().raw().toBuffer({ resolveWithObject: true });
   const raw = rawResult.data;
   let visible = 0;
-  for (let index = 3; index < raw.length; index += 4) if ((raw[index] ?? 0) > 8) visible += 1;
+  for (let index = 0; index < raw.length; index += 4) {
+    if ((raw[index + 3] ?? 0) > 8 && ((raw[index] ?? 255) < 245 || (raw[index + 1] ?? 255) < 245 || (raw[index + 2] ?? 255) < 245)) visible += 1;
+  }
   if (visible < 100) throw new CreatureOperationError("TOOLCHAIN_UNAVAILABLE", `The preview renderer produced a blank '${basename(path)}'.`, { path });
   return { bytes, metadata, raw, channels: rawResult.info.channels };
 }
@@ -454,12 +456,14 @@ async function readPriorReceipt(
     throw new CreatureOperationError("INVALID_SPEC", "previousPreviewId is invalid.");
   }
   const candidate = join(root, ".threenative", "creatures", "previews", previewId, "receipt.json");
+  const candidateInfo = await lstat(candidate).catch(() => undefined);
+  if (candidateInfo?.isSymbolicLink()) throw new CreatureOperationError("PREVIEW_COMPARISON", "The previous preview receipt is a symlink and cannot be compared.", { previousPreviewId: previewId });
   const canonical = await realpath(candidate).catch(() => {
     throw new CreatureOperationError("PREVIEW_COMPARISON", "The previous preview receipt is missing; render a complete prior preview before comparing.", { previousPreviewId: previewId });
   });
   const canonicalRelative = relative(root, canonical);
   if (isAbsolute(canonicalRelative) || canonicalRelative === ".." || canonicalRelative.startsWith(`..${sep}`)) throw new CreatureOperationError("PREVIEW_COMPARISON", "The previous preview receipt escapes the project root.");
-  const info = await lstat(canonical);
+  const info = await lstat(candidate);
   if (!info.isFile() || info.isSymbolicLink()) throw new CreatureOperationError("PREVIEW_COMPARISON", "The previous preview receipt is not a regular file.");
   let parsed: unknown;
   try {
@@ -568,8 +572,8 @@ export async function previewCreature(
             if (isAbsolute(relativePath) || relativePath === ".." || relativePath.startsWith(`..${sep}`)) {
               throw new CreatureOperationError("PREVIEW_COMPARISON", `The previous preview '${view.name}' ${key} artifact escapes the project root.`, { previousPreviewId: request.previousPreviewId, view: view.name });
             }
-            const priorInfo = await stat(priorPath).catch(() => undefined);
-            if (!priorInfo?.isFile()) throw new CreatureOperationError("PREVIEW_COMPARISON", `The previous preview '${view.name}' ${key} artifact is missing.`, { previousPreviewId: request.previousPreviewId, view: view.name });
+            const priorInfo = await lstat(priorPath).catch(() => undefined);
+            if (!priorInfo?.isFile() || priorInfo.isSymbolicLink()) throw new CreatureOperationError("PREVIEW_COMPARISON", `The previous preview '${view.name}' ${key} artifact is missing or unsafe.`, { previousPreviewId: request.previousPreviewId, view: view.name });
           }
         }
         comparison = { previousPreviewId: request.previousPreviewId, compatible: true };
