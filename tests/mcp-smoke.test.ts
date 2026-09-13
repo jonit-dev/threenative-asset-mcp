@@ -10,6 +10,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { LATEST_PROTOCOL_VERSION } from "@modelcontextprotocol/server";
+import { Document, NodeIO } from "@gltf-transform/core";
+import { Uint8ArrayReader, Uint8ArrayWriter, ZipWriter } from "@zip.js/zip.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { TtlLruCache } from "../src/fab/cache.js";
@@ -78,6 +80,87 @@ function jsonResponse(
     };
     child.stdout.on("data", onData);
   });
+}
+
+async function rigFixtureGlb(): Promise<Uint8Array> {
+  const document = new Document();
+  const buffer = document.createBuffer();
+  const scene = document.createScene("Scene");
+  const hips = document.createNode("Hips");
+  const hand = document.createNode("hand.R");
+  hips.addChild(hand);
+  scene.addChild(hips);
+  const skin = document.createSkin("Rig").addJoint(hips).addJoint(hand);
+  const inverseBind = new Float32Array(32);
+  inverseBind[15] = 1;
+  inverseBind[31] = 1;
+  skin.setInverseBindMatrices(
+    document.createAccessor("ibm").setType("MAT4").setArray(inverseBind).setBuffer(buffer),
+  );
+  const mesh = document.createMesh("Body").addPrimitive(
+    document
+      .createPrimitive()
+      .setAttribute(
+        "POSITION",
+        document
+          .createAccessor("pos")
+          .setType("VEC3")
+          .setArray(new Float32Array([0, 0, 0]))
+          .setBuffer(buffer),
+      )
+      .setAttribute(
+        "JOINTS_0",
+        document
+          .createAccessor("j")
+          .setType("VEC4")
+          .setArray(new Uint16Array([0, 1, 0, 0]))
+          .setBuffer(buffer),
+      )
+      .setAttribute(
+        "WEIGHTS_0",
+        document
+          .createAccessor("w")
+          .setType("VEC4")
+          .setArray(new Float32Array([1, 1, 0, 0]))
+          .setBuffer(buffer),
+      ),
+  );
+  scene.addChild(document.createNode("Body").setMesh(mesh).setSkin(skin));
+  const input = document
+    .createAccessor("time")
+    .setType("SCALAR")
+    .setArray(new Float32Array([0, 1]))
+    .setBuffer(buffer);
+  const output = document
+    .createAccessor("translation")
+    .setType("VEC3")
+    .setArray(new Float32Array([0, 0, 0, 0, 0, 0]))
+    .setBuffer(buffer);
+  const sampler = document
+    .createAnimationSampler()
+    .setInput(input)
+    .setOutput(output)
+    .setInterpolation("LINEAR");
+  document
+    .createAnimation("Walk_Loop")
+    .addSampler(sampler)
+    .addChannel(
+      document
+        .createAnimationChannel()
+        .setSampler(sampler)
+        .setTargetNode(hips)
+        .setTargetPath("translation"),
+    );
+  return await new NodeIO().writeBinary(document);
+}
+
+async function rigLibraryZip(): Promise<Uint8Array> {
+  const writer = new ZipWriter(new Uint8ArrayWriter());
+  await writer.add(
+    "Universal Animation Library[Standard]/Unreal-Godot/UAL1_Standard.glb",
+    new Uint8ArrayReader(await rigFixtureGlb()),
+  );
+  return writer.close();
 }
 
 function send(
@@ -416,6 +499,38 @@ describe("built stdio package", () => {
     const lines = stdout.join("").split("\n").filter(Boolean);
     expect(lines.length).toBeGreaterThanOrEqual(3);
     expect(() => lines.map((line) => JSON.parse(line))).not.toThrow();
+  });
+
+  it("should inspect a rig and its local library over stdio", async () => {
+    const { child } = await startInitializedServer();
+    const directory = await mkdtemp(join(tmpdir(), "asset-mcp-rig-stdio-"));
+    temporaryDirectories.push(directory);
+    const target = join(directory, "aether-02.glb");
+    await writeFile(target, await rigFixtureGlb());
+    const library = join(directory, "UAL1_Standard.zip");
+    await writeFile(library, await rigLibraryZip());
+
+    const response = await callTool(child, 3, "asset_inspect_rig", {
+      target,
+      libraries: [library],
+    });
+
+    expect(response).toMatchObject({
+      result: {
+        structuredContent: {
+          target: { report: { skins: [{ joints: 2 }] } },
+          catalog: [{ id: "ual1/Walk_Loop", variant: "in_place" }],
+        },
+      },
+    });
+    const catalog = (
+      response.result as {
+        structuredContent: { catalog: Array<{ donor: { url: string | null } }> };
+      }
+    ).structuredContent.catalog;
+    expect(catalog[0]?.donor.url).toContain("animation-assets-v0.8.0");
+
+    await stopServer(child);
   });
 
   it("should terminate cleanly", async () => {
