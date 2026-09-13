@@ -84,10 +84,13 @@ try {
     const clips = gltf.animations ?? [];
     const clip = options.clipName ? clips.find(c => c.name === options.clipName) : clips[0];
     let tracks = 0, boundTracks = 0;
+    const boneNames = new Set();
+    model.traverse(o => { if (o.isBone) boneNames.add(o.name); });
     if (clip) {
       tracks = clip.tracks.length;
       for (const track of clip.tracks) {
-        if (THREE.PropertyBinding.findNode(model, track.name)) boundTracks += 1;
+        const head = track.name.replace(/\.(quaternion|position|scale|morphTargetInfluences.*)$/, '');
+        if (boneNames.has(head) || THREE.PropertyBinding.findNode(model, track.name)) boundTracks += 1;
       }
       mixer.clipAction(clip).play();
     }
