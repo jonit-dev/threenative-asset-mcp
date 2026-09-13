@@ -8,6 +8,7 @@ import { acquirePinnedSample, type AcquiredSample } from "../rig/acquire.js";
 import { RIG_CATALOG_SOURCES, buildAnimationCatalog, type RigClipDescriptor } from "../rig/catalog.js";
 import { fitBipedLandmarks, type FittedJoint, type FitOptions } from "../rig/fit.js";
 import { publishOutput } from "../rig/publish.js";
+import { renderPreview } from "../rig/preview.js";
 import { skinDocument } from "../rig/rig.js";
 import {
   inspectLocalAsset,
@@ -513,6 +514,151 @@ export function createAssetAutoRigHandler(options: { limits?: RigLimits } = {}) 
           : error instanceof z.ZodError
             ? { code: "RIG_INVALID_INPUT", message: "The auto-rig request is invalid.", retryable: false }
             : { code: "RIG_INTERNAL", message: "The asset MCP could not complete the auto-rig.", retryable: false };
+      return {
+        isError: true as const,
+        content: [{ type: "text" as const, text: JSON.stringify(safe) }],
+      };
+    }
+  };
+}
+
+export const AssetPreviewAnimationInputSchema = z.object({
+  prepared: PathSchema.describe("Absolute path to a prepared (rigged or retargeted) GLB."),
+  output: PathSchema.describe("Output contact-sheet .png path under projectRoot."),
+  projectRoot: PathSchema.describe("Project root that must contain the output."),
+  clip: z.string().max(300).optional(),
+  times: z.array(z.number().nonnegative()).min(1).max(12).optional(),
+  pose: z
+    .object({
+      bone: z.string().max(64),
+      axis: z.enum(["x", "y", "z"]),
+      degrees: z.number().min(-360).max(360),
+    })
+    .optional(),
+  angles: z.number().int().min(2).max(6).default(3),
+  width: z.number().int().min(64).max(1024).default(384),
+  height: z.number().int().min(64).max(1024).default(384),
+  priorDigest: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+});
+
+export const AssetPreviewAnimationOutputSchema = z.object({
+  status: z.enum(["rendered", "unavailable"]),
+  reason: z.string().max(400).nullable(),
+  backend: z.string().max(200).nullable(),
+  output: z.string().max(4_096).nullable(),
+  contactSheetSha256: z.string().regex(/^[0-9a-f]{64}$/).nullable(),
+  images: z
+    .array(
+      z.object({
+        time: z.number().nonnegative(),
+        angle: z.number().int().nonnegative(),
+        nonBlank: z.boolean(),
+        mean: z.number(),
+        std: z.number(),
+      }),
+    )
+    .max(72),
+  canvas: z
+    .object({
+      width: z.number().int().positive(),
+      height: z.number().int().positive(),
+      columns: z.number().int().positive(),
+      rows: z.number().int().positive(),
+    })
+    .nullable(),
+  bounds: z.object({ min: Vec3Schema, max: Vec3Schema }).nullable(),
+  animations: z.array(z.string().max(300)).max(64),
+  tracks: z.number().int().nonnegative(),
+  boundTracks: z.number().int().nonnegative(),
+  sampledTimes: z.array(z.number().nonnegative()).max(12),
+});
+
+export function createAssetPreviewAnimationHandler(options: { limits?: RigLimits } = {}) {
+  const limits = options.limits ?? RIG_LIMITS;
+  return async (raw: z.input<typeof AssetPreviewAnimationInputSchema>) => {
+    try {
+      const input = AssetPreviewAnimationInputSchema.parse(raw);
+      const resolved = await realpath(input.prepared).catch(() => null);
+      if (!resolved) {
+        throw new RigAssetError("RIG_INVALID_INPUT", `No readable file at ${input.prepared}.`);
+      }
+      const bytes = new Uint8Array(await readFile(resolved));
+      if (bytes.byteLength > limits.maxGlbBytes) {
+        throw new RigAssetError("RIG_INPUT_TOO_LARGE", "The prepared GLB is over the byte limit.");
+      }
+      const times = input.times ?? [0];
+      let preview;
+      try {
+        preview = await renderPreview(bytes, {
+          ...(input.clip ? { clipName: input.clip } : {}),
+          times,
+          ...(input.pose ? { pose: input.pose } : {}),
+          angles: input.angles,
+          width: input.width,
+          height: input.height,
+        });
+      } catch (error) {
+        if (error instanceof RigAssetError && error.code === "RIG_PREVIEW_UNAVAILABLE") {
+          const unavailable = AssetPreviewAnimationOutputSchema.parse({
+            status: "unavailable",
+            reason: error.message,
+            backend: null,
+            output: null,
+            contactSheetSha256: null,
+            images: [],
+            canvas: null,
+            bounds: null,
+            animations: [],
+            tracks: 0,
+            boundTracks: 0,
+            sampledTimes: times,
+          });
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify(unavailable) }],
+            structuredContent: unavailable,
+          };
+        }
+        throw error;
+      }
+
+      const published = await publishOutput({
+        projectRoot: input.projectRoot,
+        outputPath: input.output,
+        bytes: preview.contactSheet,
+        extension: ".png",
+        ...(input.priorDigest ? { priorDigest: input.priorDigest } : {}),
+      });
+      const output = AssetPreviewAnimationOutputSchema.parse({
+        status: "rendered",
+        reason: null,
+        backend: preview.backend,
+        output: published.path,
+        contactSheetSha256: published.sha256,
+        images: preview.images.map((image) => ({
+          time: image.time,
+          angle: image.angle,
+          nonBlank: image.nonBlank,
+          mean: image.mean,
+          std: image.std,
+        })),
+        canvas: preview.canvas,
+        bounds: preview.bounds,
+        animations: preview.animations,
+        tracks: preview.tracks,
+        boundTracks: preview.boundTracks,
+        sampledTimes: preview.sampledTimes,
+      });
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(output) }],
+        structuredContent: output,
+      };
+    } catch (error) {
+      const safe =
+        error instanceof RigAssetError
+          ? { code: error.code, message: error.message, retryable: error.retryable }
+          : error instanceof z.ZodError
+            ? { code: "RIG_INVALID_INPUT", message: "The preview request is invalid.", retryable: false }
+            : { code: "RIG_INTERNAL", message: "The asset MCP could not complete the preview.", retryable: false };
       return {
         isError: true as const,
         content: [{ type: "text" as const, text: JSON.stringify(safe) }],

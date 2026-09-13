@@ -61,6 +61,7 @@ export async function publishOutput(options: {
   outputPath: string;
   bytes: Uint8Array;
   priorDigest?: string;
+  extension?: string;
 }): Promise<PublishedOutput> {
   const root = canonicalPath(options.projectRoot);
   const target = canonicalPath(options.outputPath);
@@ -70,8 +71,9 @@ export async function publishOutput(options: {
       `The output ${options.outputPath} escapes the project root ${options.projectRoot}.`,
     );
   }
-  if (!target.toLowerCase().endsWith(".glb")) {
-    throw new RigAssetError("RIG_INVALID_INPUT", "The rig output must be a .glb path.");
+  const extension = options.extension ?? ".glb";
+  if (!target.toLowerCase().endsWith(extension)) {
+    throw new RigAssetError("RIG_INVALID_INPUT", `The rig output must be a ${extension} path.`);
   }
   const digest = createHash("sha256").update(options.bytes).digest("hex");
   await mkdir(dirname(target), { recursive: true });

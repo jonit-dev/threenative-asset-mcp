@@ -157,8 +157,11 @@ import {
   AssetAutoRigOutputSchema,
   AssetInspectRigInputSchema,
   AssetInspectRigOutputSchema,
+  AssetPreviewAnimationInputSchema,
+  AssetPreviewAnimationOutputSchema,
   createAssetAutoRigHandler,
   createAssetInspectRigHandler,
+  createAssetPreviewAnimationHandler,
 } from "./tools/rig.js";
 
 function packageVersion(): string {
@@ -282,6 +285,24 @@ export function createAssetServer(
       },
     },
     createAssetAutoRigHandler(),
+  );
+
+  server.registerTool(
+    "asset_preview_animation",
+    {
+      title: "Preview a prepared rig or clip",
+      description:
+        "Render a prepared GLB from several angles with an optional clip sample time or explicit bone pose, and publish a nonblank contact sheet under the project root. A missing rendering backend returns an explicit unavailable result instead of claiming success.",
+      inputSchema: AssetPreviewAnimationInputSchema,
+      outputSchema: AssetPreviewAnimationOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    createAssetPreviewAnimationHandler(),
   );
 
   server.registerTool(

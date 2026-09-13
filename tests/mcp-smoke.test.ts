@@ -449,6 +449,7 @@ describe("built stdio package", () => {
       "creature_guide",
       "asset_inspect_rig",
       "asset_auto_rig",
+      "asset_preview_animation",
       "fab_search_assets",
       "fab_get_asset",
       "fab_list_filters",

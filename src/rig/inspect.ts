@@ -37,7 +37,9 @@ export type RigErrorCode =
   | "RIG_ENTRY_NOT_FOUND"
   | "RIG_ACQUISITION_FAILED"
   | "RIG_DIGEST_MISMATCH"
-  | "RIG_OUTPUT_CONFLICT";
+  | "RIG_OUTPUT_CONFLICT"
+  | "RIG_PREVIEW_UNAVAILABLE"
+  | "RIG_PREVIEW_FAILED";
 
 export class RigAssetError extends Error {
   constructor(
