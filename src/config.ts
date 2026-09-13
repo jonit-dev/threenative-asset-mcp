@@ -234,3 +234,35 @@ export function loadCreatureConfig(
     limits: CreatureLimitsSchema.parse(CREATURE_LIMITS),
   };
 }
+
+export interface RigConfig {
+  /** Development cache for explicitly acquired animation sources; never a project asset root. */
+  cacheDir: string;
+  maxDownloadBytes: number;
+  downloadTimeoutMs: number;
+}
+
+export function loadRigConfig(
+  environment: NodeJS.ProcessEnv = process.env,
+): RigConfig {
+  const cacheRoot = canonicalPath(
+    environment.XDG_CACHE_HOME?.trim() || join(homedir(), ".cache"),
+  );
+  const cacheDir = canonicalPath(
+    join(cacheRoot, "threenative-asset-mcp", "animation-sources"),
+  );
+  if (
+    cacheDir === canonicalPath(homedir()) ||
+    dirname(cacheDir) === cacheDir
+  ) {
+    throw new Error(
+      "The animation source cache must be a dedicated directory, not a filesystem or home root.",
+    );
+  }
+
+  return {
+    cacheDir,
+    maxDownloadBytes: 256 * 1024 * 1024,
+    downloadTimeoutMs: 120_000,
+  };
+}

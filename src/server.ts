@@ -152,6 +152,20 @@ import {
   createCreatureGuideHandler,
   createCreatureStatusHandler,
 } from "./tools/creature.js";
+import {
+  AssetAutoRigInputSchema,
+  AssetAutoRigOutputSchema,
+  AssetInspectRigInputSchema,
+  AssetInspectRigOutputSchema,
+  AssetPreviewAnimationInputSchema,
+  AssetPreviewAnimationOutputSchema,
+  AssetRetargetAnimationsInputSchema,
+  AssetRetargetAnimationsOutputSchema,
+  createAssetAutoRigHandler,
+  createAssetInspectRigHandler,
+  createAssetPreviewAnimationHandler,
+  createAssetRetargetAnimationsHandler,
+} from "./tools/rig.js";
 
 function packageVersion(): string {
   const manifest = JSON.parse(
@@ -238,6 +252,78 @@ export function createAssetServer(
       },
     },
     createCreatureGuideHandler(),
+  );
+
+  server.registerTool(
+    "asset_inspect_rig",
+    {
+      title: "Inspect a humanoid rig and its animation donors",
+      description:
+        "Inspect a local humanoid GLB and optional local UAL ZIP/GLB libraries: meshes, joints, suggested bone mappings, clips, attributes, extensions, measured bounds and attachment candidates. Reads only caller-selected local files and downloads nothing.",
+      inputSchema: AssetInspectRigInputSchema,
+      outputSchema: AssetInspectRigOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    createAssetInspectRigHandler(),
+  );
+
+  server.registerTool(
+    "asset_auto_rig",
+    {
+      title: "Auto-rig an unrigged humanoid",
+      description:
+        "Fit an 18-joint humanoid skeleton to an unrigged local GLB by measured geometry landmarks, bind smooth or rigid skin weights and publish the skinned GLB under the project root. Preserves an existing rig unless replaceRig is set; ambiguous anatomy returns a landmark correction request instead of a bad rig.",
+      inputSchema: AssetAutoRigInputSchema,
+      outputSchema: AssetAutoRigOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    createAssetAutoRigHandler(),
+  );
+
+  server.registerTool(
+    "asset_preview_animation",
+    {
+      title: "Preview a prepared rig or clip",
+      description:
+        "Render a prepared GLB from several angles with an optional clip sample time or explicit bone pose, and publish a nonblank contact sheet under the project root. A missing rendering backend returns an explicit unavailable result instead of claiming success.",
+      inputSchema: AssetPreviewAnimationInputSchema,
+      outputSchema: AssetPreviewAnimationOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    createAssetPreviewAnimationHandler(),
+  );
+
+  server.registerTool(
+    "asset_retarget_animations",
+    {
+      title: "Retarget selected donor clips onto a prepared target",
+      description:
+        "Fetch the selected pinned release donors, retarget their clips onto a prepared target skeleton with a world-space rest correction, preserve the target's mesh/materials/UVs and (by default) its existing clips, and publish a game minimal GLB. Root motion requires the matching _RM donor.",
+      inputSchema: AssetRetargetAnimationsInputSchema,
+      outputSchema: AssetRetargetAnimationsOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    createAssetRetargetAnimationsHandler(),
   );
 
   server.registerTool(
