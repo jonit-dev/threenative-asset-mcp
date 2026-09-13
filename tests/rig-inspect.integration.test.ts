@@ -241,19 +241,48 @@ describe("asset_inspect_rig", () => {
     const target = await writeGlb(directory, "aether-02.glb", await humanoidGlb(["Walk"]));
     const result = await call(
       createAssetInspectRigHandler({
-        maxGlbBytes: 64,
-        maxArchiveBytes: 64,
-        maxJoints: 2_048,
-        maxClips: 1_024,
-        maxMeshes: 4_096,
-        maxVertices: 8_000_000,
-        maxEntries: 2_048,
-        maxTextures: 4_096,
+        limits: {
+          maxGlbBytes: 64,
+          maxArchiveBytes: 64,
+          maxJoints: 2_048,
+          maxClips: 1_024,
+          maxMeshes: 4_096,
+          maxVertices: 8_000_000,
+          maxEntries: 2_048,
+          maxTextures: 4_096,
+        },
       }),
       { target },
     );
     expect(result.isError).toBe(true);
     expect(result.content[0]?.text).toContain("RIG_INPUT_TOO_LARGE");
+  });
+
+  it("acquires a pinned sample through the acquirer and still inspects it", async () => {
+    const directory = await temporaryDirectory();
+    const samplePath = await writeGlb(
+      directory,
+      "aether-02-cache.glb",
+      await humanoidGlb(["Walk"]),
+    );
+    const result = await call(
+      createAssetInspectRigHandler({
+        acquire: async (sourceId) => ({
+          path: samplePath,
+          bytes: 1,
+          sha256: "a".repeat(64),
+          alreadyCached: false,
+          sourceUrl: `https://raw.githubusercontent.com/RamonLinares/atlas-09/1b8fb9d54160215c071c5a29a49b1c36dc01f0df/${sourceId}.glb`,
+        }),
+      }),
+      { target: { sourceId: "aether-02" } },
+    );
+    expect(result.isError).toBeUndefined();
+    expect((result.structuredContent.acquisition as { sourceId: string }).sourceId).toBe("aether-02");
+    const targetReport = (
+      result.structuredContent.target as { report: { skins: Array<{ joints: number }> } }
+    ).report;
+    expect(targetReport.skins[0]?.joints).toBe(JOINT_NAMES.length);
   });
 
   it("returns a named ambiguity instead of guessing a mapping", () => {

@@ -34,7 +34,9 @@ export type RigErrorCode =
   | "RIG_INPUT_TOO_LARGE"
   | "RIG_INVALID_GLTF"
   | "RIG_LIMIT_EXCEEDED"
-  | "RIG_ENTRY_NOT_FOUND";
+  | "RIG_ENTRY_NOT_FOUND"
+  | "RIG_ACQUISITION_FAILED"
+  | "RIG_DIGEST_MISMATCH";
 
 export class RigAssetError extends Error {
   constructor(

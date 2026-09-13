@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+import { loadRigConfig } from "../config.js";
+import { acquirePinnedSample, type AcquiredSample } from "../rig/acquire.js";
 import { RIG_CATALOG_SOURCES, buildAnimationCatalog, type RigClipDescriptor } from "../rig/catalog.js";
 import {
   inspectLocalAsset,
@@ -109,10 +111,16 @@ const SourceSchema = z.object({
     .max(8),
 });
 
+const SampleTargetSchema = z.object({
+  sourceId: z.literal("aether-02").describe("Explicitly acquire the pinned AETHER / 02 sample."),
+});
+
 export const AssetInspectRigInputSchema = z.object({
-  target: PathSchema.describe(
-    "Absolute path to the humanoid GLB under inspection (existing rig or unrigged mesh).",
-  ),
+  target: z
+    .union([PathSchema, SampleTargetSchema])
+    .describe(
+      "Absolute path to the humanoid GLB under inspection, or a pinned sample reference to acquire into the development cache.",
+    ),
   libraries: z
     .array(PathSchema)
     .max(8)
@@ -123,6 +131,16 @@ export const AssetInspectRigInputSchema = z.object({
 export const AssetInspectRigOutputSchema = z.object({
   sources: z.array(SourceSchema).max(32),
   target: InspectedGlbSchema,
+  acquisition: z
+    .object({
+      sourceId: z.string().max(64),
+      sourceUrl: z.url().max(2_048),
+      path: z.string().max(4_096),
+      bytes: z.number().int().nonnegative(),
+      sha256: z.string().regex(/^[0-9a-f]{64}$/),
+      alreadyCached: z.boolean(),
+    })
+    .nullable(),
   libraries: z
     .array(
       z.object({
@@ -169,11 +187,35 @@ function variantFor(path: string): "in_place" | "root_motion" {
   return /_rm\.(glb|fbx)$/i.test(path) ? "root_motion" : "in_place";
 }
 
-export function createAssetInspectRigHandler(limits: RigLimits = RIG_LIMITS) {
+export interface AssetInspectRigOptions {
+  limits?: RigLimits;
+  acquire?: (sourceId: string) => Promise<AcquiredSample>;
+}
+
+export function createAssetInspectRigHandler(options: AssetInspectRigOptions = {}) {
+  const limits = options.limits ?? RIG_LIMITS;
+  const acquire =
+    options.acquire ?? ((sourceId: string) => acquirePinnedSample({ sourceId, config: loadRigConfig() }));
   return async (raw: z.input<typeof AssetInspectRigInputSchema>) => {
     try {
       const input = AssetInspectRigInputSchema.parse(raw);
-      const target = await inspectLocalAsset(input.target, limits);
+      let targetPath: string;
+      let acquisition: {
+        sourceId: string;
+        sourceUrl: string;
+        path: string;
+        bytes: number;
+        sha256: string;
+        alreadyCached: boolean;
+      } | null = null;
+      if (typeof input.target === "string") {
+        targetPath = input.target;
+      } else {
+        const acquired = await acquire(input.target.sourceId);
+        targetPath = acquired.path;
+        acquisition = { sourceId: input.target.sourceId, ...acquired };
+      }
+      const target = await inspectLocalAsset(targetPath, limits);
       if (target.kind !== "glb") {
         throw new RigAssetError(
           "RIG_INVALID_INPUT",
@@ -223,6 +265,7 @@ export function createAssetInspectRigHandler(limits: RigLimits = RIG_LIMITS) {
           sha256: target.glb.sha256,
           report: target.glb.report,
         },
+        acquisition,
         libraries,
         catalog,
         attachmentCandidates: target.glb.report.attachmentCandidates,

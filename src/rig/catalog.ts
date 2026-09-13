@@ -1,4 +1,5 @@
 import type { AnimationReport } from "./inspect.js";
+import pinnedCatalog from "./animation-catalog.json" with { type: "json" };
 
 export type RigLibraryVariant = "in_place" | "root_motion";
 
@@ -84,6 +85,33 @@ export interface RigClipDescriptor {
 
 const CALIBRATION_CLIP = /t[\s_-]?pose/i;
 
+export interface PinnedCatalogClip {
+  id: string;
+  library: string;
+  name: string;
+  variant: RigLibraryVariant;
+  calibration: boolean;
+  donor: { url: string; sha256: string; bytes: number; joints: number };
+}
+
+interface PinnedCatalogShape {
+  exporterVersion: string;
+  clips: PinnedCatalogClip[];
+}
+
+const PINNED_CATALOG = pinnedCatalog as PinnedCatalogShape;
+
+export const PINNED_CATALOG_VERSION = PINNED_CATALOG.exporterVersion;
+
+export function pinnedDonorFor(
+  id: string,
+  variant: RigLibraryVariant,
+): PinnedCatalogClip | null {
+  return (
+    PINNED_CATALOG.clips.find((clip) => clip.id === id && clip.variant === variant) ?? null
+  );
+}
+
 export function buildAnimationCatalog(input: {
   libraryId: string;
   variant: RigLibraryVariant;
@@ -92,20 +120,26 @@ export function buildAnimationCatalog(input: {
   animations: readonly AnimationReport[];
   donorUrlFor?: (clipName: string, variant: RigLibraryVariant) => string | null;
 }): RigClipDescriptor[] {
-  return input.animations.map((animation) => ({
-    id: `${input.libraryId}/${animation.name}`,
-    library: input.libraryId,
-    name: animation.name,
-    variant: input.variant,
-    entry: input.entryPath,
-    entrySha256: input.entrySha256,
-    channels: animation.channels,
-    durationSeconds: animation.durationSeconds,
-    calibration: CALIBRATION_CLIP.test(animation.name),
-    donor: {
-      url: input.donorUrlFor?.(animation.name, input.variant) ?? null,
-      sha256: null,
-      bytes: null,
-    },
-  }));
+  return input.animations.map((animation) => {
+    const id = `${input.libraryId}/${animation.name}`;
+    const pinned = pinnedDonorFor(id, input.variant);
+    return {
+      id,
+      library: input.libraryId,
+      name: animation.name,
+      variant: input.variant,
+      entry: input.entryPath,
+      entrySha256: input.entrySha256,
+      channels: animation.channels,
+      durationSeconds: animation.durationSeconds,
+      calibration: pinned?.calibration ?? CALIBRATION_CLIP.test(animation.name),
+      donor: pinned
+        ? { url: pinned.donor.url, sha256: pinned.donor.sha256, bytes: pinned.donor.bytes }
+        : {
+            url: input.donorUrlFor?.(animation.name, input.variant) ?? null,
+            sha256: null,
+            bytes: null,
+          },
+    };
+  });
 }
