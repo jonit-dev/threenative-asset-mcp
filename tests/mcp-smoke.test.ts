@@ -450,6 +450,7 @@ describe("built stdio package", () => {
       "asset_inspect_rig",
       "asset_auto_rig",
       "asset_preview_animation",
+      "asset_retarget_animations",
       "fab_search_assets",
       "fab_get_asset",
       "fab_list_filters",

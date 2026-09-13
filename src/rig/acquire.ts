@@ -3,7 +3,7 @@ import { mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { RigConfig } from "../config.js";
-import { RIG_CATALOG_SOURCES } from "./catalog.js";
+import { RIG_CATALOG_SOURCES, pinnedDonorFor, type RigLibraryVariant } from "./catalog.js";
 import { RigAssetError, sha256 } from "./inspect.js";
 
 export interface AcquiredSample {
@@ -18,6 +18,7 @@ const ALLOWED_HOSTS = new Set([
   "raw.githubusercontent.com",
   "github.com",
   "objects.githubusercontent.com",
+  "release-assets.githubusercontent.com",
 ]);
 
 function assertAllowedHost(url: string): void {
@@ -171,4 +172,37 @@ export async function acquireVerifiedSource(options: {
     await handle?.close().catch(() => undefined);
     await rm(temporary, { force: true }).catch(() => undefined);
   }
+}
+
+function slug(value: string): string {
+  return value.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+}
+
+/** Acquire one selected release donor (mesh-free, rig-bearing) by clip id and variant. */
+export async function acquireDonor(options: {
+  clipId: string;
+  variant: RigLibraryVariant;
+  config: RigConfig;
+  fetchImpl?: typeof fetch;
+}): Promise<AcquiredSample> {
+  const clip = pinnedDonorFor(options.clipId, options.variant);
+  if (!clip) {
+    throw new RigAssetError(
+      "RIG_INVALID_INPUT",
+      `No pinned donor for clip "${options.clipId}" (${options.variant}).`,
+    );
+  }
+  if (clip.calibration) {
+    throw new RigAssetError(
+      "RIG_INVALID_INPUT",
+      `Clip "${options.clipId}" is T-pose calibration data, not a selectable motion.`,
+    );
+  }
+  return acquireVerifiedSource({
+    id: slug(`${options.clipId}-${options.variant}`),
+    sourceUrl: clip.donor.url,
+    sha256: clip.donor.sha256,
+    config: options.config,
+    ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+  });
 }

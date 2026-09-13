@@ -159,9 +159,12 @@ import {
   AssetInspectRigOutputSchema,
   AssetPreviewAnimationInputSchema,
   AssetPreviewAnimationOutputSchema,
+  AssetRetargetAnimationsInputSchema,
+  AssetRetargetAnimationsOutputSchema,
   createAssetAutoRigHandler,
   createAssetInspectRigHandler,
   createAssetPreviewAnimationHandler,
+  createAssetRetargetAnimationsHandler,
 } from "./tools/rig.js";
 
 function packageVersion(): string {
@@ -303,6 +306,24 @@ export function createAssetServer(
       },
     },
     createAssetPreviewAnimationHandler(),
+  );
+
+  server.registerTool(
+    "asset_retarget_animations",
+    {
+      title: "Retarget selected donor clips onto a prepared target",
+      description:
+        "Fetch the selected pinned release donors, retarget their clips onto a prepared target skeleton with a world-space rest correction, preserve the target's mesh/materials/UVs and (by default) its existing clips, and publish a game minimal GLB. Root motion requires the matching _RM donor.",
+      inputSchema: AssetRetargetAnimationsInputSchema,
+      outputSchema: AssetRetargetAnimationsOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    createAssetRetargetAnimationsHandler(),
   );
 
   server.registerTool(

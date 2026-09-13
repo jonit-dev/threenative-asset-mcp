@@ -1,14 +1,17 @@
 import { readFile, realpath } from "node:fs/promises";
 
 import { Document, NodeIO } from "@gltf-transform/core";
+import { ALL_EXTENSIONS } from "@gltf-transform/extensions";
 import { z } from "zod";
 
 import { loadRigConfig } from "../config.js";
-import { acquirePinnedSample, type AcquiredSample } from "../rig/acquire.js";
+import { acquireDonor, acquirePinnedSample, type AcquiredSample } from "../rig/acquire.js";
 import { RIG_CATALOG_SOURCES, buildAnimationCatalog, type RigClipDescriptor } from "../rig/catalog.js";
 import { fitBipedLandmarks, type FittedJoint, type FitOptions } from "../rig/fit.js";
 import { publishOutput } from "../rig/publish.js";
 import { renderPreview } from "../rig/preview.js";
+import { retargetClip } from "../rig/retarget.js";
+import { finalizeDocument } from "../rig/export.js";
 import { skinDocument } from "../rig/rig.js";
 import {
   inspectLocalAsset,
@@ -372,7 +375,7 @@ export const AssetAutoRigOutputSchema = z.object({
   }),
 });
 
-const autoRigIo = new NodeIO();
+const autoRigIo = new NodeIO().registerExtensions(ALL_EXTENSIONS);
 
 async function readTargetDocument(path: string, limits: RigLimits): Promise<Document> {
   const resolved = await realpath(path).catch(() => null);
@@ -659,6 +662,153 @@ export function createAssetPreviewAnimationHandler(options: { limits?: RigLimits
           : error instanceof z.ZodError
             ? { code: "RIG_INVALID_INPUT", message: "The preview request is invalid.", retryable: false }
             : { code: "RIG_INTERNAL", message: "The asset MCP could not complete the preview.", retryable: false };
+      return {
+        isError: true as const,
+        content: [{ type: "text" as const, text: JSON.stringify(safe) }],
+      };
+    }
+  };
+}
+
+const ClipSelectionSchema = z.object({
+  id: z.string().min(1).max(300).describe("Pinned donor clip id, e.g. ual1/Walk_Loop."),
+  variant: z.enum(["in_place", "root_motion"]).describe("Which donor variant to retarget."),
+});
+
+export const AssetRetargetAnimationsInputSchema = z.object({
+  target: PathSchema.describe("Absolute path to the prepared target GLB (e.g. the AETHER sample)."),
+  output: PathSchema.describe("Output .glb path under projectRoot."),
+  projectRoot: PathSchema.describe("Project root that must contain the output."),
+  clips: z.array(ClipSelectionSchema).min(1).max(24),
+  keepExistingClips: z.boolean().default(true),
+  mapping: z.record(z.string().max(64), z.string().max(64)).optional(),
+  priorDigest: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+});
+
+export const AssetRetargetAnimationsOutputSchema = z.object({
+  status: z.literal("retargeted"),
+  output: z.string().max(4_096),
+  bytes: z.number().int().nonnegative(),
+  sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  replaced: z.boolean(),
+  alreadyExisted: z.boolean(),
+  keepExistingClips: z.boolean(),
+  animationBytes: z.number().int().nonnegative(),
+  meshTextureBytes: z.number().int().nonnegative(),
+  animationCount: z.number().int().nonnegative(),
+  clips: z
+    .array(
+      z.object({
+        id: z.string().max(300),
+        variant: z.enum(["in_place", "root_motion"]),
+        durationSeconds: z.number().nonnegative(),
+        frames: z.number().int().positive(),
+        jointTracks: z.number().int().positive(),
+        rootDisplacement: z.number().nonnegative(),
+        omittedRoles: z.array(z.string().max(120)).max(64),
+      }),
+    )
+    .max(24),
+  mapping: z
+    .array(
+      z.object({
+        role: z.string().max(64),
+        side: z.enum(["left", "right"]).nullable(),
+        target: z.string().max(64),
+        source: z.string().max(64),
+      }),
+    )
+    .max(128),
+});
+
+export interface AssetRetargetOptions {
+  limits?: RigLimits;
+  config?: ReturnType<typeof loadRigConfig>;
+  loadDonor?: (clipId: string, variant: "in_place" | "root_motion") => Promise<Document>;
+}
+
+export function createAssetRetargetAnimationsHandler(options: AssetRetargetOptions = {}) {
+  const limits = options.limits ?? RIG_LIMITS;
+  const loadDonor =
+    options.loadDonor ??
+    (async (clipId: string, variant: "in_place" | "root_motion") => {
+      const acquired = await acquireDonor({
+        clipId,
+        variant,
+        config: options.config ?? loadRigConfig(),
+      });
+      return autoRigIo.readBinary(new Uint8Array(await readFile(acquired.path)));
+    });
+  return async (raw: z.input<typeof AssetRetargetAnimationsInputSchema>) => {
+    try {
+      const input = AssetRetargetAnimationsInputSchema.parse(raw);
+      const target = await readTargetDocument(input.target, limits);
+      if (target.getRoot().listSkins().length === 0) {
+        throw new RigAssetError("RIG_INVALID_INPUT", "The retarget target has no skeleton.");
+      }
+      const clipReports: Array<{
+        id: string;
+        variant: "in_place" | "root_motion";
+        durationSeconds: number;
+        frames: number;
+        jointTracks: number;
+        rootDisplacement: number;
+        omittedRoles: string[];
+      }> = [];
+      let lastMapping: Awaited<ReturnType<typeof retargetClip>>["mapping"] = [];
+      for (const clip of input.clips) {
+        const donor = await loadDonor(clip.id, clip.variant);
+        const result = await retargetClip(donor, target, {
+          clipName: clip.id,
+          rootMotion: clip.variant === "root_motion",
+          ...(input.mapping ? { mapping: input.mapping } : {}),
+        });
+        lastMapping = result.mapping;
+        clipReports.push({
+          id: result.clipName,
+          variant: clip.variant,
+          durationSeconds: result.durationSeconds,
+          frames: result.frames,
+          jointTracks: result.jointTracks,
+          rootDisplacement: result.rootDisplacement,
+          omittedRoles: result.omittedRoles,
+        });
+      }
+      const { bytes, report } = await finalizeDocument(target, {
+        keepExistingClips: input.keepExistingClips,
+        addedClipNames: input.clips.map((clip) => clip.id),
+      });
+      const published = await publishOutput({
+        projectRoot: input.projectRoot,
+        outputPath: input.output,
+        bytes,
+        ...(input.priorDigest ? { priorDigest: input.priorDigest } : {}),
+      });
+      const output = AssetRetargetAnimationsOutputSchema.parse({
+        status: "retargeted",
+        output: published.path,
+        bytes: published.bytes,
+        sha256: published.sha256,
+        replaced: published.replaced,
+        alreadyExisted: published.alreadyExisted,
+        keepExistingClips: input.keepExistingClips,
+        animationBytes: report.animationBytes,
+        meshTextureBytes: report.meshTextureBytes,
+        animationCount: report.animationCount,
+        clips: clipReports,
+        mapping: lastMapping,
+      });
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(output) }],
+        structuredContent: output,
+      };
+    } catch (error) {
+      const safe =
+        error instanceof RigAssetError
+          ? { code: error.code, message: error.message, retryable: error.retryable }
+          : error instanceof z.ZodError
+            ? { code: "RIG_INVALID_INPUT", message: "The retarget request is invalid.", retryable: false }
+            : { code: "RIG_INTERNAL", message: "The asset MCP could not complete the retarget.", retryable: false };
       return {
         isError: true as const,
         content: [{ type: "text" as const, text: JSON.stringify(safe) }],
