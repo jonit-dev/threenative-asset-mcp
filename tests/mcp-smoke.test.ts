@@ -364,6 +364,7 @@ describe("built stdio package", () => {
     ).toEqual([
       "creature_status",
       "creature_guide",
+      "asset_inspect_rig",
       "fab_search_assets",
       "fab_get_asset",
       "fab_list_filters",

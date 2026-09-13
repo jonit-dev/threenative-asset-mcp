@@ -152,6 +152,11 @@ import {
   createCreatureGuideHandler,
   createCreatureStatusHandler,
 } from "./tools/creature.js";
+import {
+  AssetInspectRigInputSchema,
+  AssetInspectRigOutputSchema,
+  createAssetInspectRigHandler,
+} from "./tools/rig.js";
 
 function packageVersion(): string {
   const manifest = JSON.parse(
@@ -238,6 +243,24 @@ export function createAssetServer(
       },
     },
     createCreatureGuideHandler(),
+  );
+
+  server.registerTool(
+    "asset_inspect_rig",
+    {
+      title: "Inspect a humanoid rig and its animation donors",
+      description:
+        "Inspect a local humanoid GLB and optional local UAL ZIP/GLB libraries: meshes, joints, suggested bone mappings, clips, attributes, extensions, measured bounds and attachment candidates. Reads only caller-selected local files and downloads nothing.",
+      inputSchema: AssetInspectRigInputSchema,
+      outputSchema: AssetInspectRigOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    createAssetInspectRigHandler(),
   );
 
   server.registerTool(
