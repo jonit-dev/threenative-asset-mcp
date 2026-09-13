@@ -118,7 +118,7 @@ const SourceSchema = z.object({
 });
 
 const SampleTargetSchema = z.object({
-  sourceId: z.literal("aether-02").describe("Explicitly acquire the pinned AETHER / 02 sample."),
+  sourceId: z.enum(["aether-02", "aether-02-retopo"]).describe("Explicitly acquire a pinned sample into the development cache."),
 });
 
 export const AssetInspectRigInputSchema = z.object({

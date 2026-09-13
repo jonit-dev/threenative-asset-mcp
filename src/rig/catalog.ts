@@ -40,6 +40,18 @@ export const RIG_CATALOG_SOURCES: readonly RigCatalogSource[] = [
     sha256: "ed91ecddff69d3de088e475dcf529a5ab410d04b5c61ddb394ed29f482e8ce41",
   },
   {
+    id: "aether-02-retopo",
+    label: "AETHER / 02 unrigged retopology (auto-rig subject)",
+    kind: "sample",
+    license: "CC0",
+    attributionRequired: false,
+    sourceUrl:
+      "https://raw.githubusercontent.com/RamonLinares/atlas-09/1b8fb9d54160215c071c5a29a49b1c36dc01f0df/assets/aether-02/retopo/71b9da3c-c71e-4861-b892-5ab03bf38e6d-model_url.glb",
+    revision: "1b8fb9d54160215c071c5a29a49b1c36dc01f0df",
+    bytes: 3_752_080,
+    sha256: "3fefedfc067dafcd14e020ddfa623795ce69fbb966a8d369b29f0a9615b13641",
+  },
+  {
     id: "ual1",
     label: "Quaternius Universal Animation Library 1 (Standard)",
     kind: "library",

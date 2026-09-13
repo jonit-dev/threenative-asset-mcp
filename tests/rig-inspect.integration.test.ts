@@ -225,7 +225,12 @@ describe("asset_inspect_rig", () => {
     );
 
     const sources = output.sources as Array<{ id: string }>;
-    expect(sources.map((source) => source.id)).toEqual(["aether-02", "ual1", "ual2"]);
+    expect(sources.map((source) => source.id)).toEqual([
+      "aether-02",
+      "aether-02-retopo",
+      "ual1",
+      "ual2",
+    ]);
   });
 
   it("rejects an archive used as the target", async () => {
