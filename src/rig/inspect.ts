@@ -36,7 +36,8 @@ export type RigErrorCode =
   | "RIG_LIMIT_EXCEEDED"
   | "RIG_ENTRY_NOT_FOUND"
   | "RIG_ACQUISITION_FAILED"
-  | "RIG_DIGEST_MISMATCH";
+  | "RIG_DIGEST_MISMATCH"
+  | "RIG_OUTPUT_CONFLICT";
 
 export class RigAssetError extends Error {
   constructor(

@@ -153,8 +153,11 @@ import {
   createCreatureStatusHandler,
 } from "./tools/creature.js";
 import {
+  AssetAutoRigInputSchema,
+  AssetAutoRigOutputSchema,
   AssetInspectRigInputSchema,
   AssetInspectRigOutputSchema,
+  createAssetAutoRigHandler,
   createAssetInspectRigHandler,
 } from "./tools/rig.js";
 
@@ -261,6 +264,24 @@ export function createAssetServer(
       },
     },
     createAssetInspectRigHandler(),
+  );
+
+  server.registerTool(
+    "asset_auto_rig",
+    {
+      title: "Auto-rig an unrigged humanoid",
+      description:
+        "Fit an 18-joint humanoid skeleton to an unrigged local GLB by measured geometry landmarks, bind smooth or rigid skin weights and publish the skinned GLB under the project root. Preserves an existing rig unless replaceRig is set; ambiguous anatomy returns a landmark correction request instead of a bad rig.",
+      inputSchema: AssetAutoRigInputSchema,
+      outputSchema: AssetAutoRigOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    createAssetAutoRigHandler(),
   );
 
   server.registerTool(

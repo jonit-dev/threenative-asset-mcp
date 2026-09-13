@@ -1,8 +1,14 @@
+import { readFile, realpath } from "node:fs/promises";
+
+import { Document, NodeIO } from "@gltf-transform/core";
 import { z } from "zod";
 
 import { loadRigConfig } from "../config.js";
 import { acquirePinnedSample, type AcquiredSample } from "../rig/acquire.js";
 import { RIG_CATALOG_SOURCES, buildAnimationCatalog, type RigClipDescriptor } from "../rig/catalog.js";
+import { fitBipedLandmarks, type FittedJoint, type FitOptions } from "../rig/fit.js";
+import { publishOutput } from "../rig/publish.js";
+import { skinDocument } from "../rig/rig.js";
 import {
   inspectLocalAsset,
   RIG_LIMITS,
@@ -294,6 +300,219 @@ export function createAssetInspectRigHandler(options: AssetInspectRigOptions = {
                 message: "The asset MCP could not complete the rig inspection.",
                 retryable: false,
               };
+      return {
+        isError: true as const,
+        content: [{ type: "text" as const, text: JSON.stringify(safe) }],
+      };
+    }
+  };
+}
+
+const AxisSchema = z.enum(["x", "y", "z"]);
+const JointPositionSchema = z.object({
+  name: z.string().max(64),
+  parent: z.string().max(64).nullable(),
+  position: Vec3Schema,
+  inferred: z.boolean(),
+  ambiguous: z.boolean(),
+});
+
+export const AssetAutoRigInputSchema = z.object({
+  target: PathSchema.describe("Absolute path to an unrigged humanoid GLB."),
+  output: PathSchema.describe("Output .glb path under projectRoot."),
+  projectRoot: PathSchema.describe("Project root that must contain the output."),
+  weightMode: z.enum(["smooth", "rigid"]).default("smooth"),
+  replaceRig: z.boolean().default(false),
+  maxInfluences: z.number().int().min(1).max(4).optional(),
+  priorDigest: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+  overrides: z.record(z.string().max(64), Vec3Schema).optional(),
+  orientation: z
+    .object({
+      up: AxisSchema.optional(),
+      arm: AxisSchema.optional(),
+      facing: AxisSchema.optional(),
+      facingSign: z.union([z.literal(1), z.literal(-1)]).optional(),
+    })
+    .optional(),
+});
+
+export const AssetAutoRigOutputSchema = z.object({
+  status: z.enum(["rigged", "needs-landmarks"]),
+  target: z.string().max(4_096),
+  output: z.string().max(4_096).nullable(),
+  bytes: z.number().int().nonnegative().nullable(),
+  sha256: z.string().regex(/^[0-9a-f]{64}$/).nullable(),
+  replaced: z.boolean(),
+  alreadyExisted: z.boolean(),
+  weightMode: z.enum(["smooth", "rigid"]),
+  joints: z.number().int().nonnegative(),
+  skinnedVertices: z.number().int().nonnegative(),
+  maxInfluences: z.number().int().nonnegative(),
+  maxNormalizationError: z.number().nonnegative(),
+  diagnostics: z.object({
+    finite: z.boolean(),
+    nonNegative: z.boolean(),
+    validJoints: z.boolean(),
+  }),
+  ambiguities: z.array(z.string().max(400)).max(32),
+  landmarks: z.array(JointPositionSchema).max(64),
+  orientation: z.object({
+    up: AxisSchema,
+    arm: AxisSchema,
+    facing: AxisSchema,
+    facingSign: z.union([z.literal(1), z.literal(-1)]),
+  }),
+  measure: z.object({
+    height: z.number().nonnegative(),
+    armSpan: z.number().nonnegative(),
+    facingExtent: z.number().nonnegative(),
+    armSpreadRatio: z.number().nonnegative(),
+    legSeparationRatio: z.number().nonnegative(),
+  }),
+});
+
+const autoRigIo = new NodeIO();
+
+async function readTargetDocument(path: string, limits: RigLimits): Promise<Document> {
+  const resolved = await realpath(path).catch(() => null);
+  if (!resolved) throw new RigAssetError("RIG_INVALID_INPUT", `No readable file at ${path}.`);
+  const bytes = new Uint8Array(await readFile(resolved));
+  if (bytes.byteLength > limits.maxGlbBytes) {
+    throw new RigAssetError("RIG_INPUT_TOO_LARGE", `${path} is over the GLB byte limit.`);
+  }
+  try {
+    return await autoRigIo.readBinary(bytes);
+  } catch {
+    throw new RigAssetError("RIG_INVALID_GLTF", `${path} is not a readable GLB asset.`);
+  }
+}
+
+function collectPositions(document: Document, limits: RigLimits): Float32Array {
+  const chunks: Float32Array[] = [];
+  let total = 0;
+  for (const mesh of document.getRoot().listMeshes()) {
+    for (const primitive of mesh.listPrimitives()) {
+      const array = primitive.getAttribute("POSITION")?.getArray();
+      if (!array) continue;
+      const positions = array instanceof Float32Array ? array : Float32Array.from(array);
+      total += positions.length;
+      if (total / 3 > limits.maxVertices) {
+        throw new RigAssetError("RIG_LIMIT_EXCEEDED", "The model is over the vertex limit.");
+      }
+      chunks.push(positions);
+    }
+  }
+  const merged = new Float32Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return merged;
+}
+
+export function createAssetAutoRigHandler(options: { limits?: RigLimits } = {}) {
+  const limits = options.limits ?? RIG_LIMITS;
+  return async (raw: z.input<typeof AssetAutoRigInputSchema>) => {
+    try {
+      const input = AssetAutoRigInputSchema.parse(raw);
+      const document = await readTargetDocument(input.target, limits);
+      if (document.getRoot().listSkins().length > 0 && !input.replaceRig) {
+        throw new RigAssetError(
+          "RIG_INVALID_INPUT",
+          "The target already has a rig; pass replaceRig to replace it.",
+        );
+      }
+      const positions = collectPositions(document, limits);
+      const fitOptions: FitOptions = {};
+      if (input.orientation?.up) fitOptions.up = input.orientation.up;
+      if (input.orientation?.arm) fitOptions.arm = input.orientation.arm;
+      if (input.orientation?.facing) fitOptions.facing = input.orientation.facing;
+      if (input.orientation?.facingSign) fitOptions.facingSign = input.orientation.facingSign;
+      if (input.overrides) {
+        fitOptions.overrides = input.overrides as Record<string, [number, number, number]>;
+      }
+      const fit = fitBipedLandmarks(positions, fitOptions);
+      if (fit.ambiguities.length > 0 && !input.overrides) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({
+                status: "needs-landmarks",
+                ambiguities: fit.ambiguities,
+                landmarks: fit.joints,
+              }),
+            },
+          ],
+          structuredContent: AssetAutoRigOutputSchema.parse({
+            status: "needs-landmarks",
+            target: input.target,
+            output: null,
+            bytes: null,
+            sha256: null,
+            replaced: false,
+            alreadyExisted: false,
+            weightMode: input.weightMode,
+            joints: fit.joints.length,
+            skinnedVertices: 0,
+            maxInfluences: 0,
+            maxNormalizationError: 0,
+            diagnostics: { finite: true, nonNegative: true, validJoints: true },
+            ambiguities: fit.ambiguities,
+            landmarks: fit.joints,
+            orientation: fit.orientation,
+            measure: fit.measure,
+          }),
+        };
+      }
+
+      const diagnostics = skinDocument(document, fit.joints as FittedJoint[], {
+        weightMode: input.weightMode,
+        ...(input.maxInfluences ? { maxInfluences: input.maxInfluences } : {}),
+      });
+      const bytes = await autoRigIo.writeBinary(document);
+      const published = await publishOutput({
+        projectRoot: input.projectRoot,
+        outputPath: input.output,
+        bytes,
+        ...(input.priorDigest ? { priorDigest: input.priorDigest } : {}),
+      });
+
+      const output = AssetAutoRigOutputSchema.parse({
+        status: "rigged",
+        target: input.target,
+        output: published.path,
+        bytes: published.bytes,
+        sha256: published.sha256,
+        replaced: published.replaced,
+        alreadyExisted: published.alreadyExisted,
+        weightMode: diagnostics.weightMode,
+        joints: diagnostics.joints,
+        skinnedVertices: diagnostics.skinnedVertices,
+        maxInfluences: diagnostics.maxInfluences,
+        maxNormalizationError: diagnostics.maxNormalizationError,
+        diagnostics: {
+          finite: diagnostics.finite,
+          nonNegative: diagnostics.nonNegative,
+          validJoints: diagnostics.validJoints,
+        },
+        ambiguities: fit.ambiguities,
+        landmarks: fit.joints,
+        orientation: fit.orientation,
+        measure: fit.measure,
+      });
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(output) }],
+        structuredContent: output,
+      };
+    } catch (error) {
+      const safe =
+        error instanceof RigAssetError
+          ? { code: error.code, message: error.message, retryable: error.retryable }
+          : error instanceof z.ZodError
+            ? { code: "RIG_INVALID_INPUT", message: "The auto-rig request is invalid.", retryable: false }
+            : { code: "RIG_INTERNAL", message: "The asset MCP could not complete the auto-rig.", retryable: false };
       return {
         isError: true as const,
         content: [{ type: "text" as const, text: JSON.stringify(safe) }],
