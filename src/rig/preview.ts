@@ -206,6 +206,7 @@ export async function renderPreview(
   const port = typeof address === "object" && address ? address.port : 0;
 
   let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
+  const pageErrors: string[] = [];
   try {
     browser = await chromium.launch({
       headless: true,
@@ -214,6 +215,10 @@ export async function renderPreview(
     const page = await browser.newPage({
       viewport: { width: wide.width!, height: wide.height! },
     });
+    page.on("pageerror", (error) => pageErrors.push(error.message));
+    page.on("requestfailed", (request) =>
+      pageErrors.push(`${request.url()} ${request.failure()?.errorText ?? ""}`),
+    );
     await page.goto(`http://127.0.0.1:${port}/`, { timeout: options.timeoutMs ?? 30_000 });
     await page.waitForFunction(
       () => Boolean((window as unknown as { __result?: unknown }).__result),
@@ -288,7 +293,9 @@ export async function renderPreview(
     if (error instanceof RigAssetError) throw error;
     throw new RigAssetError(
       "RIG_PREVIEW_FAILED",
-      `The preview render failed: ${error instanceof Error ? error.message : String(error)}.`,
+      `The preview render failed: ${error instanceof Error ? error.message : String(error)}${
+        pageErrors.length > 0 ? ` [${pageErrors.slice(0, 3).join("; ")}]` : ""
+      }.`,
     );
   } finally {
     await browser?.close().catch(() => undefined);
