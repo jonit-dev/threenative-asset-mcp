@@ -170,6 +170,22 @@ function binCentroids(
   return result;
 }
 
+// Math.max(...array) overflows the call stack once a mesh reaches a few hundred
+// thousand vertices, which is well inside the supported vertex budget.
+function extremum(
+  samples: readonly Sample[],
+  value: (sample: Sample) => number,
+  pick: "min" | "max",
+  seed: number,
+): number {
+  let best = seed;
+  for (const sample of samples) {
+    const candidate = value(sample);
+    if (pick === "max" ? candidate > best : candidate < best) best = candidate;
+  }
+  return best;
+}
+
 const round = (value: number): number => Math.round(value * 1e6) / 1e6;
 
 export function fitBipedLandmarks(positions: Float32Array, options: FitOptions = {}): FitResult {
@@ -185,7 +201,7 @@ export function fitBipedLandmarks(positions: Float32Array, options: FitOptions =
   const height = upRange[1] - upRange[0];
   const ambiguities: string[] = [];
 
-  const maxArm = Math.max(...samples.map((sample) => Math.abs(sample.arm)), 0);
+  const maxArm = extremum(samples, (sample) => Math.abs(sample.arm), "max", 0);
   const armSpreadRatio = height > 0 ? (maxArm * 2) / height : 0;
   if (armSpreadRatio < 0.18) {
     ambiguities.push("arms are not separated from the torso; supply explicit arm landmarks");
@@ -211,7 +227,10 @@ export function fitBipedLandmarks(positions: Float32Array, options: FitOptions =
       (sample) =>
         sample.arm * sign > torsoThreshold && Math.abs(sample.up - armUp) < 0.22 * height,
     );
-    const reach = armSamples.length > 0 ? Math.max(...armSamples.map((s) => s.arm * sign)) : 0;
+    const reach =
+      armSamples.length > 0
+        ? extremum(armSamples, (s) => s.arm * sign, "max", Number.NEGATIVE_INFINITY)
+        : 0;
     const armBins = armSamples.length > 0 ? binCentroids(armSamples, (s) => s.arm * sign, torsoThreshold, reach, 5) : [];
     const shoulder = armBins[0] ?? null;
     const hand = armBins[armBins.length - 1] ?? null;
@@ -221,7 +240,13 @@ export function fitBipedLandmarks(positions: Float32Array, options: FitOptions =
       (sample) => sample.arm * sign > torsoThreshold && sample.up < armUp - 0.18 * height,
     );
     const legBins = legSamples.length > 0
-      ? binCentroids(legSamples, (s) => s.up, Math.min(...legSamples.map((s) => s.up)), Math.max(...legSamples.map((s) => s.up)), 4)
+      ? binCentroids(
+          legSamples,
+          (s) => s.up,
+          extremum(legSamples, (s) => s.up, "min", Number.POSITIVE_INFINITY),
+          extremum(legSamples, (s) => s.up, "max", Number.NEGATIVE_INFINITY),
+          4,
+        )
       : [];
     const hip = legBins[legBins.length - 1] ?? null;
     const knee = legBins[Math.floor(legBins.length / 2)] ?? null;
