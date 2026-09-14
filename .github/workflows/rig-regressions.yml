@@ -1,0 +1,38 @@
+name: Rig regressions
+
+on:
+  push:
+    branches: [fix/pr237-retarget-hands]
+  pull_request:
+    paths:
+      - src/rig/**
+      - src/tools/rig.ts
+      - tests/rig-*.ts
+      - package.json
+      - package-lock.json
+      - .github/workflows/rig-regressions.yml
+
+permissions:
+  contents: read
+
+jobs:
+  rig-regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - name: Install preview backends
+        run: |
+          npx --no-install playwright install --with-deps chromium
+          python3 -m venv "$RUNNER_TEMP/rig-python"
+          "$RUNNER_TEMP/rig-python/bin/python" -m pip install numpy==2.2.6 Pillow==11.3.0
+          echo "$RUNNER_TEMP/rig-python/bin" >> "$GITHUB_PATH"
+      # Each integration file can launch Chromium, Python and installed MCP
+      # processes. Bound concurrency instead of weakening existing deadlines.
+      - run: npm test -- --maxWorkers=1
