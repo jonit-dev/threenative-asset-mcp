@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import { basename, dirname, join, normalize } from "node:path";
@@ -19,7 +20,7 @@ export interface PreviewPose {
 export interface PreviewOptions {
   clipName?: string;
   times: number[];
-  /** One explicit bone rotation applied to every frame, for limb-isolation sheets. */
+  /** An additive local-axis rotation applied after sampling, for limb-isolation sheets. */
   pose?: PreviewPose;
   angles?: number;
   width?: number;
@@ -53,6 +54,7 @@ function threeFile(relative: string): string {
 }
 
 function pageHtml(options: PreviewOptions): string {
+  // Asset names are data, including names containing an HTML script terminator.
   const payload = JSON.stringify({
     clipName: options.clipName ?? null,
     times: options.times,
@@ -60,7 +62,7 @@ function pageHtml(options: PreviewOptions): string {
     angles: options.angles ?? 3,
     width: options.width ?? 384,
     height: options.height ?? 384,
-  });
+  }).replace(/</g, "\\u003c");
   return `<!doctype html><html><body>
 <script type="importmap">{"imports":{"three":"/three.module.js","three/addons/":"/jsm/"}}</script>
 <script type="module">
@@ -76,59 +78,105 @@ try {
   const light = new THREE.DirectionalLight(0xffffff,3); light.position.set(2,5,3); scene.add(light);
   const camera = new THREE.PerspectiveCamera(45,width/height,0.01,1000);
   new GLTFLoader().load('/model.glb', (gltf) => {
-    const model = gltf.scene; scene.add(model);
-    const box = new THREE.Box3().setFromObject(model);
-    const size = box.getSize(new THREE.Vector3()); const center = box.getCenter(new THREE.Vector3());
-    const radius = Math.max(size.x,size.y,size.z) || 1;
-    const mixer = new THREE.AnimationMixer(model);
-    const clips = gltf.animations ?? [];
-    const clip = options.clipName ? clips.find(c => c.name === options.clipName) : clips[0];
-    let tracks = 0, boundTracks = 0;
-    const boneNames = new Set();
-    model.traverse(o => { if (o.isBone) boneNames.add(o.name); });
-    if (clip) {
-      tracks = clip.tracks.length;
-      for (const track of clip.tracks) {
-        const head = track.name.replace(/\.(quaternion|position|scale|morphTargetInfluences.*)$/, '');
-        if (boneNames.has(head) || THREE.PropertyBinding.findNode(model, track.name)) boundTracks += 1;
+    try {
+      const model = gltf.scene; scene.add(model);
+      model.updateMatrixWorld(true);
+      const box = new THREE.Box3().setFromObject(model);
+      const size = box.getSize(new THREE.Vector3()); const center = box.getCenter(new THREE.Vector3());
+      const radius = Math.max(size.x,size.y,size.z) || 1;
+      const mixer = new THREE.AnimationMixer(model);
+      const clips = gltf.animations ?? [];
+      const clip = options.clipName !== null ? clips.find(c => c.name === options.clipName) : clips[0];
+      if (options.clipName !== null && !clip) throw new Error('Unknown preview clip: ' + options.clipName);
+
+      // Restore authored local transforms, never Euler zero. Untracked fingers
+      // and helper nodes must retain their bind/rest orientation.
+      const rest = [];
+      const bones = new Map();
+      const addBoneAlias = (name, bone) => {
+        if (typeof name !== 'string' || !name) return;
+        const matches = bones.get(name) ?? new Set();
+        matches.add(bone);
+        bones.set(name, matches);
+      };
+      model.traverse(node => {
+        rest.push({node, position:node.position.clone(), quaternion:node.quaternion.clone(), scale:node.scale.clone()});
+        if (!node.isBone) return;
+        addBoneAlias(node.name, node);
+        // GLTFLoader sanitizes names for PropertyBinding (hand.L -> handL).
+        // The public preview API also accepts the original glTF joint name.
+        const index = gltf.parser.associations.get(node)?.nodes;
+        if (index !== undefined) addBoneAlias(gltf.parser.json.nodes[index]?.name, node);
+      });
+      const pose = options.pose;
+      let poseBone;
+      if (pose) {
+        const matches = bones.get(pose.bone);
+        if (!matches || matches.size !== 1) throw new Error('Unknown or ambiguous preview bone: ' + pose.bone);
+        poseBone = matches.values().next().value;
       }
-      mixer.clipAction(clip).play();
-    }
-    const bones = {};
-    model.traverse(o => { if (o.isBone) bones[o.name] = o; });
-    const gl = renderer.getContext();
-    const images = [];
-    for (const time of options.times) {
-      for (let angle = 0; angle < options.angles; angle++) {
-        const azimuth = (angle / options.angles) * Math.PI * 2;
-        const pose = options.pose;
-        for (const name of Object.keys(bones)) bones[name].rotation.set(0,0,0);
-        if (pose && bones[pose.bone]) {
-          bones[pose.bone].rotation[pose.axis] = (pose.degrees * Math.PI) / 180;
+      let tracks = 0, boundTracks = 0;
+      let action;
+      if (clip) {
+        tracks = clip.tracks.length;
+        for (const track of clip.tracks) {
+          const binding = THREE.PropertyBinding.parseTrackName(track.name);
+          if (THREE.PropertyBinding.findNode(model, binding.nodeName)) boundTracks += 1;
         }
-        if (clip) { mixer.setTime(time); }
-        model.updateMatrixWorld(true);
-        const distance = radius * 1.7;
-        camera.position.set(center.x + Math.sin(azimuth)*distance, center.y + size.y*0.12, center.z + Math.cos(azimuth)*distance);
-        camera.lookAt(center);
-        renderer.render(scene, camera);
-        const pixels = new Uint8Array(width*height*4);
-        gl.readPixels(0,0,width,height,gl.RGBA,gl.UNSIGNED_BYTE,pixels);
-        let sum=0, sum2=0; const n = width*height;
-        for (let i=0;i<pixels.length;i+=4){ const v=pixels[i]; sum+=v; sum2+=v*v; }
-        const mean = sum/n; const std = Math.sqrt(Math.max(0, sum2/n - mean*mean));
-        images.push({ time, angle, dataUrl: renderer.domElement.toDataURL('image/png'), mean, std });
+        action = mixer.clipAction(clip);
+        action.setLoop(THREE.LoopOnce, 1);
+        action.clampWhenFinished = true;
       }
+      const gl = renderer.getContext();
+      const images = [];
+      for (const time of options.times) {
+        for (let angle = 0; angle < options.angles; angle++) {
+          const azimuth = (angle / options.angles) * Math.PI * 2;
+          mixer.stopAllAction();
+          for (const entry of rest) {
+            entry.node.position.copy(entry.position);
+            entry.node.quaternion.copy(entry.quaternion);
+            entry.node.scale.copy(entry.scale);
+          }
+          if (action) {
+            action.reset().play();
+            mixer.setTime(Math.min(Math.max(time, 0), clip.duration));
+          }
+          // Apply after sampling so animation cannot erase the requested proof.
+          // A local delta preserves the authored orientation and avoids any
+          // assumption that a finger's curl axis matches a world-space axis.
+          if (poseBone) {
+            const axis = new THREE.Vector3(); axis[pose.axis] = 1;
+            poseBone.rotateOnAxis(axis, (pose.degrees * Math.PI) / 180);
+          }
+          model.updateMatrixWorld(true);
+          const distance = radius * 1.7;
+          camera.position.set(center.x + Math.sin(azimuth)*distance, center.y + size.y*0.12, center.z + Math.cos(azimuth)*distance);
+          camera.lookAt(center);
+          renderer.render(scene, camera);
+          const pixels = new Uint8Array(width*height*4);
+          gl.readPixels(0,0,width,height,gl.RGBA,gl.UNSIGNED_BYTE,pixels);
+          let sum=0, sum2=0; const n = width*height;
+          for (let i=0;i<pixels.length;i+=4){ const v=pixels[i]; sum+=v; sum2+=v*v; }
+          const mean = sum/n; const std = Math.sqrt(Math.max(0, sum2/n - mean*mean));
+          images.push({ time, angle, dataUrl: renderer.domElement.toDataURL('image/png'), mean, std });
+        }
+      }
+      window.__result = {
+        ok: true,
+        backend: 'playwright-chromium ' + gl.getParameter(gl.VERSION),
+        images,
+        animations: clips.map(c => c.name),
+        tracks,
+        boundTracks,
+        bounds: { min: box.min.toArray(), max: box.max.toArray() },
+      };
+      mixer.stopAllAction();
+      mixer.uncacheRoot(model);
+      renderer.dispose();
+    } catch (error) {
+      window.__result = { ok:false, error: 'render ' + String(error) };
     }
-    window.__result = {
-      ok: true,
-      backend: 'playwright-chromium ' + gl.getParameter(gl.VERSION),
-      images,
-      animations: clips.map(c => c.name),
-      tracks,
-      boundTracks,
-      bounds: { min: box.min.toArray(), max: box.max.toArray() },
-    };
   }, undefined, (error) => { window.__result = { ok:false, error: 'load ' + String(error) }; });
 } catch (error) {
   window.__result = { ok:false, error: 'setup ' + String(error) };
@@ -147,7 +195,7 @@ function serveBuffer(
 
 export function previewAvailable(): boolean {
   try {
-    return chromium.executablePath().length > 0;
+    return existsSync(chromium.executablePath());
   } catch {
     return false;
   }
