@@ -95,18 +95,28 @@ try {
       mixer.clipAction(clip).play();
     }
     const bones = {};
+    // GLTFLoader sanitizes node names, so 'upper_arm.L' in the file is 'upper_armL' in the scene.
     model.traverse(o => { if (o.isBone) bones[o.name] = o; });
+    const pose = options.pose;
+    const poseBone = pose ? (bones[pose.bone] ?? bones[THREE.PropertyBinding.sanitizeNodeName(pose.bone)]) : null;
+    if (pose && !poseBone) {
+      window.__result = { ok:false, error: 'pose bone ' + pose.bone + ' is not in the model' };
+      return;
+    }
+    const poseAxis = pose ? new THREE.Vector3(pose.axis === 'x' ? 1 : 0, pose.axis === 'y' ? 1 : 0, pose.axis === 'z' ? 1 : 0) : null;
+    const poseRotation = pose ? new THREE.Quaternion().setFromAxisAngle(poseAxis, (pose.degrees * Math.PI) / 180) : null;
+    const poseUndo = poseRotation ? poseRotation.clone().invert() : null;
     const gl = renderer.getContext();
     const images = [];
     for (const time of options.times) {
       for (let angle = 0; angle < options.angles; angle++) {
         const azimuth = (angle / options.angles) * Math.PI * 2;
-        const pose = options.pose;
-        for (const name of Object.keys(bones)) bones[name].rotation.set(0,0,0);
-        if (pose && bones[pose.bone]) {
-          bones[pose.bone].rotation[pose.axis] = (pose.degrees * Math.PI) / 180;
-        }
+        // Never write the driven bones by hand: AnimationMixer applies a track only when its value
+        // differs from the one it last wrote, so an external reset makes it skip every later tile
+        // and the whole sheet past the first frame renders the same pose.
         if (clip) { mixer.setTime(time); }
+        // On top of the mixer, never before it, or a clip driving this bone overwrites the override.
+        if (poseRotation) poseBone.quaternion.multiply(poseRotation);
         model.updateMatrixWorld(true);
         const distance = radius * 1.7;
         camera.position.set(center.x + Math.sin(azimuth)*distance, center.y + size.y*0.12, center.z + Math.cos(azimuth)*distance);
@@ -118,6 +128,8 @@ try {
         for (let i=0;i<pixels.length;i+=4){ const v=pixels[i]; sum+=v; sum2+=v*v; }
         const mean = sum/n; const std = Math.sqrt(Math.max(0, sum2/n - mean*mean));
         images.push({ time, angle, dataUrl: renderer.domElement.toDataURL('image/png'), mean, std });
+        // Undo the override so the mixer's change detection keeps seeing its own last value.
+        if (poseUndo) poseBone.quaternion.multiply(poseUndo);
       }
     }
     window.__result = {

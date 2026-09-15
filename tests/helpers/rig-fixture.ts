@@ -39,3 +39,30 @@ export async function unriggedBipedGlb(armAxis: "x" | "z" = "x"): Promise<Uint8A
   document.createScene("Scene").addChild(document.createNode("Body").setMesh(mesh));
   return await new NodeIO().writeBinary(document);
 }
+
+/** Append a one-second rotation of `bone` about Z to an existing rigged GLB. */
+export async function withArmSwing(glb: Uint8Array, bone: string): Promise<Uint8Array> {
+  const io = new NodeIO();
+  const document = await io.readBinary(glb);
+  const node = document
+    .getRoot()
+    .listNodes()
+    .find((candidate) => candidate.getName() === bone);
+  if (!node) throw new Error(`fixture: the rigged model has no bone named ${bone}`);
+  const buffer = document.getRoot().listBuffers()[0] ?? document.createBuffer();
+  const half = Math.sin(Math.PI / 4);
+  const input = document
+    .createAccessor("swing-input")
+    .setType("SCALAR")
+    .setArray(new Float32Array([0, 1]))
+    .setBuffer(buffer);
+  const output = document
+    .createAccessor("swing-output")
+    .setType("VEC4")
+    .setArray(new Float32Array([0, 0, 0, 1, 0, 0, half, half]))
+    .setBuffer(buffer);
+  const sampler = document.createAnimationSampler().setInput(input).setOutput(output).setInterpolation("LINEAR");
+  const channel = document.createAnimationChannel().setTargetNode(node).setTargetPath("rotation").setSampler(sampler);
+  document.createAnimation("Swing").addSampler(sampler).addChannel(channel);
+  return await io.writeBinary(document);
+}
