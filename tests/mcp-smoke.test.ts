@@ -477,6 +477,8 @@ describe("built stdio package", () => {
       "audio_list_sources",
       "audio_search_assets",
       "audio_download_asset",
+      "audio_inspect_asset",
+      "audio_generate_sound",
       "itch_list_downloads",
       "itch_download_asset",
       "asset_list_bundle_entries",

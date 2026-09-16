@@ -96,10 +96,18 @@ import {
   AudioListSourcesOutputSchema,
   AudioSearchInputSchema,
   AudioSearchOutputSchema,
+  AudioInspectInputSchema,
+  AudioInspectOutputSchema,
+  AudioGenerateInputSchema,
+  AudioGenerateOutputSchema,
   createAudioDownloadHandler,
+  createAudioGenerateHandler,
+  createAudioInspectHandler,
   createAudioListSourcesHandler,
   createAudioSearchHandler,
 } from "./tools/audio.js";
+import { AudioInspector } from "./audio/inspect.js";
+import { AudioGenerator } from "./audio/generate.js";
 import {
   AssetListSourcesInputSchema,
   AssetSearchSourcesInputSchema,
@@ -187,6 +195,9 @@ export interface AssetServerClients {
   directDownloader: DirectAssetDownloader;
   itch: ItchAssetClient;
   bundle: BundleAssetClient;
+  /** Constructed on demand; overridden only by tests that supply a stub inspector or fetch. */
+  audioInspector?: AudioInspector;
+  audioGenerator?: AudioGenerator;
 }
 
 export function createAssetServer(
@@ -213,6 +224,10 @@ export function createAssetServer(
     itch,
     bundle,
   } = clients;
+  const audioInspector = clients.audioInspector ?? new AudioInspector();
+  // Constructing this reads no credentials: a missing key fails at call time, not at startup, so
+  // the catalog and inspection tools still work on a machine that has no ElevenLabs account.
+  const audioGenerator = clients.audioGenerator ?? new AudioGenerator();
   const server = new McpServer({
     name: "threenative-asset-mcp",
     version: packageVersion(),
@@ -778,6 +793,42 @@ export function createAssetServer(
       },
     },
     createAudioDownloadHandler(audio),
+  );
+  server.registerTool(
+    "audio_inspect_asset",
+    {
+      title: "Inspect a local audio file for defects",
+      description:
+        "Measure one local WAV, Ogg, MP3 or FLAC with the pinned threenative-playtest inspector: decode integrity, silence, peak, DC, five-band spectrum, declared-loop seam and requested duration, plus a spectrogram. Needs no ElevenLabs key. Reports technical status, and prompt/emotion fit only when local CLAP is provisioned. It never repairs or rewrites the file, and it never certifies artistic quality: use the findings to decide whether to revise one specific property, then listen before shipping.",
+      inputSchema: AudioInspectInputSchema,
+      outputSchema: AudioInspectOutputSchema,
+      annotations: {
+        // Writes a spectrogram and a cached result beside the audio directory, so not read-only.
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    createAudioInspectHandler(audioInspector),
+  );
+  server.registerTool(
+    "audio_generate_sound",
+    {
+      title: "Generate one sound effect with ElevenLabs (spends credits)",
+      description:
+        "SPENDS PROVIDER CREDITS. Generate one sound effect or ambience from a prompt using the user's own ELEVENLABS_API_KEY, save the original response and a PCM16 WAV, and inspect the result automatically. Requires that key in the server environment; without it this tool fails and you should tell the user to set their own. Describe source, action, material, distance and timing in the prompt. Generate once, inspect, revise the specific property that failed, then explicitly generate again — never loop. Reusing a requestId returns the saved result instead of charging again.",
+      inputSchema: AudioGenerateInputSchema,
+      outputSchema: AudioGenerateOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        // A fresh requestId always spends; only an explicit replay of one is protected.
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+    },
+    createAudioGenerateHandler(audioGenerator),
   );
 
   server.registerTool(
