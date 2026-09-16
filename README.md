@@ -35,6 +35,11 @@ dependency relationships with pagination and resolution/format filters.
 - A local environment capable of running Playwright Chromium when Fab requests
   browser verification
 - No Epic or Fab login is required or automated
+- **FFmpeg and FFprobe on `PATH`** for `audio_inspect_asset` and
+  `audio_generate_sound`. Without them nothing is decoded, and the tools report
+  that they could not check rather than reporting a pass.
+- An **ElevenLabs API key of your own** for `audio_generate_sound` only. Every
+  other tool, including local audio inspection, works without one.
 
 ## Install
 
@@ -192,6 +197,83 @@ Game audio:
   `acceptLicense: true`. It uses an HTTPS host allowlist, validates every
   redirect, streams with a byte cap, writes atomically without overwrite, and
   returns the local path, byte size, and SHA-256.
+- `audio_inspect_asset` — measures one local WAV, Ogg, MP3, or FLAC with the
+  pinned `@threenative/playtest` inspector: decode integrity, silence floor,
+  peak ceiling, DC offset, a five-band spectrum, the loop seam of a **declared**
+  loop, and the requested duration, plus a spectrogram PNG. Needs no ElevenLabs
+  key and never modifies or repairs the file. Optionally compares prompt and
+  emotional tone when local CLAP is provisioned.
+- `audio_generate_sound` — **spends ElevenLabs credits.** Generates one sound
+  effect or ambience from a prompt using *your own* `ELEVENLABS_API_KEY`, saves
+  the original response plus a PCM16 WAV, and runs the same inspection
+  automatically. Reusing a `requestId` returns the saved result instead of
+  charging again.
+
+### Generating a sound
+
+The loop is **generate once → inspect → revise the one property that failed →
+explicitly generate again.** There is no best-of-N retry: every generation is a
+separate billable invocation you ask for on purpose.
+
+Describe source, action, material, distance, and timing. A useful brief:
+
+> One short metal latch closing, close microphone, dry recording, single event
+> with natural decay, no speech or music.
+
+These are prompting conventions absorbed from ElevenLabs' own
+[sound-effects skill](https://github.com/elevenlabs/skills/blob/9edcbd4b80ed57b8e07a3f86ea520333969fbc3c/sound-effects/SKILL.md)
+(MIT, reviewed at commit `9edcbd4b`), which is linked and attributed rather than
+installed. They are conventions, not guaranteed exclusion controls.
+
+`audio_generate_sound` requires `ELEVENLABS_API_KEY` in the server environment.
+It is never bundled, defaulted, or logged: without your own key the tool fails
+with `AUDIO_GENERATE_NO_CREDENTIALS` and an instruction to set one, while the
+catalog and inspection tools keep working normally.
+
+What the inspection does and does not tell you:
+
+| It answers | It does not answer |
+| --- | --- |
+| Is it broken, silent, clipped, DC-offset, or the wrong duration? | Is it a *good* sound? |
+| Does a declared loop click at the wrap? | Does it suit this scene? |
+| Is the frequency content inside bounds *you* supplied? | Is the mix right? |
+
+`artisticQuality` is always `"unverified"`. There is no `soundsGood` flag and no
+single quality score. `recommendation: "audition"` means the technical checks
+passed and every requested check completed — it means *go listen to it*, not
+*ship it*. A definite technical failure recommends `"reject"`; a warning, a
+possible mismatch, or an incomplete requested check recommends `"review"`.
+
+If asset compilation rewrites the bytes, inspect the compiled output before
+describing that output as checked.
+
+### Optional local CLAP setup
+
+Prompt fit and emotion fit are **off by default** (`semantic: "off"`) and add no
+dependency to `npm install`. To enable them:
+
+```sh
+python3 -m venv ~/.venvs/clap
+~/.venvs/clap/bin/pip install "laion-clap==1.1.6" "torch==2.4.1" \
+    "torchaudio==2.4.1" "librosa==0.10.2.post1" "numpy<2"
+# Download 630k-audioset-best.pt from the LAION-AI/CLAP releases and check its hash.
+export AUDIO_CLAP_CHECKPOINT=/path/to/630k-audioset-best.pt
+export AUDIO_CLAP_PYTHON=~/.venvs/clap/bin/python
+```
+
+Nothing is downloaded implicitly and no GPU is required. With `semantic: "clap"`
+and no provisioned model, you get the technical result plus an explicit
+unavailable semantic result and this instruction — never a semantic pass. A
+generation that requests `semantic: "clap"` is refused in preflight, before
+spending, when the model is missing.
+
+Scores are cosine similarities used as **supporting evidence**, never
+probabilities or quality grades. The emotion check builds otherwise identical
+hypotheses — `The sound of {sourceDescription}, with a {mood} emotional tone.` —
+so only the mood clause differs, and **this use of CLAP is a proposed heuristic,
+not a demonstrated emotion-recognition capability**: mood status stays
+`unverified` until the held-out emotion calibration qualifies your domain. Check
+the CLAP code and checkpoint licensing separately before redistributing either.
 
 Curated itch.io packs:
 
@@ -399,6 +481,11 @@ glTF's standard punctual-light extension has no area-light type.
 | `AUDIO_DOWNLOAD_DIR`            | `~/Downloads/threenative-asset-mcp/audio`          | Dedicated directory for curated audio downloads.         |
 | `AUDIO_MAX_DOWNLOAD_BYTES`      | `10737418240`                                      | Maximum accepted bytes per audio archive (10 GiB).       |
 | `AUDIO_DOWNLOAD_TIMEOUT_MS`     | `1800000`                                          | Total timeout for one audio download (30 minutes).       |
+| `ELEVENLABS_API_KEY`            | unset                                              | **Your own** key; required only by `audio_generate_sound`. Never bundled or logged. |
+| `AUDIO_INSPECT_ROOTS`           | the audio dir plus the launch directory            | Extra `:`-separated roots `audio_inspect_asset` may read. |
+| `AUDIO_CLAP_PYTHON`             | unset                                              | Interpreter with LAION-CLAP installed; enables `semantic: "clap"`. |
+| `AUDIO_CLAP_CHECKPOINT`         | unset                                              | Path to the `630k-audioset-best.pt` checkpoint.          |
+| `AUDIO_CLAP_CHECKPOINT_SHA256`  | unset                                              | Optional pin; a mismatched checkpoint is refused.        |
 | `ASSET_DOWNLOAD_DIR`            | `~/Downloads/threenative-asset-mcp/assets`         | Dedicated directory for direct provider downloads.       |
 | `ASSET_MAX_DOWNLOAD_BYTES`      | `10737418240`                                      | Maximum accepted bytes per provider file (10 GiB).       |
 | `ASSET_DOWNLOAD_TIMEOUT_MS`     | `1800000`                                          | Total timeout for one provider download (30 minutes).    |
