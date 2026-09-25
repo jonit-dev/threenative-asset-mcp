@@ -12,6 +12,7 @@ import {
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 
 import { FabClientError, type FabDownloadResult } from "./direct-transport.js";
+import { sizeMeters } from "../gltf-size.js";
 
 export function safeDownloadName(input: string): string {
   const leaf = basename(input).slice(0, 180);
@@ -88,6 +89,8 @@ export async function storeDownload(
       );
     }
     const metadata = await stat(outputPath);
+    // A glTF download also reports how big the asset is, so a game can place it unopened.
+    const size = await sizeMeters(outputPath);
     return {
       listingId: options.listingId,
       format: options.format as FabDownloadResult["format"],
@@ -97,6 +100,7 @@ export async function storeDownload(
       sha256: await sha256File(outputPath),
       alreadyExisted: true,
       authentication: "not-required",
+      ...(size ? { sizeMeters: size } : {}),
     };
   }
 
@@ -115,6 +119,7 @@ export async function storeDownload(
     }
     await copyFile(temporaryPath, outputPath, constants.COPYFILE_EXCL);
     const metadata = await stat(outputPath);
+    const size = await sizeMeters(outputPath);
     return {
       listingId: options.listingId,
       format: options.format as FabDownloadResult["format"],
@@ -124,6 +129,7 @@ export async function storeDownload(
       sha256: await sha256File(outputPath),
       alreadyExisted: false,
       authentication: "not-required",
+      ...(size ? { sizeMeters: size } : {}),
     };
   } catch (error) {
     if (error instanceof FabClientError) throw error;

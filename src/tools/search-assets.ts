@@ -21,7 +21,6 @@ export const SearchToolInputSchema = z.object({
     channels: dedupedValues.optional(),
     listingTypes: dedupedValues.optional(),
     categories: dedupedValues.optional(),
-    formats: dedupedValues.optional(),
     tags: dedupedValues.optional(),
     licenses: dedupedValues.optional(),
     publisher: z.string().trim().min(1).max(200).optional(),
@@ -110,7 +109,7 @@ const SearchItemSchema = z.object({
       slug: z.string().max(200).optional(),
     })
     .optional(),
-  formats: z.array(z.string().max(100)).max(20),
+  formats: z.array(z.string().max(100)).max(20).optional(),
   tags: z
     .array(
       z.object({

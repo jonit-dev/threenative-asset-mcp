@@ -1,4 +1,5 @@
 import { FabClientError, nullFabLogger, type FabLogger } from "./errors.js";
+import type { SizeMeters } from "../gltf-size.js";
 
 const FAB_ORIGIN = "https://www.fab.com";
 const LISTING_ID =
@@ -44,6 +45,8 @@ export interface FabDownloadResult {
   sha256: string;
   alreadyExisted: boolean;
   authentication: "not-required";
+  /** Bounding-box size in metres, for `.glb`/`.gltf` downloads the reader could open. */
+  sizeMeters?: SizeMeters;
 }
 
 export interface FabTransport {

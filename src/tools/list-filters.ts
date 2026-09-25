@@ -5,7 +5,6 @@ import { FabClientError } from "../fab/client.js";
 export const FilterKindSchema = z.enum([
   "channels",
   "listing_types",
-  "formats",
   "categories",
   "licenses",
 ]);
@@ -20,7 +19,6 @@ export const FilterValueSchema = z.object({
 export const FilterGroupsSchema = z.object({
   channels: z.array(FilterValueSchema),
   listing_types: z.array(FilterValueSchema),
-  formats: z.array(FilterValueSchema),
   categories: z.array(FilterValueSchema),
   licenses: z.array(FilterValueSchema),
 });
@@ -28,7 +26,7 @@ export const FilterGroupsSchema = z.object({
 export const ListFiltersInputSchema = z.object({
   kinds: z
     .array(FilterKindSchema)
-    .max(5)
+    .max(4)
     .transform((values) => [...new Set(values)])
     .optional(),
   refresh: z.boolean().default(false),

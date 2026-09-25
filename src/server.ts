@@ -346,7 +346,7 @@ export function createAssetServer(
     {
       title: "Search Fab assets",
       description:
-        "Search public Fab marketplace listings. Free assets are returned by default.",
+        "Search public Fab marketplace listings. Free assets are returned by default. Results carry no file formats and there is no format filter: call fab_get_asset for a listing's formats.",
       inputSchema: SearchToolInputSchema,
       outputSchema: SearchOutputSchema,
       annotations: {
@@ -418,7 +418,7 @@ export function createAssetServer(
     {
       title: "Download a free Fab asset file",
       description:
-        "Download one directly available free Fab file into the configured local download directory. This never purchases or adds an asset to a library.",
+        "Download one directly available free Fab file into the configured local download directory. This never purchases or adds an asset to a library. Every GLB result reports `sizeMeters`, its bounding-box size in the file's own units: a value near 890 for something meant to be 9 m means the source was authored in centimetres and the game must scale it.",
       inputSchema: DownloadFreeAssetInputSchema,
       outputSchema: DownloadFreeAssetOutputSchema,
       annotations: {
@@ -454,7 +454,7 @@ export function createAssetServer(
     {
       title: "Import a local Unreal asset directory",
       description:
-        "Convert a local directory of Unreal .uasset/.umap files into self-contained model and scene GLBs under a game's assets directory, with reconstructed PBR materials, actor transforms, and a provenance report. Works on any already-downloaded Unreal pack, whatever downloaded it.",
+        "Convert a local directory of Unreal .uasset/.umap files into self-contained model and scene GLBs under a game's assets directory, with reconstructed PBR materials, actor transforms, and a provenance report. Works on any already-downloaded Unreal pack, whatever downloaded it. Every GLB result reports `sizeMeters`, its bounding-box size in the file's own units: a value near 890 for something meant to be 9 m means the source was authored in centimetres and the game must scale it.",
       inputSchema: AssetImportUnrealInputSchema,
       outputSchema: ImportUnrealOutputSchema,
       annotations: {
@@ -472,7 +472,7 @@ export function createAssetServer(
     {
       title: "Import an owned Fab Unreal asset",
       description:
-        "Download an Unreal asset the signed-in Fab account already owns and convert it to source GLBs in one step. Uses the FabCLI session the user established themselves; it never logs in, claims, or purchases anything.",
+        "Download an Unreal asset the signed-in Fab account already owns and convert it to source GLBs in one step. Uses the FabCLI session the user established themselves; it never logs in, claims, or purchases anything. Every GLB result reports `sizeMeters`, its bounding-box size in the file's own units: a value near 890 for something meant to be 9 m means the source was authored in centimetres and the game must scale it.",
       inputSchema: FabImportAssetInputSchema,
       outputSchema: ImportUnrealOutputSchema,
       annotations: {
