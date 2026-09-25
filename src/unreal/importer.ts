@@ -45,7 +45,7 @@ import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } fr
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 43;
+export const IMPORTER_VERSION = 44;
 
 export type ImportErrorCode =
   | "UNREAL_SOURCE_NOT_FOUND"
@@ -1688,11 +1688,19 @@ export async function importUnrealDirectory(
   const uncooked = cooking.filter(
     ({ entry, state }) => entry.meshKind === "static" && state === "uncooked" && !entry.needsModernConverter,
   );
+  const uncookedMeshDescription = uncooked.filter(
+    (entry) =>
+      entry.fileVersionUE4 !== undefined &&
+      entry.fileVersionUE4 >= 517 &&
+      entry.fileVersionUE4 <= 522,
+  );
+  const legacyRawMesh = uncooked.filter((entry) => entry.fileVersionUE4 === 516);
   const unsupportedUncooked = uncooked.filter(
     (entry) =>
-      entry.fileVersionUE4 === undefined ||
-      entry.fileVersionUE4 < 517 ||
-      entry.fileVersionUE4 > 522,
+      !legacyRawMesh.includes(entry) &&
+      (entry.fileVersionUE4 === undefined ||
+        entry.fileVersionUE4 < 517 ||
+        entry.fileVersionUE4 > 522),
   );
   if (unsupportedUncooked.length > 0) {
     const versions = [...new Set(unsupportedUncooked.map((entry) => entry.fileVersionUE4 ?? "unknown"))];
@@ -1986,20 +1994,20 @@ export async function importUnrealDirectory(
   const sceneSourcePaths = new Map<string, string>();
   const sceneSourcePathFor = (entry: PackageClassification): string =>
     assertContained(sceneSources, `${entry.package.slice(0, -extname(entry.package).length)}.scene-source.json`);
-  if (uncooked.length > 0 || mapPackages.length > 0) {
+  if (uncookedMeshDescription.length > 0 || mapPackages.length > 0) {
     uncookedConverter = request.uncookedConverter ?? (await ensureUncookedConverter(environment, log));
     const uncookedRaw = join(staging, "uncooked");
     const args =
-      uncooked.length > 0
+      uncookedMeshDescription.length > 0
         ? [sourceDir, "--export-dir", uncookedRaw, "--skip-textures"]
         : [sourceDir, "--export-dir", uncookedRaw, "--skip-export"];
-    if (uncooked.length > 0 && request.onlyPackages?.length === 1 && request.onlyPackages[0]) {
+    if (uncookedMeshDescription.length > 0 && request.onlyPackages?.length === 1 && request.onlyPackages[0]) {
       args.push("--filter", request.onlyPackages[0]);
     }
     if (mapPackages.length > 0) args.push("--scene-json-dir", sceneSources);
     const actions = [
-      ...(uncooked.length > 0
-        ? [`${uncooked.length} uncooked MeshDescription package${uncooked.length === 1 ? "" : "s"}`]
+      ...(uncookedMeshDescription.length > 0
+        ? [`${uncookedMeshDescription.length} uncooked MeshDescription package${uncookedMeshDescription.length === 1 ? "" : "s"}`]
         : []),
       ...(mapPackages.length > 0
         ? [`${mapPackages.length} Unreal level${mapPackages.length === 1 ? "" : "s"}`]
@@ -2016,17 +2024,17 @@ export async function importUnrealDirectory(
         `The uncooked MeshDescription converter exited ${converted.code}; no partial output was promoted.`,
       );
     }
-    if (uncooked.length > 0) {
+    if (uncookedMeshDescription.length > 0) {
       uncookedGlbs = await indexGlbs(uncookedRaw);
       warnings.push(
-        `Decoded ${uncooked.length} requested uncooked UE4 MeshDescription GLB${uncooked.length === 1 ? "" : "s"} without Unreal Engine; UE Viewer supplied their source textures and material metadata.`,
+        `Decoded ${uncookedMeshDescription.length} requested uncooked UE4 MeshDescription GLB${uncookedMeshDescription.length === 1 ? "" : "s"} without Unreal Engine; UE Viewer supplied their source textures and material metadata.`,
       );
     }
     for (const entry of mapPackages) {
       sceneSourcePaths.set(entry.file, join(sceneSources, `${basename(entry.package, extname(entry.package))}.scene-source.json`));
     }
   }
-  const uncookedNames = new Set(uncooked.map((entry) => basename(entry.package, extname(entry.package))));
+  const uncookedNames = new Set(uncookedMeshDescription.map((entry) => basename(entry.package, extname(entry.package))));
   const modernAssetCount = modernPackages.length + modernTexturePackages.length;
   if (modernAssetCount > 0) {
     modernConverter = request.modernConverter ?? (await ensureModernConverter(environment, log));

@@ -26,7 +26,7 @@ import {
   validateGlb,
 } from "../src/unreal/importer.js";
 import { childEnvironment, resolveExecutable, ToolchainError } from "../src/unreal/toolchain.js";
-import { UEVIEWER_SOURCE } from "../src/unreal/provision.js";
+import { patchUncookedPackageVersionGates, UEVIEWER_SOURCE } from "../src/unreal/provision.js";
 import { runImportCli } from "../src/cli.js";
 import { writeFakeUmodel, writeMeshFixture, writePng, writePsaFixture, writeWavFixture } from "./helpers/unreal-fixture.js";
 
@@ -1582,6 +1582,63 @@ fs.copyFileSync(${JSON.stringify(converterFixture)}, path.join(out, "Meshes", "S
     expect(artifact.getRoot().listMaterials()[0]?.getBaseColorTexture()).not.toBeNull();
   });
 
+  it("accepts a version-516 uncooked package through UE Viewer instead of the MeshDescription path", async () => {
+    const workspace = await unrealWorkspace();
+    const sourceMesh = join(workspace.sourceDir, "Content", "Game", "SM_Rock.uasset");
+    const legacyHeader = Buffer.alloc(32);
+    legacyHeader.writeUInt32LE(0x9e2a83c1, 0);
+    legacyHeader.writeInt32LE(-7, 4);
+    legacyHeader.writeInt32LE(864, 8);
+    legacyHeader.writeInt32LE(516, 12);
+    await writeFile(sourceMesh, Buffer.concat([legacyHeader, Buffer.from("SourceModels\0AssetImportData\0")]));
+
+    const invoked = join(workspace.sourceDir, "..", "uncooked-converter-invoked");
+    const converter = join(workspace.sourceDir, "..", "unreal-assets-to-glb");
+    await writeFile(
+      converter,
+      `#!/usr/bin/env node
+const fs = require("node:fs");
+fs.writeFileSync(${JSON.stringify(invoked)}, "ran");
+process.exit(1);
+`,
+    );
+    await chmod(converter, 0o755);
+
+    const report = await importUnrealDirectory({
+      sourceDir: workspace.sourceDir,
+      outputDir: workspace.outputDir,
+      environment: workspace.environment,
+      umodel: { name: "umodel", path: workspace.umodel, version: "Test" },
+      uncookedConverter: { name: "uncooked", path: converter, version: "Test MeshDescription" },
+    });
+
+    expect(report.failed).toEqual([]);
+    expect(report.counts.exported).toBe(1);
+    expect(report.toolchain.uncookedConverter).toBeUndefined();
+    expect(report.warnings.join(" ")).not.toMatch(/without Unreal Engine/);
+    await expect(readFile(invoked, "utf8")).rejects.toThrow();
+  });
+
+  it("still refuses an uncooked package newer than the verified 517–522 MeshDescription range", async () => {
+    const workspace = await unrealWorkspace();
+    const sourceMesh = join(workspace.sourceDir, "Content", "Game", "SM_Rock.uasset");
+    const header = Buffer.alloc(32);
+    header.writeUInt32LE(0x9e2a83c1, 0);
+    header.writeInt32LE(-7, 4);
+    header.writeInt32LE(864, 8);
+    header.writeInt32LE(523, 12);
+    await writeFile(sourceMesh, Buffer.concat([header, Buffer.from("SourceModels\0AssetImportData\0")]));
+
+    await expect(
+      importUnrealDirectory({
+        sourceDir: workspace.sourceDir,
+        outputDir: workspace.outputDir,
+        environment: workspace.environment,
+        umodel: { name: "umodel", path: workspace.umodel, version: "Test" },
+      }),
+    ).rejects.toThrow(/version 523/);
+  });
+
   it("converts static meshes, textures the materials, and reports everything it skipped", async () => {
     const workspace = await unrealWorkspace();
     const report = await importUnrealDirectory({
@@ -1902,6 +1959,16 @@ fs.copyFileSync(${JSON.stringify(converterFixture)}, path.join(out, "Meshes", "S
         umodel: { name: "umodel", path: workspace.umodel, version: "Test" },
       }),
     ).rejects.toThrow(/not a readable directory/);
+  });
+});
+
+describe("uncooked converter provisioning", () => {
+  it("aligns the converter's package-owner version gates with Unreal's own", () => {
+    const source = "VER_UE4_ADDED_PACKAGE_OWNER = 517\nVER_UE4_NON_OUTER_PACKAGE_IMPORT = 519\n";
+    const patched = patchUncookedPackageVersionGates(source);
+    expect(patched).toContain("VER_UE4_ADDED_PACKAGE_OWNER = 518");
+    expect(patched).toContain("VER_UE4_NON_OUTER_PACKAGE_IMPORT = 520");
+    expect(patchUncookedPackageVersionGates(patched)).toBe(patched);
   });
 });
 
