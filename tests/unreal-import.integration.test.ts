@@ -1,4 +1,5 @@
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -643,6 +644,38 @@ describe("path and toolchain guards", () => {
       HOME: "/home/user",
       DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/bus",
     });
+  });
+
+  it("points a session-bus-less host at the bus its runtime directory advertises", async () => {
+    // Codex and other MCP hosts start this server with no DBUS_SESSION_BUS_ADDRESS of their own, so
+    // FabCLI's keystore read failed with a raw "DBus error" and a user who was very much logged in.
+    const runtime = await temporaryDirectory();
+    await writeFile(join(runtime, "bus"), "");
+    const forwarded = childEnvironment({ PATH: "/usr/bin", XDG_RUNTIME_DIR: runtime });
+    expect(forwarded.DBUS_SESSION_BUS_ADDRESS).toBe(`unix:path=${join(runtime, "bus")}`);
+  });
+
+  it("finds this user's logind bus when the host strips XDG_RUNTIME_DIR as well", () => {
+    // The 2026-09-24 Codex host had neither variable; libdbus then tried X11 autolaunch and failed.
+    const bus = `/run/user/${process.getuid?.()}/bus`;
+    const forwarded = childEnvironment({ PATH: "/usr/bin" });
+    const expected = process.platform === "linux" && existsSync(bus) ? `unix:path=${bus}` : undefined;
+    expect(forwarded.DBUS_SESSION_BUS_ADDRESS).toBe(expected);
+  });
+
+  it("keeps an explicitly configured bus address", async () => {
+    const runtime = await temporaryDirectory();
+    await writeFile(join(runtime, "bus"), "");
+    const forwarded = childEnvironment({
+      XDG_RUNTIME_DIR: runtime,
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/somewhere/else",
+    });
+    expect(forwarded.DBUS_SESSION_BUS_ADDRESS).toBe("unix:path=/somewhere/else");
+  });
+
+  it("invents no bus address when the runtime directory has no bus in it", async () => {
+    const forwarded = childEnvironment({ XDG_RUNTIME_DIR: await temporaryDirectory() });
+    expect(forwarded).not.toHaveProperty("DBUS_SESSION_BUS_ADDRESS");
   });
 
   it("refuses a relative executable override rather than searching for it", async () => {

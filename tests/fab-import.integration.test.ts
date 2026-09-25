@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -181,6 +181,38 @@ describe("Fab licence gate", () => {
 });
 
 describe("Fab session handling", () => {
+  /** A FabCLI whose every subcommand fails with the given message, as a keyring refusal looks. */
+  async function fabcliSaying(message: string): Promise<FabCli> {
+    const path = join(await temporaryDirectory(), "fabcli");
+    const payload = JSON.stringify({ error: { kind: "auth_required", message } });
+    await writeFile(
+      path,
+      `#!/usr/bin/env node\nprocess.stdout.write(\`${payload}\` + "\\n");\n`,
+    );
+    await chmod(path, 0o755);
+    return new FabCli({ tool: { name: "fabcli", path, version: "0.1.0" } });
+  }
+
+  it("blames the missing session bus, not the session, when the keyring is unreachable", async () => {
+    const fabcli = await fabcliSaying("DBus error: could not open the OS keystore");
+    const error = await fabcli.authStatus().then(
+      () => undefined,
+      (thrown: unknown) => thrown as FabCliError,
+    );
+    expect(error?.code).toBe("FABCLI_KEYSTORE_UNREACHABLE");
+    expect(error?.message).toMatch(/DBUS_SESSION_BUS_ADDRESS/);
+    expect(error?.message).toMatch(/logging in again will not help/);
+  });
+
+  it("still says log in when FabCLI reports a genuinely absent session", async () => {
+    const fabcli = await fabcliSaying("no Fab session found; run fabcli auth login");
+    const error = await fabcli.authStatus().then(
+      () => undefined,
+      (thrown: unknown) => thrown as FabCliError,
+    );
+    expect(error?.code).toBe("FABCLI_UNAUTHENTICATED");
+  });
+
   it("downloads nothing and says what to run when there is no session", async () => {
     const test = await harness({ authStatus: { authenticated: false } });
     const result = await test.handler({

@@ -20,6 +20,7 @@ export type FabCliErrorCode =
   | "FABCLI_UNAVAILABLE"
   | "FABCLI_INCOMPATIBLE"
   | "FABCLI_UNAUTHENTICATED"
+  | "FABCLI_KEYSTORE_UNREACHABLE"
   | "FABCLI_SESSION_EXPIRED"
   | "FABCLI_NOT_OWNED"
   | "FABCLI_ENGINE_AMBIGUOUS"
@@ -234,8 +235,8 @@ export class FabCli {
       const detail = failure.message ?? "no detail";
       if (/keystore|secure storage|DBus/i.test(detail)) {
         throw new FabCliError(
-          "FABCLI_UNAUTHENTICATED",
-          `FabCLI could not read its session from the OS keystore (${detail}). Run the import from a desktop session where the keyring is unlocked, or export DBUS_SESSION_BUS_ADDRESS before starting the MCP server.`,
+          "FABCLI_KEYSTORE_UNREACHABLE",
+          `FabCLI could not read its session from the OS keystore (${detail}). The MCP host started this server without a session bus, so DBUS_SESSION_BUS_ADDRESS is missing or wrong for FabCLI; logging in again will not help. Restart the MCP host from a desktop session, or export DBUS_SESSION_BUS_ADDRESS yourself.`,
         );
       }
       throw new FabCliError(
