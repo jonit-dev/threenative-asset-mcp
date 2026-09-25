@@ -192,6 +192,25 @@ describe("downloadFreeAssetViaApi", () => {
     expect(downloader).not.toHaveBeenCalled();
   });
 
+  it("routes an Unreal-only listing to fab_import_asset instead of dead-ending", async () => {
+    // The European Hornbeam ships only as an Unreal pack; asking it for GLB used to stop here.
+    const { downloadDir, downloader, fetchJson } = await setup({
+      [`/i/listings/${LISTING_ID}?currency=USD`]: detailPayload({
+        assetFormats: [{ assetFormatType: { code: "unreal-engine" } }],
+      }),
+    });
+    const error = await downloadFreeAssetViaApi({
+      request: { listingId: LISTING_ID, format: "glb" },
+      fetchJson,
+      downloader,
+      downloadDir,
+      maxBytes: 10_000_000,
+    }).catch((e) => e);
+    expect((error as FabClientError).code).toBe("FAB_FORMAT_UNAVAILABLE");
+    expect((error as FabClientError).message).toContain("unreal-engine");
+    expect((error as FabClientError).message).toContain("fab_import_asset");
+  });
+
   it("maps a download-info denial to acquisition-required", async () => {
     const { downloadDir, downloader, fetchJson } = await setup({
       ...happyRoutes(),
