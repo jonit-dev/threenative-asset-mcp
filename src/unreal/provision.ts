@@ -1080,7 +1080,14 @@ async function resolveOrProvision(
   log: ProvisionLog,
 ): Promise<string> {
   try {
-    return await resolveExecutable(name, environment);
+    const found = await resolveExecutable(name, environment);
+    // A PATH umodel is whatever the user happened to install; the 2022 upstream release rejects
+    // `-psk`, which every animation export passes. An explicit override stays the user's call.
+    if (name !== "umodel" || environment.THREENATIVE_UMODEL_PATH?.trim() || (await canRun(found, UMODEL_PROBE, /UE Viewer/i))) {
+      return found;
+    }
+    log(`Ignoring ${found}: that UE Viewer build does not accept -psk.`);
+    throw new ToolchainError("UNREAL_TOOL_NOT_FOUND", `${found} does not accept -psk; no capable UE Viewer was found.`);
   } catch (error) {
     if (!(error instanceof ToolchainError) || error.code !== "UNREAL_TOOL_NOT_FOUND") throw error;
     const cached = name === "uncooked"
@@ -1104,7 +1111,7 @@ async function resolveOrProvision(
         : name === "modern"
           ? new RegExp(CUE4PARSE_SOURCE.version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
           : /gpu instances\/landscapes/;
-    const probe = name === "umodel" ? ["-version"] : name === "fabcli" ? ["--version"] : name === "modern" ? ["--version"] : ["--help"];
+    const probe = name === "umodel" ? UMODEL_PROBE : name === "fabcli" ? ["--version"] : name === "modern" ? ["--version"] : ["--help"];
     if (await canRun(cached, probe, marker)) return cached;
     if (!autoInstallEnabled(environment)) throw error;
     if (name === "umodel") return await provisionUmodel(environment, log);
@@ -1116,6 +1123,9 @@ async function resolveOrProvision(
 
 const UMODEL_VERSION = /^UE Viewer.*$\n^(Compiled .*)$/m;
 
+/** Prints the banner only when the build parses `-psk`; older builds fail the command line first. */
+export const UMODEL_PROBE = ["-export", "-psk", "-version"] as const;
+
 /** UE Viewer, resolved from the environment, PATH, the toolchain cache, or a fresh install. */
 export async function ensureUmodel(
   environment: NodeJS.ProcessEnv = process.env,
@@ -1123,12 +1133,14 @@ export async function ensureUmodel(
 ): Promise<ExternalTool> {
   assertSupportedHost();
   const path = await resolveOrProvision("umodel", environment, log);
-  const run = await runBounded(path, ["-version"], { timeoutMs: 30_000 });
+  const run = await runBounded(path, UMODEL_PROBE, { timeoutMs: 30_000 });
   const text = `${run.stdout}\n${run.stderr}`;
   if (!/UE Viewer/i.test(text)) {
     throw new ToolchainError(
       "UNREAL_TOOL_UNUSABLE",
-      `"${path}" does not identify itself as UE Viewer (umodel).`,
+      /invalid option: -psk/.test(text)
+        ? `"${path}" is a UE Viewer build too old to accept -psk, which animation export needs. Unset THREENATIVE_UMODEL_PATH to let the importer provision a current build.`
+        : `"${path}" does not identify itself as UE Viewer (umodel).`,
     );
   }
   return {

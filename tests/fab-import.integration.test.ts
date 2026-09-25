@@ -288,6 +288,21 @@ describe("Fab import safety", () => {
     expect(errorOf(result).code).toBe("FABCLI_NO_UNREAL_FORMAT");
   });
 
+  it("reads past another engine's format whose versions are null", async () => {
+    // fabcli returns `versions: null` on a Unity entry; that used to fail the whole parse.
+    const test = await harness({
+      formats: [{ assetFormatType: { code: "unity" }, versions: null }, ...UNREAL_FORMAT],
+      downloadExitCode: 4,
+    });
+    const result = await test.handler({
+      listingIdOrUrl: LISTING,
+      outputDir: test.outputDir,
+      engine: "UE_4.18",
+      acceptFabEula: true,
+    });
+    expect(errorOf(result).code).toBe("FABCLI_DOWNLOAD_FAILED");
+  });
+
   it("leaves the game's assets untouched when the download fails", async () => {
     const test = await harness({ downloadExitCode: 4 });
     const existing = join(test.root, "game", "assets", "fab", "existing.glb");

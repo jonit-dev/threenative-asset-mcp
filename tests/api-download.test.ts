@@ -156,6 +156,25 @@ describe("downloadFreeAssetViaApi", () => {
     expect(downloader).not.toHaveBeenCalled();
   });
 
+  it("treats a listing as free when isFree is false but every license's priceTier is zero", async () => {
+    // Sponsored "add to library" listings: Fab keeps isFree false while pricing every tier at 0.
+    const { downloadDir, downloader, fetchJson } = await setup({
+      ...happyRoutes(),
+      [`/i/listings/${LISTING_ID}?currency=USD`]: detailPayload({
+        isFree: false,
+        licenses: [{ priceTier: { price: 0, currencyCode: "USD" } }],
+      }),
+    });
+    await downloadFreeAssetViaApi({
+      request: { listingId: LISTING_ID, format: "glb" },
+      fetchJson,
+      downloader,
+      downloadDir,
+      maxBytes: 10_000_000,
+    });
+    expect(downloader).toHaveBeenCalledOnce();
+  });
+
   it("refuses formats the listing does not expose", async () => {
     const { downloadDir, downloader, fetchJson } = await setup({
       [`/i/listings/${LISTING_ID}?currency=USD`]: detailPayload({

@@ -69,7 +69,14 @@ const LibrarySchema = z.object({
 
 const FormatSchema = z.object({
   assetFormatType: z.object({ code: z.string() }).loose(),
-  versions: z.array(VersionSchema).default([]),
+  // `.default([])` fires on `undefined` and not on `null`, and fabcli returns `versions: null`
+  // on a Unity entry. One unrelated null poisoned the whole parse, so every listing published
+  // for both Unreal and Unity failed with FABCLI_INCOMPATIBLE — a message blaming the CLI
+  // version — and the well-formed `unreal-engine` entry beside it was never reached.
+  versions: z
+    .array(VersionSchema)
+    .nullish()
+    .transform((versions) => versions ?? []),
 });
 
 export interface FabAuthStatus {

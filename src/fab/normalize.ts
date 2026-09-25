@@ -113,6 +113,10 @@ function normalizeLicenses(
       if (!slug || !name) return [];
       const baseMoney =
         normalizeMoney(item.price, fallbackCurrency) ??
+        // Fab nests a listing's real money under `priceTier` ({ price, currencyCode }); a
+        // listing that is free-addable carries priceTier.price = 0 and NO other price key, so
+        // missing this read reported paid assets as paid and broke the free-download gate.
+        normalizeMoney(item.priceTier, fallbackCurrency) ??
         normalizeMoney(item.basePrice, fallbackCurrency) ??
         normalizeMoney(item.pricing, fallbackCurrency);
       const explicitEffective =

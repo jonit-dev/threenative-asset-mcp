@@ -23,6 +23,7 @@ import {
   inspectWebAudio,
   parseUmodelList,
   summarizeClasses,
+  uncookedMeshRoute,
   validateGlb,
 } from "../src/unreal/importer.js";
 import { childEnvironment, resolveExecutable, ToolchainError } from "../src/unreal/toolchain.js";
@@ -450,6 +451,62 @@ CollectedVectorParameters[0] = { Value={ R=1,G=0,B=0,A=1 }, Name=BaseColor }
     );
   });
 
+  // Modular Building Set (UE4.10): UE Viewer resolved a solid-green gloss map as Diffuse.
+  it("swaps a gloss map resolved as Diffuse for the variant colour map beside it", () => {
+    const resolved = resolveMaterial({
+      name: "brick_wall_grey",
+      readMat: () => "Diffuse=brick_wall_tiling_g\nNormal=brick_wall_tiling_n\nOther[0]=brick_wall_tiling_c_grey\n",
+      readProps: () => undefined,
+      availableTextures: new Set(["brick_wall_tiling_g", "brick_wall_tiling_n", "brick_wall_tiling_c_grey"]),
+    });
+    expect(resolved.bindings.find((binding) => binding.slot === "baseColor")?.texture).toBe("brick_wall_tiling_c_grey");
+  });
+
+  // STF Landscape Pro (UE4.18): a rock's only "Diffuse" is its height/AO/curvature mask, which
+  // painted every rock neon green. With no colour image in the graph, neutral is the answer.
+  it("leaves base colour neutral when the resolved Diffuse is a data mask with no colour sibling", () => {
+    const resolved = resolveMaterial({
+      name: "MI_cliffrock01_material_Inst",
+      readMat: () => "Diffuse=T_cliffrock01_height_AO_Curvature_TGA\nNormal=T_cliffrock01_normal\n",
+      readProps: () => undefined,
+      availableTextures: new Set(["T_cliffrock01_height_AO_Curvature_TGA", "T_cliffrock01_normal"]),
+    });
+    expect(resolved.bindings.find((binding) => binding.slot === "baseColor")).toBeUndefined();
+    expect(resolved.unsupported.map((entry) => entry.texture)).toContain("T_cliffrock01_height_AO_Curvature_TGA");
+  });
+
+  // UE4.19 fern pack: Diffuse resolved to the AO/roughness pack; the albedo is the `_A` sibling.
+  it("takes a trailing _A albedo over an AORO pack, but never a variant-lettered normal map", () => {
+    const resolved = resolveMaterial({
+      name: "MI_Fern_01_01",
+      readMat: () => "Diffuse=fern_01_AORO\nNormal=fern_01_N\nOther[0]=rock_d_n\nOther[1]=fern_01_A\n",
+      readProps: () => undefined,
+      availableTextures: new Set(["fern_01_AORO", "fern_01_N", "rock_d_n", "fern_01_A"]),
+    });
+    expect(resolved.bindings.find((binding) => binding.slot === "baseColor")?.texture).toBe("fern_01_A");
+  });
+
+  // Megascans European Hornbeam (UE4.27): UE Viewer resolved the Winter set, so leaves came out brown.
+  it("prefers a Megascans Summer texture set over the Winter set UE Viewer resolved", () => {
+    const resolved = resolveMaterial({
+      name: "MI_EuropeanHornbeam_TwoSided",
+      readMat: () =>
+        "Diffuse=T_EuropeanHornbeam_TwoSided_Winter_Albedo\nNormal=T_EuropeanHornbeam_TwoSided_Winter_Normal\n" +
+        "Other[0]=T_EuropeanHornbeam_TwoSided_Summer_Albedo\nOther[1]=T_EuropeanHornbeam_TwoSided_Summer_Normal\n",
+      readProps: () => undefined,
+      availableTextures: new Set([
+        "T_EuropeanHornbeam_TwoSided_Winter_Albedo",
+        "T_EuropeanHornbeam_TwoSided_Winter_Normal",
+        "T_EuropeanHornbeam_TwoSided_Summer_Albedo",
+        "T_EuropeanHornbeam_TwoSided_Summer_Normal",
+      ]),
+    });
+    expect(resolved.bindings.map((binding) => binding.texture).sort()).toEqual([
+      "T_EuropeanHornbeam_TwoSided_Summer_Albedo",
+      "T_EuropeanHornbeam_TwoSided_Summer_Normal",
+    ]);
+  });
+
   it("reports an unmappable texture rather than dropping it", () => {
     const resolved = resolveMaterial({
       name: "M_Odd",
@@ -826,6 +883,34 @@ process.exit(1);
         onlyPackages: ["SM_Rock"],
       }),
     ).rejects.toThrow(/game-compatible \.usmap/);
+  });
+
+  it("trusts UE Viewer's class list over the Texture2D name-table hint for a material instance", async () => {
+    // A material instance imports the Texture2D class for its parameters and carries
+    // AssetImportData; read as a texture it failed with "no PNG" and its mesh lost every texture.
+    const workspace = await unrealWorkspace({
+      classes: { SM_Rock: ["StaticMesh", "BodySetup"], MI_Rock: ["MaterialInstanceConstant"] },
+      emptyExports: ["MI_Rock"],
+    });
+    const header = Buffer.alloc(32);
+    header.writeUInt32LE(0x9e2a83c1, 0);
+    header.writeInt32LE(-7, 4);
+    header.writeInt32LE(516, 12);
+    await writeFile(
+      join(workspace.sourceDir, "Content", "Game", "MI_Rock.uasset"),
+      Buffer.concat([header, Buffer.from("AssetImportData\0Texture2D\0MaterialInstanceConstant\0")]),
+    );
+
+    const report = await importUnrealDirectory({
+      sourceDir: workspace.sourceDir,
+      outputDir: workspace.outputDir,
+      environment: workspace.environment,
+      umodel: { name: "umodel", path: workspace.umodel, version: "Test" },
+      onlyPackages: ["SM_Rock", "MI_Rock"],
+    });
+
+    expect(report.failed.filter((entry) => entry.package.includes("MI_Rock"))).toEqual([]);
+    expect(report.textures.map((texture) => texture.name)).not.toContain("MI_Rock");
   });
 
   it("routes a modern editor Texture2D rejected by UE Viewer through the modern converter", async () => {
@@ -1582,14 +1667,16 @@ fs.copyFileSync(${JSON.stringify(converterFixture)}, path.join(out, "Meshes", "S
     expect(artifact.getRoot().listMaterials()[0]?.getBaseColorTexture()).not.toBeNull();
   });
 
-  it("accepts a version-516 uncooked package through UE Viewer instead of the MeshDescription path", async () => {
+  // Object versions of the real FAB packs verified end to end: UE4.0–4.3 (401, 434), 4.15 (510),
+  // 4.18 (514), 4.19 (515), and 4.20 (516).
+  it.each([401, 434, 510, 514, 515, 516])("accepts a version-%i uncooked package through UE Viewer instead of the MeshDescription path", async (version) => {
     const workspace = await unrealWorkspace();
     const sourceMesh = join(workspace.sourceDir, "Content", "Game", "SM_Rock.uasset");
     const legacyHeader = Buffer.alloc(32);
     legacyHeader.writeUInt32LE(0x9e2a83c1, 0);
     legacyHeader.writeInt32LE(-7, 4);
     legacyHeader.writeInt32LE(864, 8);
-    legacyHeader.writeInt32LE(516, 12);
+    legacyHeader.writeInt32LE(version, 12);
     await writeFile(sourceMesh, Buffer.concat([legacyHeader, Buffer.from("SourceModels\0AssetImportData\0")]));
 
     const invoked = join(workspace.sourceDir, "..", "uncooked-converter-invoked");
@@ -2014,5 +2101,23 @@ describe("the CLI and the MCP tool are one code path", () => {
     const result = await runImportCli(["/some/pack"]);
     expect(result.exitCode).toBe(2);
     expect(result.stderr).toMatch(/--out <directory>/);
+  });
+});
+
+describe("uncookedMeshRoute", () => {
+  it("sends every pre-MeshDescription version to UE Viewer, static and skeletal alike", () => {
+    for (const version of [401, 434, 510, 514, 515, 516]) {
+      expect(uncookedMeshRoute("static", version)).toBe("umodel");
+      expect(uncookedMeshRoute("skeletal", version)).toBe("umodel");
+    }
+  });
+
+  it("keeps 517–522 static meshes on the converter, newer skeletal on the modern path, and refuses the rest", () => {
+    expect(uncookedMeshRoute("static", 517)).toBe("mesh-description");
+    expect(uncookedMeshRoute("static", 522)).toBe("mesh-description");
+    expect(uncookedMeshRoute("static", 523)).toBeUndefined();
+    expect(uncookedMeshRoute("static", undefined)).toBeUndefined();
+    expect(uncookedMeshRoute("skeletal", 517)).toBe("modern");
+    expect(uncookedMeshRoute("skeletal", undefined)).toBe("modern");
   });
 });

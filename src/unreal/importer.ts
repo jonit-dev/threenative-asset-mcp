@@ -45,7 +45,24 @@ import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } fr
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 44;
+export const IMPORTER_VERSION = 45;
+
+/** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
+ * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
+ * reads uncooked source geometry itself, static and skeletal alike: verified on FAB packs saved at
+ * object versions 401–516 (UE4.0–4.20), where it matched or beat every hand-written decoder. */
+const MESH_DESCRIPTION_FIRST_VERSION = 517;
+const MESH_DESCRIPTION_LAST_VERSION = 522;
+
+/** Which tool decodes an uncooked mesh package, or undefined when it must be refused. */
+export function uncookedMeshRoute(
+  meshKind: "static" | "skeletal",
+  fileVersionUE4: number | undefined,
+): "umodel" | "mesh-description" | "modern" | undefined {
+  if (fileVersionUE4 !== undefined && fileVersionUE4 < MESH_DESCRIPTION_FIRST_VERSION) return "umodel";
+  if (meshKind === "skeletal") return "modern";
+  return fileVersionUE4 !== undefined && fileVersionUE4 <= MESH_DESCRIPTION_LAST_VERSION ? "mesh-description" : undefined;
+}
 
 export type ImportErrorCode =
   | "UNREAL_SOURCE_NOT_FOUND"
@@ -368,6 +385,24 @@ export function summarizeClasses(classes: readonly string[], keep = 4): string {
   const unique = [...new Set(classes)];
   if (unique.length <= keep) return unique.join(", ");
   return `${unique.slice(0, keep).join(", ")} and ${unique.length - keep} more`;
+}
+
+/** Staging older than this belongs to an import that was killed before its `finally` ran. */
+const STALE_STAGING_MS = 24 * 60 * 60 * 1000;
+
+/** Removes `run-*` staging left by killed imports. One such run can hold gigabytes, and they
+ * accumulate until the cache volume fills and every later import fails its free-space check. */
+export async function sweepStaleStaging(root: string, now = Date.now()): Promise<void> {
+  for (const key of await readdir(root).catch(() => [] as string[])) {
+    for (const run of await readdir(join(root, key)).catch(() => [] as string[])) {
+      if (!run.startsWith("run-")) continue;
+      const path = join(root, key, run);
+      const modified = (await stat(path).catch(() => undefined))?.mtimeMs;
+      if (modified !== undefined && now - modified > STALE_STAGING_MS) {
+        await rm(path, { recursive: true, force: true }).catch(() => {});
+      }
+    }
+  }
 }
 
 function cacheRoot(environment: NodeJS.ProcessEnv): string {
@@ -1384,6 +1419,7 @@ export async function importUnrealDirectory(
     }
   }
 
+  await sweepStaleStaging(cacheRoot(environment));
   const stagingRoot = join(cacheRoot(environment), cacheKey);
   await mkdir(stagingRoot, { recursive: true });
   // The cache key identifies reusable results, not ownership of mutable scratch space. Give every
@@ -1479,15 +1515,19 @@ export async function importUnrealDirectory(
             ? "static"
             : cooking?.meshKindHint;
       const isMapBuildData = classes.includes("MapBuildDataRegistry");
-      const hasTexture = !isMapBuildData && (classes.includes("Texture2D") || cooking?.textureHint === true);
+      // The name-table hints stand in for a listing UE Viewer could not produce. When it did list
+      // the package, its classes win: a material instance names Texture2D and carries
+      // AssetImportData too, and reading that as a texture drops the material entirely.
+      const listed = run.code === 0 && classes.length > 0;
+      const hasTexture = !isMapBuildData && (classes.includes("Texture2D") || (!listed && cooking?.textureHint === true));
       // MapBuildDataRegistry owns transient reflection-capture cubes that are tied to baked level
       // lighting. They are not standalone environment assets and cannot be meaningfully reused.
       const hasCubemap =
-        !isMapBuildData && (classes.includes("TextureCube") || cooking?.cubemapHint === true);
+        !isMapBuildData && (classes.includes("TextureCube") || (!listed && cooking?.cubemapHint === true));
       const hasMaterial = classes.some((className) =>
         ["Material", "Material3", "MaterialInstance", "MaterialInstanceConstant"].includes(className),
       );
-      const hasSound = classes.includes("SoundWave") || cooking?.soundHint === true;
+      const hasSound = classes.includes("SoundWave") || (!listed && cooking?.soundHint === true);
       const dataClass = classes.find((className) => DATA_ASSET_CLASSES.has(className)) ?? cooking?.dataClassHint;
       const textureStackClass =
         classes.find((className) => TEXTURE_STACK_CLASSES.has(className)) ?? cooking?.textureStackClassHint;
@@ -1676,7 +1716,9 @@ export async function importUnrealDirectory(
     ...(await readPackageCooking(entry.file)),
   }));
   const modernPackages = cooking.filter(
-    ({ entry, state }) => entry.needsModernConverter || (entry.meshKind === "skeletal" && state === "uncooked"),
+    ({ entry, state, fileVersionUE4 }) =>
+      entry.needsModernConverter ||
+      (entry.meshKind === "skeletal" && state === "uncooked" && uncookedMeshRoute("skeletal", fileVersionUE4) === "modern"),
   );
   const modernTexturePackages = texturePackages.filter((entry) => entry.needsModernConverter);
   const modernMaterialPackages = materialPackages.filter((entry) => entry.needsModernConverter);
@@ -1689,24 +1731,14 @@ export async function importUnrealDirectory(
     ({ entry, state }) => entry.meshKind === "static" && state === "uncooked" && !entry.needsModernConverter,
   );
   const uncookedMeshDescription = uncooked.filter(
-    (entry) =>
-      entry.fileVersionUE4 !== undefined &&
-      entry.fileVersionUE4 >= 517 &&
-      entry.fileVersionUE4 <= 522,
+    (entry) => uncookedMeshRoute("static", entry.fileVersionUE4) === "mesh-description",
   );
-  const legacyRawMesh = uncooked.filter((entry) => entry.fileVersionUE4 === 516);
-  const unsupportedUncooked = uncooked.filter(
-    (entry) =>
-      !legacyRawMesh.includes(entry) &&
-      (entry.fileVersionUE4 === undefined ||
-        entry.fileVersionUE4 < 517 ||
-        entry.fileVersionUE4 > 522),
-  );
+  const unsupportedUncooked = uncooked.filter((entry) => uncookedMeshRoute("static", entry.fileVersionUE4) === undefined);
   if (unsupportedUncooked.length > 0) {
     const versions = [...new Set(unsupportedUncooked.map((entry) => entry.fileVersionUE4 ?? "unknown"))];
     throw new ImportError(
       "UNREAL_SOURCE_UNSUPPORTED",
-      `${unsupportedUncooked.length} uncooked static-mesh package${unsupportedUncooked.length === 1 ? " uses" : "s use"} UE4 object version ${versions.join(", ")}. The engine-free MeshDescription path is verified for versions 517–522 (UE4.26/4.27-era source assets); refusing to guess at a different binary layout.`,
+      `${unsupportedUncooked.length} uncooked static-mesh package${unsupportedUncooked.length === 1 ? " uses" : "s use"} UE4 object version ${versions.join(", ")}. UE Viewer reads versions below 517 and the engine-free MeshDescription path reads 517–522 (UE4.25–4.27-era source assets); refusing to guess at a different binary layout.`,
     );
   }
 
@@ -1942,9 +1974,13 @@ export async function importUnrealDirectory(
           ],
           { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
         );
-        return run.code === 0
-          ? undefined
-          : { package: entry.package, reason: `UE Viewer animation export exited ${run.code}.` };
+        if (run.code === 0) return undefined;
+        // UE Viewer prints its reason last; without it every failure reads the same.
+        const diagnostic = `${run.stdout}\n${run.stderr}`.trim().split(/\r?\n/).filter((line) => line.trim()).at(-1)?.trim();
+        return {
+          package: entry.package,
+          reason: `UE Viewer animation export exited ${run.code}.${diagnostic ? ` ${diagnostic.slice(0, 300)}` : ""}`,
+        };
       } catch (error) {
         return {
           package: entry.package,
