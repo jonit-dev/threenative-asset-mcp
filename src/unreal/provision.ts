@@ -68,7 +68,7 @@ export const FABCLI_RELEASE = Object.freeze({
 /** GPL-3.0-or-later command-line converter, always executed out-of-process. */
 export const UNCOOKED_CONVERTER = Object.freeze({
   package: "unreal-assets-to-glb==4.27.2.0",
-  version: "4.27.2.0+threenative.6",
+  version: "4.27.2.0+threenative.7",
 });
 
 export interface ProvisionLog {
@@ -325,6 +325,13 @@ function replaceRequired(source: string, before: string, after: string, label: s
   return source.replace(before, after);
 }
 
+/** The pinned converter's package-owner constants sit a step below Unreal's own, which reads the
+ * PersistentGuid header fields out of phase. Align both gates before the header patches below run. */
+export function patchUncookedPackageVersionGates(source: string): string {
+  source = replaceRequired(source, "VER_UE4_ADDED_PACKAGE_OWNER = 517", "VER_UE4_ADDED_PACKAGE_OWNER = 518", "UE4 package-owner start version");
+  return replaceRequired(source, "VER_UE4_NON_OUTER_PACKAGE_IMPORT = 519", "VER_UE4_NON_OUTER_PACKAGE_IMPORT = 520", "UE4 package-owner end version");
+}
+
 /**
  * Installs the GPL converter in its own virtual environment and applies narrow compatibility
  * fixes to that external program. The fixes preserve uncooked-package PersistentGuid fields,
@@ -386,7 +393,9 @@ export async function provisionUncookedConverter(
     }
 
     const packagePath = join(moduleDir, "package.py");
-    let packageSource = (await readFile(packagePath, "utf8")).replace(/\r\n/g, "\n");
+    let packageSource = patchUncookedPackageVersionGates(
+      (await readFile(packagePath, "utf8")).replace(/\r\n/g, "\n"),
+    );
     packageSource = replaceRequired(
       packageSource,
       `        # 24. PersistentGuid (ObjectVersion >= VER_UE4_ADDED_PACKAGE_OWNER) - SKIPPED for cooked packages\n        # 25. OwnerPersistentGuid (VER_UE4_ADDED_PACKAGE_OWNER <= ObjectVersion < VER_UE4_NON_OUTER_PACKAGE_IMPORT) - SKIPPED for cooked packages\n        # Note: These editor-only fields may not be present in some packages`,
