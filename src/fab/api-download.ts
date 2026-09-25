@@ -174,10 +174,26 @@ export async function downloadFreeAssetViaApi(
       "Fab's listing detail no longer matches the expected contract.",
     );
   }
-  if (detail.isFree !== true) {
+  // Fab's own `isFree` flag lies for sponsored free listings ("add to library" at $0): the
+  // flag stays false while every license's priceTier prices 0. The tiers are the truth users
+  // see, so free is either the flag or all-zero tiers — not the flag alone.
+  const licenses = Array.isArray(detail.licenses) ? detail.licenses : [];
+  const freeByPriceTier =
+    licenses.length > 0 &&
+    licenses.every((license) => {
+      const tier = asRecord(asRecord(license)?.priceTier);
+      if (!tier) return false;
+      const price = typeof tier.price === "number" ? tier.price : undefined;
+      const amount = typeof tier.amount === "number" ? tier.amount : undefined;
+      return price === 0 || amount === 0;
+    });
+  if (detail.isFree !== true && !freeByPriceTier) {
+    // "Not free" is not "not yours". A paid listing the signed-in account already owns
+    // downloads through the FabCLI path (fab_import_asset), which sees the library this
+    // anonymous API call cannot. Route rather than dead-end.
     throw new FabClientError(
       "FAB_ACQUISITION_REQUIRED",
-      "This listing is not fully free; Fab requires an account or purchase before downloading. The MCP did not start that flow.",
+      "This listing is not fully free, so the anonymous download path stops here. If you already own it, call fab_import_asset with this listing — it downloads through your signed-in FabCLI library (run the FabCLI login once if it reports unauthenticated). The MCP did not start a purchase flow.",
     );
   }
 

@@ -24,3 +24,7 @@ work/
 .DS_Store
 .idea/
 .vscode/
+
+# Agent worktrees
+.worktrees/
+__pycache__/

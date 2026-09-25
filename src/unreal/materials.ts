@@ -369,12 +369,28 @@ function planForFileName(texture: string): SlotPlan | undefined {
   return undefined;
 }
 
-function isDisplacementTexture(texture: string): boolean {
-  return /(_displacement|_height)(_tex)?$/i.test(texture);
+const COLOUR_TOKENS = new Set(["c", "d", "diff", "diffuse", "basecolor", "basecolour", "albedo", "color", "colour"]);
+const DATA_TOKENS = new Set(["displacement", "height", "ao", "aoro", "curvature", "orm", "arm", "mask", "masks", "roughness", "gloss"]);
+const NORMAL_TOKENS = new Set(["n", "nrm", "normal"]);
+
+/** Name tokens after the prefix: `T_brick_wall_tiling_c_grey` is a colour map in its grey variant. */
+function nameTokens(texture: string): string[] {
+  return texture.toLowerCase().split("_").slice(1);
 }
 
+/** A colour word anywhere (`_c_grey`), or a trailing `_A` albedo beside `_N`/`_AORO` — never a
+ * texture that ends as a normal map, whatever variant letter precedes that. */
 function isColourTexture(texture: string): boolean {
-  return /(_color|_colour|_d|_diff|_diffuse|_basecolor|_albedo)(_tex)?$/i.test(texture);
+  const tokens = nameTokens(texture);
+  if (NORMAL_TOKENS.has(tokens.at(-1) ?? "")) return false;
+  return tokens.some((token) => COLOUR_TOKENS.has(token)) || tokens.at(-1) === "a";
+}
+
+/** Named for data channels — height, AO, curvature, a trailing `_g` gloss — and for no colour. */
+function isDataTexture(texture: string): boolean {
+  const tokens = nameTokens(texture);
+  if (isColourTexture(texture)) return false;
+  return tokens.some((token) => DATA_TOKENS.has(token)) || tokens.at(-1) === "g";
 }
 
 /** `*_D_R` textures carry roughness in alpha; the same image serves both slots. */
@@ -585,11 +601,13 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
   // grayscale images. Preserve both by packing roughness.red -> G and metalness.red -> B.
   const referenced = referencedTextures(request, seenMaterials);
 
-  // UE Viewer occasionally labels a graph's displacement input as `Diffuse` when it cannot
-  // reduce a layered material. A filename cannot normally outrank the resolved `.mat`, but this
-  // contradiction is unambiguous when that same graph references an explicit colour image.
+  // UE Viewer labels the first texture of a diffuse chain `Diffuse` when it cannot reduce the
+  // graph, and in older packs that is often a data map: a rock's height/AO/curvature mask, a
+  // brick wall's gloss. A filename cannot normally outrank the resolved `.mat`, but a data-named
+  // base colour is a contradiction: take the graph's explicit colour image, or none at all —
+  // a neutral surface beats one painted with a mask.
   const resolvedBaseColor = bindings.get("baseColor");
-  if (resolvedBaseColor && isDisplacementTexture(resolvedBaseColor.texture)) {
+  if (resolvedBaseColor && isDataTexture(resolvedBaseColor.texture)) {
     const colour = [...referenced].find(
       (texture) => request.availableTextures.has(texture) && isColourTexture(texture),
     );
@@ -601,7 +619,21 @@ export function resolveMaterial(request: ResolveMaterialRequest): ResolvedMateri
         confidence: "heuristic",
         transform: "none",
       });
+    } else {
+      bindings.delete("baseColor");
     }
+  }
+
+  // Megascans foliage blends seasonal texture sets, and UE Viewer resolves the graph's first sample
+  // — the Winter set, which turns every leaf brown. The packs' default look is Summer, so a Winter
+  // or Autumn texture yields to its Summer sibling when the same graph references one.
+  for (const [slot, binding] of bindings) {
+    const summer = binding.texture.replace(/_(winter|autumn|fall)(?=_|$)/i, "_summer").toLowerCase();
+    if (summer === binding.texture.toLowerCase()) continue;
+    const sibling = [...referenced].find(
+      (texture) => texture.toLowerCase() === summer && request.availableTextures.has(texture),
+    );
+    if (sibling) bindings.set(slot, { ...binding, texture: sibling, confidence: "heuristic" });
   }
 
   const metallicRoughness = bindings.get("metallicRoughness");
