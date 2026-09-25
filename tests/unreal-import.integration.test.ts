@@ -2134,6 +2134,19 @@ process.exit(1);
         freeSpaceBytes,
       }),
     ).rejects.toMatchObject({ code: "UNREAL_DISK_SPACE" });
+
+    // The converters only take a filter for a single package, so two requested packages convert the
+    // whole source tree: sizing only those two would under-count what the import actually reads.
+    await expect(
+      importUnrealDirectory({
+        sourceDir: workspace.sourceDir,
+        outputDir: join(workspace.outputDir, "two-packages"),
+        environment: workspace.environment,
+        umodel: { name: "umodel", path: workspace.umodel, version: "Test" },
+        onlyPackages: ["SM_Rock", "BP_Spawner"],
+        freeSpaceBytes,
+      }),
+    ).rejects.toMatchObject({ code: "UNREAL_DISK_SPACE" });
   }, 60_000);
 
   it("says why the modern converter produced nothing for a static mesh", async () => {
@@ -2195,6 +2208,47 @@ process.exit(1);
     expect(report.failed).toEqual([]);
     expect(report.counts).toMatchObject({ exported: 1, failed: 0 });
     expect(report.models[0]).toMatchObject({ name: "SM_Rock", kind: "static" });
+  });
+
+  it("promotes nothing when only some modern packages can fall back to UE Viewer", async () => {
+    const workspace = await unrealWorkspace({ classes: {}, listExitCode: 1 });
+    const readable = Buffer.alloc(32);
+    readable.writeUInt32LE(0x9e2a83c1, 0);
+    readable.writeInt32LE(-8, 4);
+    // Below UE4.25, so UE Viewer reads this mesh itself and the modern converter was never needed.
+    readable.writeInt32LE(500, 12);
+    await writeFile(
+      join(workspace.sourceDir, "Content", "Game", "SM_Rock.uasset"),
+      Buffer.concat([readable, Buffer.from("StaticMesh\0Default__StaticMesh\0NaniteSettings\0")]),
+    );
+    // A UE5-era static mesh that UE Viewer can no longer read: recovering the other one silently
+    // would drop this package, so the converter's own diagnostic is the honest answer.
+    const unreadable = Buffer.alloc(32);
+    unreadable.writeUInt32LE(0x9e2a83c1, 0);
+    unreadable.writeInt32LE(-8, 4);
+    unreadable.writeInt32LE(1009, 12);
+    await writeFile(
+      join(workspace.sourceDir, "Content", "Game", "SM_Tree.uasset"),
+      Buffer.concat([unreadable, Buffer.from("StaticMesh\0Default__StaticMesh\0")]),
+    );
+    const converter = await writeFailingModernConverter(workspace);
+
+    const error = await importUnrealDirectory({
+      sourceDir: workspace.sourceDir,
+      outputDir: workspace.outputDir,
+      environment: workspace.environment,
+      umodel: { name: "umodel", path: workspace.umodel, version: "Test" },
+      modernConverter: { name: "modern", path: converter, version: "Test failing" },
+      onlyPackages: ["SM_Rock", "SM_Tree"],
+    }).then(
+      () => undefined,
+      (reason: unknown) => reason as ToolchainError,
+    );
+
+    expect(error?.code).toBe("UNREAL_TOOL_FAILED");
+    expect(error?.message).toContain("SM_Tree.uasset is UE5 (legacy file version -8), UE4 object version 1009");
+    expect(error?.message).toContain("fatal: no geometry to write");
+    await expect(stat(workspace.outputDir)).rejects.toThrow();
   });
 });
 

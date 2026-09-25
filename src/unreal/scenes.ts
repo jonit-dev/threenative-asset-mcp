@@ -116,8 +116,9 @@ export interface ImportedScene {
   readonly name: string;
   readonly package: string;
   readonly glb: string;
-  /** Bounding-box size of the assembled level in metres, so a game can place it unopened. */
-  readonly sizeMeters: { readonly x: number; readonly y: number; readonly z: number };
+  /** Bounding-box size of the assembled level in metres, so a game can place it unopened. Absent
+   * when the level reconstructs no geometry to measure. */
+  readonly sizeMeters: { readonly x: number; readonly y: number; readonly z: number } | undefined;
   readonly manifest: string;
   readonly bytes: number;
   readonly sha256: string;
@@ -867,16 +868,22 @@ export async function assembleSceneGlb(request: AssembleSceneRequest): Promise<I
     }, null, 2)}\n`,
   );
   const bounds = getBounds(scene);
+  const measured = {
+    x: bounds.max[0] - bounds.min[0],
+    y: bounds.max[1] - bounds.min[1],
+    z: bounds.max[2] - bounds.min[2],
+  };
+  // A level that reconstructs no mesh at all bounds to -Infinity, which is not a size: report
+  // nothing rather than a number the game's own validation would have to reject.
+  const sizeMeters = [measured.x, measured.y, measured.z].every(Number.isFinite)
+    ? measured
+    : undefined;
   return {
     name: request.source.mapName,
     package: request.package,
     glb: glbRelative,
     manifest: manifestRelative,
-    sizeMeters: {
-      x: bounds.max[0] - bounds.min[0],
-      y: bounds.max[1] - bounds.min[1],
-      z: bounds.max[2] - bounds.min[2],
-    },
+    sizeMeters,
     bytes: validated.bytes,
     sha256: validated.sha256,
     actors: request.source.actors.length + sourceTexts.length,

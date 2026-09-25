@@ -1455,10 +1455,12 @@ export async function importUnrealDirectory(
     );
   }
   const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
-  // A filtered import only reads the packages it converts, so that is all the space it can need.
-  const neededBytes = request.onlyPackages
-    ? await importedPackageBytes(files, new Set(request.onlyPackages))
-    : totalBytes;
+  // Only a single-package request is actually filtered: both converters take `--filter` for one
+  // package alone and convert the whole tree otherwise, so two or more still need the whole tree.
+  const neededBytes =
+    request.onlyPackages?.length === 1 && request.onlyPackages[0]
+      ? await importedPackageBytes(files, new Set(request.onlyPackages))
+      : totalBytes;
   const sourceHash = await hashSourceTree(sourceDir, files);
 
   const umodel = request.umodel ?? (await ensureUmodel(environment, log));
@@ -2155,30 +2157,31 @@ export async function importUnrealDirectory(
     });
     if (converted.code !== 0) {
       // A static mesh old enough for UE Viewer never needed the modern converter, so one
-      // converter crash must not take a mesh UE Viewer can read down with it.
-      const retried = await mapWithConcurrency(
-        modernPackages.filter(
-          ({ entry, fileVersionUE4 }) =>
-            entry.meshKind === "static" && uncookedMeshRoute("static", fileVersionUE4) === "umodel",
-        ),
-        1,
-        async ({ entry }) => ({ entry, reason: await exportMeshWithUmodel(entry, raw) }),
+      // converter crash must not take a mesh UE Viewer can read down with it. That fallback is only
+      // honest when it covers everything: recovering part of the request would drop the rest
+      // silently, so anything UE Viewer cannot supply reports the converter's own diagnostic.
+      const retryable = modernPackages.filter(
+        ({ entry, fileVersionUE4 }) =>
+          entry.meshKind === "static" && uncookedMeshRoute("static", fileVersionUE4) === "umodel",
       );
-      for (const result of retried) {
-        if (result.reason === undefined) recoveredByUmodel.add(basename(result.entry.package, extname(result.entry.package)));
-        else failed.push({ package: result.entry.package, reason: result.reason });
-      }
-      if (recoveredByUmodel.size > 0) {
-        assets = await indexExported(raw);
-        warnings.push(
-          `The modern UE5 asset converter exited ${converted.code}; UE Viewer decoded ${recoveredByUmodel.size} static mesh package${recoveredByUmodel.size === 1 ? "" : "s"} it could read itself.`,
-        );
-      } else {
+      const retried = await mapWithConcurrency(retryable, 1, async ({ entry }) => ({
+        entry,
+        reason: await exportMeshWithUmodel(entry, raw),
+      }));
+      const incomplete = retried.find((result) => result.reason !== undefined);
+      if (retryable.length !== modernPackages.length || incomplete) {
         throw new ToolchainError(
           "UNREAL_TOOL_FAILED",
           `The modern UE5 asset converter exited ${converted.code}; no partial output was promoted. ${describeModernFailure(converted.stderr, modernPackages)}`,
         );
       }
+      for (const result of retried) {
+        recoveredByUmodel.add(basename(result.entry.package, extname(result.entry.package)));
+      }
+      assets = mergeExported(assets, await indexExported(raw));
+      warnings.push(
+        `The modern UE5 asset converter exited ${converted.code}; UE Viewer decoded ${recoveredByUmodel.size} static mesh package${recoveredByUmodel.size === 1 ? "" : "s"} it could read itself.`,
+      );
     } else {
       modernGlbs = await indexGlbs(modernRaw);
       assets = mergeExported(assets, await indexExported(modernRaw));

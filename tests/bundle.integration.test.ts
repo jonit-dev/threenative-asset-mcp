@@ -33,7 +33,30 @@ async function animationGlb(): Promise<Uint8Array> {
   const document = new Document();
   const buffer = document.createBuffer();
   const node = document.createNode("Hips");
-  document.createScene("Scene").addChild(node);
+  // A reference body for the clips to drive, so the aggregate GLB has bounds to report.
+  document
+    .createScene("Scene")
+    .addChild(node)
+    .addChild(
+      document
+        .createNode("Body")
+        .setMesh(
+          document
+            .createMesh("Body")
+            .addPrimitive(
+              document
+                .createPrimitive()
+                .setAttribute(
+                  "POSITION",
+                  document
+                    .createAccessor("POSITION")
+                    .setType("VEC3")
+                    .setArray(new Float32Array([0, 0, 0, 2, 0, 0, 0, 4, 0]))
+                    .setBuffer(buffer),
+                ),
+            ),
+        ),
+    );
 
   for (const [name, distance] of [
     ["Idle_Loop", 0],
@@ -239,6 +262,18 @@ describe("selective remote bundle access", () => {
 
     expect(await readFile(result.path, "utf8")).toBe("CC0");
     expect(ranged.transferred()).toBeLessThan(zip.byteLength);
+    expect(result).not.toHaveProperty("sizeMeters");
+  });
+
+  it("reports how big a downloaded GLB is", async () => {
+    const { client } = await fixtureClient();
+    const glb = await client.downloadEntry({
+      packId: "quaternius-universal-animation-library-1",
+      uploadId: "17958403",
+      entryPath: "Universal Animation Library/UAL1_Standard.glb",
+    });
+
+    expect(glb.sizeMeters).toEqual({ x: 2, y: 4, z: 0 });
   });
 
   it("rejects a poisoned local entry cache instead of returning the wrong file", async () => {

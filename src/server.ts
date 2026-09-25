@@ -888,7 +888,7 @@ export function createAssetServer(
     {
       title: "Download one file from a remote asset bundle",
       description:
-        "Extract one selected ZIP entry through HTTP byte ranges, cache it locally, and avoid downloading unrelated bundle contents. Requires explicit license acknowledgement.",
+        "Extract one selected ZIP entry through HTTP byte ranges, cache it locally, and avoid downloading unrelated bundle contents. Requires explicit license acknowledgement. A `.glb`/`.gltf` entry also reports `sizeMeters`, its bounding-box size in the file's own units: a value near 890 for something meant to be 9 m means the source was authored in centimetres and the game must scale it.",
       inputSchema: BundleDownloadEntryInputSchema,
       outputSchema: BundleDownloadEntryOutputSchema,
       annotations: {

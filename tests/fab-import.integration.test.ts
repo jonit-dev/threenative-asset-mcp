@@ -182,12 +182,12 @@ describe("Fab licence gate", () => {
 
 describe("Fab session handling", () => {
   /** A FabCLI whose every subcommand fails with the given message, as a keyring refusal looks. */
-  async function fabcliSaying(message: string): Promise<FabCli> {
+  async function fabcliSaying(message: string, exitCode = 0): Promise<FabCli> {
     const path = join(await temporaryDirectory(), "fabcli");
     const payload = JSON.stringify({ error: { kind: "auth_required", message } });
     await writeFile(
       path,
-      `#!/usr/bin/env node\nprocess.stdout.write(\`${payload}\` + "\\n");\n`,
+      `#!/usr/bin/env node\nprocess.stdout.write(\`${payload}\` + "\\n");\nprocess.exit(${exitCode});\n`,
     );
     await chmod(path, 0o755);
     return new FabCli({ tool: { name: "fabcli", path, version: "0.1.0" } });
@@ -202,6 +202,18 @@ describe("Fab session handling", () => {
     expect(error?.code).toBe("FABCLI_KEYSTORE_UNREACHABLE");
     expect(error?.message).toMatch(/DBUS_SESSION_BUS_ADDRESS/);
     expect(error?.message).toMatch(/logging in again will not help/);
+  });
+
+  it("blames the same missing session bus when the keyring fails a download", async () => {
+    const fabcli = await fabcliSaying("failed to unlock secure storage", 1);
+    const error = await fabcli
+      .download({ listingId: LISTING, outputDir: await temporaryDirectory(), engine: undefined })
+      .then(
+        () => undefined,
+        (thrown: unknown) => thrown as FabCliError,
+      );
+    expect(error?.code).toBe("FABCLI_KEYSTORE_UNREACHABLE");
+    expect(error?.message).toMatch(/DBUS_SESSION_BUS_ADDRESS/);
   });
 
   it("still says log in when FabCLI reports a genuinely absent session", async () => {

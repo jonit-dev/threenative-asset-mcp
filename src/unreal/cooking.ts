@@ -154,7 +154,9 @@ export async function readPackageCooking(file: string): Promise<PackageCooking> 
     markers,
     legacyFileVersion,
     fileVersionUE4: head.readInt32LE(12),
-    fileVersionUE5: head.readInt32LE(16),
+    // A UE4 header carries no UE5 version at this offset: it holds FileVersionLicenseeUE4, which is
+    // a licensee build number. Only a negative legacy version marks the UE5 header layout.
+    fileVersionUE5: legacyFileVersion <= -8 ? head.readInt32LE(16) : undefined,
     naniteHint: head.includes("NaniteSettings", 0, "latin1"),
     meshKindHint:
       hasSkeletalClass && (hasSkeletalEditorData || (legacyFileVersion <= -8 && hasDefaultSkeletalClass))

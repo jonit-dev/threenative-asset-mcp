@@ -6,6 +6,11 @@ import { PackIdSchema } from "./itch.js";
 
 const UploadIdSchema = z.string().regex(/^\d+$/).max(30);
 const EntryPathSchema = z.string().min(1).max(2_048);
+const SizeMetersSchema = z.object({
+  x: z.number().nonnegative(),
+  y: z.number().nonnegative(),
+  z: z.number().nonnegative(),
+});
 
 function success<T extends Record<string, unknown>>(output: T) {
   return {
@@ -109,6 +114,7 @@ export const BundleDownloadEntryOutputSchema = z
     sha256: z.string().regex(/^[0-9a-f]{64}$/),
     alreadyCached: z.boolean(),
     rangeBytesTransferred: z.number().int().nonnegative(),
+    sizeMeters: SizeMetersSchema.optional(),
   })
   .extend(LicenseOutputSchema.shape);
 

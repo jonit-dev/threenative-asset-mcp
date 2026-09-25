@@ -17,6 +17,7 @@ import {
 } from "node:fs/promises";
 import { basename, join, resolve, sep } from "node:path";
 
+import { sizeMeters, type SizeMeters } from "../gltf-size.js";
 import type { ItchPackId } from "../itch/catalog.js";
 import type { ResolvedItchUpload } from "../itch/client.js";
 
@@ -64,6 +65,8 @@ interface EntryBytesResult {
   path: string;
   alreadyCached: boolean;
   rangeBytesTransferred: number;
+  /** Bounding-box size for a written glTF entry, so a game can place it unopened. */
+  sizeMeters?: SizeMeters;
 }
 
 interface TrackedArchive {
@@ -218,6 +221,7 @@ export class BundleAssetClient {
       sha256: sha256(result.bytes),
       alreadyCached: result.alreadyCached,
       rangeBytesTransferred: result.rangeBytesTransferred,
+      ...(result.sizeMeters ? { sizeMeters: result.sizeMeters } : {}),
     };
   }
 
@@ -358,11 +362,13 @@ export class BundleAssetClient {
         },
       );
       if (expectedHash?.trim() === sha256(bytes)) {
+        const size = await sizeMeters(outputPath);
         return {
           bytes,
           path: outputPath,
           alreadyCached: true,
           rangeBytesTransferred: 0,
+          ...(size ? { sizeMeters: size } : {}),
         };
       }
     } catch (error) {
@@ -401,11 +407,13 @@ export class BundleAssetClient {
         `${outputPath}.sha256`,
         new TextEncoder().encode(`${sha256(bytes)}\n`),
       );
+      const size = await sizeMeters(outputPath);
       return {
         bytes,
         path: outputPath,
         alreadyCached,
         rangeBytesTransferred: archive.transferred(),
+        ...(size ? { sizeMeters: size } : {}),
       };
     } finally {
       await archive.reader.close();

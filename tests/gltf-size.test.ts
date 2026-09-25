@@ -80,4 +80,12 @@ describe("sizeMeters", () => {
     await writeFile(path, "not a glb");
     expect(await sizeMeters(path)).toBeUndefined();
   });
+
+  it("reports no size for a scene that holds no mesh to measure", async () => {
+    const path = await temporaryPath("empty.glb");
+    const document = new Document();
+    document.createScene("empty");
+    await new NodeIO().write(path, document);
+    expect(await sizeMeters(path)).toBeUndefined();
+  });
 });
