@@ -1011,6 +1011,90 @@ fs.copyFileSync(${JSON.stringify(png)}, path.join(out, "Textures", "SM_Rock.png"
     expect((await stat(join(workspace.outputDir, report.textures[0]!.png))).size).toBeGreaterThan(0);
   });
 
+  // Fab's UE5 Megascans packs ship foliage types, material functions and a parameter collection
+  // beside the meshes. UE Viewer cannot list UE5 packages, so these used to read as failures.
+  it("reports UE5 editor-only packages UE Viewer cannot list as skipped, not failed", async () => {
+    const workspace = await unrealWorkspace({ classes: {}, listExitCode: 1 });
+    const header = Buffer.alloc(32);
+    header.writeUInt32LE(0x9e2a83c1, 0);
+    header.writeInt32LE(-8, 4);
+    const game = join(workspace.sourceDir, "Content", "Game");
+    await writeFile(join(game, "SM_Rock.uasset"), Buffer.concat([header, Buffer.from("AssetImportData\0Texture2D\0")]));
+    await writeFile(join(game, "FT_Rock.uasset"), Buffer.concat([header, Buffer.from("FoliageType_InstancedStaticMesh\0")]));
+    await writeFile(join(game, "MF_Blend.uasset"), Buffer.concat([header, Buffer.from("MaterialFunction\0MaterialFunctionEditorOnlyData\0")]));
+    // A MaterialFunctionInstance is not a MaterialFunction: only whole name-table entries count.
+    await writeFile(join(game, "MFI_Blend.uasset"), Buffer.concat([header, Buffer.from("MaterialFunctionInstance\0")]));
+    const png = join(workspace.sourceDir, "..", "modern-texture.png");
+    await writePng(png, [20, 40, 60, 255], 4);
+    const converter = join(workspace.sourceDir, "..", "modern-texture-converter");
+    await writeFile(
+      converter,
+      `#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+const out = process.argv[process.argv.indexOf("--export-dir") + 1];
+fs.mkdirSync(path.join(out, "Textures"), { recursive: true });
+fs.copyFileSync(${JSON.stringify(png)}, path.join(out, "Textures", "SM_Rock.png"));
+`,
+    );
+    await chmod(converter, 0o755);
+
+    const report = await importUnrealDirectory({
+      sourceDir: workspace.sourceDir,
+      outputDir: workspace.outputDir,
+      environment: workspace.environment,
+      umodel: { name: "umodel", path: workspace.umodel, version: "Test" },
+      modernConverter: { name: "modern", path: converter, version: "Test modern texture" },
+      onlyPackages: ["SM_Rock", "FT_Rock", "MF_Blend", "MFI_Blend"],
+    });
+
+    const reason = (name: string) => report.skipped.find((entry) => entry.package.includes(name))?.reason;
+    expect(reason("FT_Rock")).toBe("unsupported Unreal-only content: foliage placement type");
+    expect(reason("MF_Blend")).toMatch(/no directly importable .*MaterialFunction/);
+    expect(report.failed.map((entry) => entry.package)).toEqual([expect.stringContaining("MFI_Blend")]);
+  });
+
+  // Every Megascans UE5 pack ships BP_GlobalFoliageActor: an event graph with nothing to place.
+  it("skips a logic-only Blueprint prefab the converter reports as empty, without a second level failure", async () => {
+    const workspace = await unrealWorkspace({ classes: {}, listExitCode: 1 });
+    const header = Buffer.alloc(32);
+    header.writeUInt32LE(0x9e2a83c1, 0);
+    header.writeInt32LE(-8, 4);
+    const game = join(workspace.sourceDir, "Content", "Game");
+    await writeFile(join(game, "SM_Rock.uasset"), Buffer.concat([header, Buffer.from("AssetImportData\0Texture2D\0")]));
+    await writeFile(join(game, "BP_Wind.uasset"), Buffer.concat([header, Buffer.from("BlueprintGeneratedClass\0SimpleConstructionScript\0")]));
+    const png = join(workspace.sourceDir, "..", "modern-texture.png");
+    await writePng(png, [20, 40, 60, 255], 4);
+    const converter = join(workspace.sourceDir, "..", "modern-converter");
+    await writeFile(
+      converter,
+      `#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+const out = process.argv[process.argv.indexOf("--export-dir") + 1];
+if (process.argv.some((arg) => arg.includes("BP_Wind"))) {
+  process.stderr.write("Unhandled exception. System.IO.InvalidDataException: No StaticMesh, SkeletalMesh, Texture2D, TextureCube, SoundWave, or structured-data output was produced.\\n");
+  process.exit(134);
+}
+fs.mkdirSync(path.join(out, "Textures"), { recursive: true });
+fs.copyFileSync(${JSON.stringify(png)}, path.join(out, "Textures", "SM_Rock.png"));
+`,
+    );
+    await chmod(converter, 0o755);
+
+    const report = await importUnrealDirectory({
+      sourceDir: workspace.sourceDir,
+      outputDir: workspace.outputDir,
+      environment: workspace.environment,
+      umodel: { name: "umodel", path: workspace.umodel, version: "Test" },
+      modernConverter: { name: "modern", path: converter, version: "Test modern" },
+      onlyPackages: ["SM_Rock", "BP_Wind"],
+    });
+
+    expect(report.failed).toEqual([]);
+    expect(report.skipped.find((entry) => entry.package.includes("BP_Wind"))?.reason).toMatch(/Blueprint class with no mesh or light components/);
+  });
+
   it("decodes TextureCube as collision-safe 2:1 environment PNG and preserves ratio under an odd size cap", async () => {
     const workspace = await unrealWorkspace({ classes: { SM_Rock: ["TextureCube"] } });
     const panorama = join(workspace.sourceDir, "..", "panorama.png");

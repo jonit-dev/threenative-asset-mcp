@@ -9,8 +9,11 @@ ue5-editor-static-meshes.md follows; it is not called by the importer.
 import struct
 import sys
 
-BOOL = 5    # bulk array elements are 1 byte, but the default value is a 4-byte UE bool
 FNAME = 6   # values are FStrings, with no element-size field
+# Default-value size per attribute type: FVector4f, FVector3f, FVector2f, float, int32, and bool
+# (a 4-byte UE bool, although bulk arrays store 1 byte per element). The default is written even
+# for an attribute with no channels, so it cannot be sized from the arrays.
+DEFAULT_SIZE = {0: 16, 1: 12, 2: 8, 3: 4, 4: 4, 5: 4}
 
 
 class Reader:
@@ -50,7 +53,7 @@ def parse(data):
                 kind = r.i32()
                 r.i32()                             # unknown, 1 or 2 so far
                 r.i32()                             # element count again
-                arrays, last_size = [], 0
+                arrays = []
                 for _ in range(r.i32()):            # attribute indices (TextureCoordinate has one per UV set)
                     r.i32()                         # extent: values per element (3 for triangle corners)
                     if kind == FNAME:
@@ -58,11 +61,10 @@ def parse(data):
                         continue
                     size, n = r.i32(), r.i32()
                     arrays.append(r.raw(size * n))
-                    last_size = size
                 if kind == FNAME:
                     r.fstring()                     # default value
-                elif arrays:
-                    r.raw(4 if kind == BOOL else last_size)
+                else:
+                    r.raw(DEFAULT_SIZE[kind])
                 r.i32()                             # EMeshAttributeFlags (Mandatory=32, IndexReference=16, ...)
                 attributes[name] = arrays
             channels.append({"count": count, "attributes": attributes})

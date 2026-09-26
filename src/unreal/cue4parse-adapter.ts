@@ -2,7 +2,7 @@
 export const CUE4PARSE_SOURCE = Object.freeze({
   repository: "https://github.com/FabianFG/CUE4Parse.git",
   commit: "b4e95441bcf0c975eb3adb68c0fb44c740c2cf62",
-  version: "b4e95441+threenative.48",
+  version: "b4e95441+threenative.49",
 });
 
 /** Applied to the pinned checkout, which remains an out-of-process Apache-2.0 tool. */
@@ -223,6 +223,7 @@ export const CUE4PARSE_PROJECT = String.raw`<Project Sdk="Microsoft.NET.Sdk">
 `;
 
 export const CUE4PARSE_PROGRAM = String.raw`using System.Buffers.Binary;
+using System.Runtime.InteropServices;
 using System.Text;
 using CUE4Parse.FileProvider;
 using CUE4Parse.MappingsProvider.Usmap;
@@ -333,7 +334,7 @@ async Task<bool> ExportPaperSpriteAsync(UPaperSprite sprite)
         var packageBytes = await File.ReadAllBytesAsync(textureFile);
         var sourcePng = ExtractLargestPng(packageBytes) ?? ExtractCompressedPayloadPng(packageBytes);
         if (sourcePng is null) return false;
-        await File.WriteAllBytesAsync(textureTarget, sourcePng);
+        await File.WriteAllBytesAsync(textureTarget, NormalizeSourcePng(sourcePng, LoadAssetByName<UTexture>(textureName)));
     }
     var descriptor = new {
         Name = sprite.Name,
@@ -464,10 +465,16 @@ async Task ExportMaterialAsync(string initialName)
 
         foreach (var textureName in references.Select(entry => entry.Texture).Distinct(StringComparer.OrdinalIgnoreCase))
         {
+            var target = Path.Combine(materialDirectory, textureName + ".png");
+            // Materials share the same 8K textures, so skip decoding/encoding one another material already wrote.
+            if (File.Exists(target)) continue;
             var textureFile = Directory.EnumerateFiles(root, textureName + ".uasset", SearchOption.AllDirectories).FirstOrDefault();
             if (textureFile is null || new FileInfo(textureFile).Length > 1_073_741_824) continue;
-            var sourcePng = ExtractLargestPng(await File.ReadAllBytesAsync(textureFile));
-            if (sourcePng is not null) await File.WriteAllBytesAsync(Path.Combine(materialDirectory, textureName + ".png"), sourcePng);
+            // UE5.1+ keeps large source art inside an FCompressedBuffer payload, like every other
+            // editor texture site; without this fallback a level's materials lost their textures.
+            var textureBytes = await File.ReadAllBytesAsync(textureFile);
+            var sourcePng = ExtractLargestPng(textureBytes) ?? ExtractCompressedPayloadPng(textureBytes);
+            if (sourcePng is not null) await File.WriteAllBytesAsync(target, NormalizeSourcePng(sourcePng, LoadAssetByName<UTexture>(textureName)));
         }
     }
 }
@@ -477,20 +484,74 @@ async Task<bool> ExportStaticMeshAsync(UStaticMesh mesh)
     var identity = mesh.GetPathName();
     var target = Path.Combine(output, "Meshes", mesh.Name + ".glb");
     if (!exportedMeshes.Add(identity)) return File.Exists(target);
-    var session = new ExportSession { MaxDegreeOfParallelism = 1 };
-    session.Add(mesh);
-    var results = await session.RunAsync(output, new ExportOptions(meshFormat: EMeshFormat.Gltf2, exportMaterials: false));
-    var emitted = results.SelectMany(result => result.DiskFilePaths ?? [])
-        .FirstOrDefault(path => path.EndsWith(".glb", StringComparison.OrdinalIgnoreCase));
-    if (emitted is null || !File.Exists(emitted))
+    // An uncooked UE5 package deserializes StaticMaterials as a tagged property, after the point
+    // UStaticMesh stops reading editor packages.
+    var staticMaterials = mesh.StaticMaterials.Length > 0
+        ? mesh.StaticMaterials
+        : mesh.GetOrDefault("StaticMaterials", Array.Empty<FStaticMaterial>());
+    if (mesh.RenderData?.LODs is not { Length: > 0 })
     {
-        exportedMeshes.Remove(identity);
-        return false;
+        // Uncooked editor mesh: no render data, only the source model. Decode LOD0's
+        // FMeshDescription from the package trailer instead.
+        if (!ExportEditorStaticMesh(mesh, staticMaterials, target))
+        {
+            exportedMeshes.Remove(identity);
+            return false;
+        }
     }
-    if (!Path.GetFullPath(emitted).Equals(Path.GetFullPath(target), StringComparison.OrdinalIgnoreCase)) File.Move(emitted, target, true);
-    foreach (var materialName in mesh.StaticMaterials.Select(slot => slot.MaterialInterface?.Name).Where(name => !string.IsNullOrWhiteSpace(name)).Distinct(StringComparer.OrdinalIgnoreCase))
+    else
+    {
+        var session = new ExportSession { MaxDegreeOfParallelism = 1 };
+        session.Add(mesh);
+        var results = await session.RunAsync(output, new ExportOptions(meshFormat: EMeshFormat.Gltf2, exportMaterials: false));
+        var emitted = results.SelectMany(result => result.DiskFilePaths ?? [])
+            .FirstOrDefault(path => path.EndsWith(".glb", StringComparison.OrdinalIgnoreCase));
+        if (emitted is null || !File.Exists(emitted))
+        {
+            exportedMeshes.Remove(identity);
+            return false;
+        }
+        if (!Path.GetFullPath(emitted).Equals(Path.GetFullPath(target), StringComparison.OrdinalIgnoreCase)) File.Move(emitted, target, true);
+    }
+    foreach (var materialName in staticMaterials.Select(slot => slot.MaterialInterface?.Name).Where(name => !string.IsNullOrWhiteSpace(name)).Distinct(StringComparer.OrdinalIgnoreCase))
         await ExportMaterialAsync(materialName!);
     return true;
+}
+
+bool ExportEditorStaticMesh(UStaticMesh mesh, FStaticMaterial[] staticMaterials, string target)
+{
+    // Same-named meshes in different folders: prefer the key whose last two path segments match
+    // the owning package's.
+    var packageTail = string.Join('/', (mesh.Owner?.Name ?? mesh.Name).Split('/').TakeLast(2));
+    var packageKey = provider.Files.Keys
+        .Where(candidate => candidate.EndsWith(".uasset", StringComparison.OrdinalIgnoreCase) &&
+            Path.GetFileNameWithoutExtension(candidate).Equals(mesh.Name, StringComparison.OrdinalIgnoreCase))
+        .OrderByDescending(candidate => Path.ChangeExtension(candidate.Replace('\\', '/'), null)
+            .EndsWith(packageTail, StringComparison.OrdinalIgnoreCase))
+        .FirstOrDefault();
+    if (packageKey is null || !provider.Files.TryGetValue(packageKey, out var file) || file.Size > 2_000_000_000L)
+    {
+        assetLookupDiagnostics[mesh.Name] = "uncooked mesh package was not mounted";
+        return false;
+    }
+    var editorMesh = ReadLargestMeshDescription(file.Read());
+    if (editorMesh is null)
+    {
+        assetLookupDiagnostics[mesh.Name] = "uncooked mesh has no readable FMeshDescription source model";
+        return false;
+    }
+    // Same material naming as the cooked glTF writer (MeshMaterialDto.SlotName): the material
+    // interface's name, else the imported slot name.
+    var materialNames = editorMesh.GroupSlots.Select((slot, index) =>
+    {
+        var match = staticMaterials.FirstOrDefault(material =>
+            string.Equals(material.ImportedMaterialSlotName?.Text, slot, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(material.MaterialSlotName.Text, slot, StringComparison.OrdinalIgnoreCase))
+            ?? (index < staticMaterials.Length ? staticMaterials[index] : null);
+        return match?.MaterialInterface?.Name ?? match?.ImportedMaterialSlotName?.Text ?? slot;
+    }).ToArray();
+    WriteEditorMeshGlb(editorMesh, materialNames, mesh.Name, target);
+    return File.Exists(target);
 }
 
 T? LoadAssetByName<T>(string name) where T : UObject
@@ -1002,7 +1063,7 @@ foreach (var key in provider.Files.Keys.Where(key =>
                         packageBytes = await File.ReadAllBytesAsync(packageFile);
                 }
                 var sourcePng = ExtractLargestPng(packageBytes) ?? ExtractCompressedPayloadPng(packageBytes);
-                if (sourcePng is not null) await File.WriteAllBytesAsync(target, sourcePng);
+                if (sourcePng is not null) await File.WriteAllBytesAsync(target, NormalizeSourcePng(sourcePng, texture));
             }
             if (File.Exists(target)) pageFiles.Add(targetName);
         }
@@ -1064,7 +1125,7 @@ foreach (var key in provider.Files.Keys.Where(key =>
             var packageBytes = await File.ReadAllBytesAsync(textureFile);
             var sourcePng = ExtractLargestPng(packageBytes) ?? ExtractCompressedPayloadPng(packageBytes);
             if (sourcePng is null) continue;
-            await File.WriteAllBytesAsync(target, sourcePng);
+            await File.WriteAllBytesAsync(target, NormalizeSourcePng(sourcePng, texture));
         }
         exported++;
     }
@@ -1169,7 +1230,7 @@ foreach (var key in provider.Files.Keys.Where(key =>
                 if (sourceFile is not null && new FileInfo(sourceFile).Length <= 1_073_741_824)
                 {
                     var sourcePng = ExtractLargestPng(await File.ReadAllBytesAsync(sourceFile)) ?? ExtractCompressedPayloadPng(await File.ReadAllBytesAsync(sourceFile));
-                    if (sourcePng is not null) await File.WriteAllBytesAsync(textureTarget, sourcePng);
+                    if (sourcePng is not null) await File.WriteAllBytesAsync(textureTarget, NormalizeSourcePng(sourcePng, sheet));
                 }
             }
             if (!File.Exists(textureTarget)) textureFileName = null;
@@ -1359,6 +1420,272 @@ static byte[]? ExtractCompressedPayloadPng(byte[] bytes)
     return null;
 }
 
+// The LOD0 source model of an uncooked UE5 StaticMesh. Its package trailer holds one
+// FMeshDescription payload per source-model LOD, so the largest raw payload that parses is LOD0.
+// Every other payload in a StaticMesh package is also a mesh description, so ranking by the
+// header's raw size decompresses only what is kept.
+static EditorMesh? ReadLargestMeshDescription(byte[] bytes)
+{
+    ReadOnlySpan<byte> magic = [0xb7, 0x75, 0x63, 0x62];
+    var candidates = new List<(int At, ulong RawSize)>();
+    for (var searchAt = 0; searchAt <= bytes.Length - magic.Length;)
+    {
+        var relativeAt = bytes.AsSpan(searchAt).IndexOf(magic);
+        if (relativeAt < 0) break;
+        var payloadAt = searchAt + relativeAt;
+        searchAt = payloadAt + magic.Length;
+        try
+        {
+            using var archive = new FByteArchive("editor-payload", bytes);
+            archive.Position = payloadAt;
+            var header = new FCompressedBufferHeader(archive);
+            if (header.Magic == FCompressedBufferHeader.ExpectedMagic && header.TotalRawSize is > 0 and <= 1_073_741_824)
+                candidates.Add((payloadAt, header.TotalRawSize));
+        }
+        catch
+        {
+            // The magic may occur inside unrelated compressed bytes.
+        }
+    }
+    foreach (var (at, _) in candidates.OrderByDescending(candidate => candidate.RawSize))
+    {
+        try
+        {
+            using var archive = new FByteArchive("editor-payload", bytes);
+            archive.Position = at;
+            return ReadMeshDescription(DecompressEditorPayload(new FCompressedBuffer(archive)));
+        }
+        catch
+        {
+            // Not a mesh description; try the next largest payload.
+        }
+    }
+    return null;
+}
+
+// UE5's FMeshDescription serialization, as verified byte-exact on the Common Hazel packs (see
+// docs/PRDs/done/ue5-mesh-description-reference.py for the annotated layout). Throws unless the
+// whole payload is consumed, so a layout drift is a refusal rather than garbage geometry.
+static EditorMesh ReadMeshDescription(byte[] raw)
+{
+    using var stream = new MemoryStream(raw, false);
+    using var reader = new BinaryReader(stream);
+    string ReadName()
+    {
+        var length = reader.ReadInt32();
+        if (length is <= 0 or > 4096) throw new InvalidDataException("Implausible FString length.");
+        var text = Encoding.ASCII.GetString(reader.ReadBytes(length - 1));
+        reader.ReadByte();
+        return text;
+    }
+    var arrays = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+    var names = new Dictionary<string, string[]>(StringComparer.Ordinal);
+    var live = new Dictionary<string, bool[]>(StringComparer.Ordinal);
+    var elementTypes = reader.ReadInt32();
+    if (elementTypes is < 1 or > 64) throw new InvalidDataException("Not a mesh description.");
+    for (var elementIndex = 0; elementIndex < elementTypes; elementIndex++)
+    {
+        var element = ReadName();
+        var channels = reader.ReadInt32();
+        if (channels is < 0 or > 64) throw new InvalidDataException("Implausible element channel count.");
+        for (var channel = 0; channel < channels; channel++)
+        {
+            var bits = reader.ReadInt32();
+            if (bits < 0) throw new InvalidDataException("Negative allocation bit count.");
+            var words = new uint[(bits + 31) / 32];
+            for (var word = 0; word < words.Length; word++) words[word] = reader.ReadUInt32();
+            if (channel == 0) live[element] = Enumerable.Range(0, bits).Select(bit => ((words[bit >> 5] >> (bit & 31)) & 1) != 0).ToArray();
+            reader.ReadInt32(); // free-list head
+            reader.ReadInt32(); // element count
+            var attributes = reader.ReadInt32();
+            for (var attributeIndex = 0; attributeIndex < attributes; attributeIndex++)
+            {
+                var attribute = ReadName().Trim(); // Vertex position is "Position " with a space
+                var kind = reader.ReadInt32();
+                reader.ReadInt32();
+                reader.ReadInt32();
+                var indices = reader.ReadInt32();
+                for (var index = 0; index < indices; index++)
+                {
+                    reader.ReadInt32(); // extent
+                    var key = element + "[" + channel + "]." + attribute + "[" + index + "]";
+                    if (kind == 6)
+                    {
+                        var count = reader.ReadInt32();
+                        names[key] = Enumerable.Range(0, count).Select(_ => ReadName()).ToArray();
+                        continue;
+                    }
+                    var elementSize = reader.ReadInt32();
+                    var elements = reader.ReadInt32();
+                    arrays[key] = reader.ReadBytes(checked(elementSize * elements));
+                }
+                // The default value is written even for an attribute with no channels, so its size
+                // comes from the attribute type: FVector4f, FVector3f, FVector2f, float, int32, and
+                // bool (a 4-byte UE bool, although bulk arrays store 1 byte per element).
+                if (kind == 6) ReadName();
+                else reader.ReadBytes(kind switch
+                {
+                    0 => 16, 1 => 12, 2 => 8, 3 or 4 or 5 => 4,
+                    _ => throw new InvalidDataException("Unknown mesh attribute type " + kind + "."),
+                });
+                reader.ReadInt32(); // EMeshAttributeFlags
+            }
+        }
+    }
+    if (stream.Position != raw.Length) throw new InvalidDataException("Mesh description was not fully consumed.");
+    float[] Floats(string key) => arrays.TryGetValue(key, out var bytes) ? MemoryMarshal.Cast<byte, float>(bytes).ToArray() : throw new InvalidDataException("Missing " + key);
+    int[] Ints(string key) => arrays.TryGetValue(key, out var bytes) ? MemoryMarshal.Cast<byte, int>(bytes).ToArray() : throw new InvalidDataException("Missing " + key);
+    return new EditorMesh(
+        Floats("Vertices[0].Position[0]"),
+        Ints("VertexInstances[0].VertexIndex[0]"),
+        Floats("VertexInstances[0].Normal[0]"),
+        Floats("VertexInstances[0].TextureCoordinate[0]"),
+        Ints("Triangles[0].VertexInstanceIndex[0]"),
+        Ints("Triangles[0].PolygonGroupIndex[0]"),
+        live.TryGetValue("Triangles", out var triangles) ? triangles : [],
+        names.TryGetValue("PolygonGroups[0].ImportedMaterialSlotName[0]", out var slots) ? slots : []);
+}
+
+// Writes the decoded source model with the cooked glTF writer's conventions: centimetres to metres,
+// Unreal's Z-up swapped to glTF's Y-up, and Unreal's triangle order kept (the axis swap and
+// Unreal's left-handedness cancel). Vertex colours and tangents are left out, as the UE Viewer
+// route leaves them out: Megascans vertex colours are wind masks, not tint, and glTF clients
+// generate MikkTSpace tangents when none are given.
+static void WriteEditorMeshGlb(EditorMesh mesh, string[] materialNames, string name, string target)
+{
+    var builder = new SharpGLTF.Geometry.MeshBuilder<
+        SharpGLTF.Geometry.VertexTypes.VertexPositionNormal,
+        SharpGLTF.Geometry.VertexTypes.VertexTexture1,
+        SharpGLTF.Geometry.VertexTypes.VertexEmpty>(name);
+    var materials = new Dictionary<int, SharpGLTF.Materials.MaterialBuilder>();
+    SharpGLTF.Materials.MaterialBuilder Material(int group)
+    {
+        if (materials.TryGetValue(group, out var existing)) return existing;
+        var material = new SharpGLTF.Materials.MaterialBuilder(group >= 0 && group < materialNames.Length ? materialNames[group] : "MaterialSlot_" + group)
+            .WithBaseColor(System.Numerics.Vector4.One);
+        materials[group] = material;
+        return material;
+    }
+    SharpGLTF.Geometry.VertexBuilder<
+        SharpGLTF.Geometry.VertexTypes.VertexPositionNormal,
+        SharpGLTF.Geometry.VertexTypes.VertexTexture1,
+        SharpGLTF.Geometry.VertexTypes.VertexEmpty> Vertex(int instance)
+    {
+        var vertex = mesh.InstanceVertices[instance];
+        var position = new System.Numerics.Vector3(mesh.Positions[vertex * 3], mesh.Positions[vertex * 3 + 2], mesh.Positions[vertex * 3 + 1]) * 0.01f;
+        var normal = new System.Numerics.Vector3(mesh.Normals[instance * 3], mesh.Normals[instance * 3 + 2], mesh.Normals[instance * 3 + 1]);
+        normal = normal.LengthSquared() > 1e-12f && float.IsFinite(normal.LengthSquared()) ? System.Numerics.Vector3.Normalize(normal) : System.Numerics.Vector3.UnitY;
+        var uv = new System.Numerics.Vector2(mesh.Uv0[instance * 2], mesh.Uv0[instance * 2 + 1]);
+        return new(new SharpGLTF.Geometry.VertexTypes.VertexPositionNormal(position, normal), new SharpGLTF.Geometry.VertexTypes.VertexTexture1(uv));
+    }
+    var triangleCount = mesh.TriangleInstances.Length / 3;
+    for (var triangle = 0; triangle < triangleCount; triangle++)
+    {
+        if (triangle < mesh.LiveTriangles.Length && !mesh.LiveTriangles[triangle]) continue;
+        var group = triangle < mesh.TriangleGroups.Length ? mesh.TriangleGroups[triangle] : 0;
+        builder.UsePrimitive(Material(group)).AddTriangle(
+            Vertex(mesh.TriangleInstances[triangle * 3]),
+            Vertex(mesh.TriangleInstances[triangle * 3 + 1]),
+            Vertex(mesh.TriangleInstances[triangle * 3 + 2]));
+    }
+    var scene = new SharpGLTF.Scenes.SceneBuilder();
+    scene.AddRigidMesh(builder, System.Numerics.Matrix4x4.Identity);
+    Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+    scene.ToGltf2().SaveGLB(target);
+}
+
+// Editor source art is stored the way FTextureSource keeps it, not as a display image. A
+// TSF_BGRA8 source PNG carries blue in its red channel: against UE Viewer's export of the same
+// Megascans texture, the extracted PNG measured RMSE 0.066 as-is and 0.016 with red and blue
+// swapped. TSF_RGBA16 source is linear light, so an sRGB-sampled one reads about four times too
+// dark until it is encoded to sRGB. Anything else passes through unchanged.
+static byte[] NormalizeSourcePng(byte[] png, UTexture? texture)
+{
+    if (texture is null) return png;
+    var format = texture.GetOrDefault<FStructFallback?>("Source", null)?.GetOrDefault<FName>("Format").Text ?? "";
+    try
+    {
+        if (format.EndsWith("TSF_BGRA8", StringComparison.Ordinal)) return SwapRedBlue(png);
+        if (format.EndsWith("TSF_RGBA16", StringComparison.Ordinal) && texture.SRGB) return LinearToSrgb8(png);
+    }
+    catch (Exception error) when (error is not OutOfMemoryException)
+    {
+        // An undecodable PNG is kept as extracted rather than dropped.
+    }
+    return png;
+}
+
+static byte[] SwapRedBlue(byte[] png)
+{
+    using var codec = SkiaSharp.SKCodec.Create(new MemoryStream(png)) ?? throw new InvalidDataException("Not a PNG.");
+    var info = new SkiaSharp.SKImageInfo(codec.Info.Width, codec.Info.Height, SkiaSharp.SKColorType.Rgba8888, SkiaSharp.SKAlphaType.Unpremul);
+    var pixels = new byte[info.BytesSize];
+    var handle = GCHandle.Alloc(pixels, GCHandleType.Pinned);
+    try
+    {
+        if (codec.GetPixels(info, handle.AddrOfPinnedObject()) != SkiaSharp.SKCodecResult.Success) throw new InvalidDataException("PNG decode failed.");
+        for (var index = 0; index < pixels.Length; index += 4) (pixels[index], pixels[index + 2]) = (pixels[index + 2], pixels[index]);
+        using var pixmap = new SkiaSharp.SKPixmap(info, handle.AddrOfPinnedObject());
+        using var encoded = pixmap.Encode(SkiaSharp.SKEncodedImageFormat.Png, 100) ?? throw new InvalidDataException("PNG encode failed.");
+        return encoded.ToArray();
+    }
+    finally
+    {
+        handle.Free();
+    }
+}
+
+// ponytail: decodes the whole 16-bit image at once (an 8K source needs ~800 MB); decode by
+// scanline if that ever exhausts memory.
+static byte[] LinearToSrgb8(byte[] png)
+{
+    using var codec = SkiaSharp.SKCodec.Create(new MemoryStream(png)) ?? throw new InvalidDataException("Not a PNG.");
+    var width = codec.Info.Width;
+    var height = codec.Info.Height;
+    // Skia's PNG codec refuses a 16-bit unorm target (InvalidConversion) but decodes to half
+    // floats, which hold every value an 8-bit result can distinguish. With no colour space on the
+    // target it applies no conversion, so these are the stored linear values.
+    var wide = new SkiaSharp.SKImageInfo(width, height, SkiaSharp.SKColorType.RgbaF16, SkiaSharp.SKAlphaType.Unpremul);
+    var source = new Half[(long) width * height * 4];
+    var lut = new byte[65536];
+    for (var value = 0; value < lut.Length; value++)
+    {
+        var linear = value / 65535.0;
+        var srgb = linear <= 0.0031308 ? linear * 12.92 : 1.055 * Math.Pow(linear, 1 / 2.4) - 0.055;
+        lut[value] = (byte) Math.Clamp(Math.Round(srgb * 255), 0, 255);
+    }
+    var sourceHandle = GCHandle.Alloc(source, GCHandleType.Pinned);
+    try
+    {
+        if (codec.GetPixels(wide, sourceHandle.AddrOfPinnedObject()) != SkiaSharp.SKCodecResult.Success) throw new InvalidDataException("PNG decode failed.");
+    }
+    finally
+    {
+        sourceHandle.Free();
+    }
+    var narrow = new SkiaSharp.SKImageInfo(width, height, SkiaSharp.SKColorType.Rgba8888, SkiaSharp.SKAlphaType.Unpremul);
+    var output = new byte[narrow.BytesSize];
+    static int Unorm16(Half value) => (int) Math.Clamp(Math.Round((float) value * 65535f), 0f, 65535f);
+    for (long index = 0; index < source.LongLength; index += 4)
+    {
+        output[index] = lut[Unorm16(source[index])];
+        output[index + 1] = lut[Unorm16(source[index + 1])];
+        output[index + 2] = lut[Unorm16(source[index + 2])];
+        output[index + 3] = (byte) Math.Clamp(Math.Round((float) source[index + 3] * 255f), 0f, 255f); // alpha is coverage, not light
+    }
+    var outputHandle = GCHandle.Alloc(output, GCHandleType.Pinned);
+    try
+    {
+        using var pixmap = new SkiaSharp.SKPixmap(narrow, outputHandle.AddrOfPinnedObject());
+        using var encoded = pixmap.Encode(SkiaSharp.SKEncodedImageFormat.Png, 100) ?? throw new InvalidDataException("PNG encode failed.");
+        return encoded.ToArray();
+    }
+    finally
+    {
+        outputHandle.Free();
+    }
+}
+
 static byte[] DecompressEditorPayload(FCompressedBuffer payload)
 {
     var header = payload.Header;
@@ -1491,4 +1818,14 @@ public sealed class USkeletalMeshEditorData : UObject
         }
     }
 }
+
+sealed record EditorMesh(
+    float[] Positions,
+    int[] InstanceVertices,
+    float[] Normals,
+    float[] Uv0,
+    int[] TriangleInstances,
+    int[] TriangleGroups,
+    bool[] LiveTriangles,
+    string[] GroupSlots);
 `;

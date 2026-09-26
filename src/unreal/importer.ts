@@ -45,7 +45,7 @@ import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } fr
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 46;
+export const IMPORTER_VERSION = 47;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -1629,6 +1629,10 @@ export async function importUnrealDirectory(
         hasBlueprintPrefab ||
         (run.code !== 0 && (meshKind !== undefined || hasTexture || hasCubemap || hasSound || dataClass !== undefined || textureStackClass !== undefined))
       );
+      // UE Viewer cannot list UE5 packages at all; when the name table shows an editor-only class
+      // with nothing to import, report that class instead of a listing failure.
+      const nonImportableClass = run.code !== 0 && !needsModernConverter ? cooking?.nonImportableClassHint : undefined;
+      if (nonImportableClass && !classes.includes(nonImportableClass)) classes.push(nonImportableClass);
       return {
         package: entry.relative,
         selector: entry.selector,
@@ -1649,7 +1653,7 @@ export async function importUnrealDirectory(
         paperClass,
         needsModernConverter,
         error:
-          run.code === 0 || needsModernConverter || hasFont || paperClass !== undefined || cooking?.levelHint === true
+          run.code === 0 || needsModernConverter || nonImportableClass !== undefined || hasFont || paperClass !== undefined || cooking?.levelHint === true
             ? undefined
             : `UE Viewer could not list the package (exit ${run.code}).`,
       };
@@ -2256,7 +2260,10 @@ export async function importUnrealDirectory(
         ["--filter", entry.selector],
         { timeoutMs: 1_800_000, maxOutputBytes: 64 * 1024 * 1024 },
       );
-      if (converted.code !== 0) return { entry, modelSources: [] as { name: string; glb: string }[], reason: `The Blueprint prefab converter exited ${converted.code}.` };
+      // A logic-only Blueprint (event graph, no mesh or light components) converts to nothing;
+      // the converter says so explicitly, and that is content with nothing to place, not a failure.
+      const empty = converted.code !== 0 && /No StaticMesh, SkeletalMesh/.test(converted.stderr);
+      if (converted.code !== 0) return { entry, empty, modelSources: [] as { name: string; glb: string }[], reason: `The Blueprint prefab converter exited ${converted.code}.` };
       const emitted = await listFiles(isolated);
       const scene = emitted.find((file) => basename(file.path).toLowerCase() === `${name}.prefab-source.json`.toLowerCase())?.path;
       const glbs = await indexGlbs(isolated);
@@ -2274,6 +2281,7 @@ export async function importUnrealDirectory(
         await writeFile(target, await readFile(result.scene));
         sceneSourcePaths.set(result.entry.file, target);
       }
+      else if ("empty" in result && result.empty) skipped.push({ package: result.entry.package, reason: "unsupported Unreal-only content: Blueprint class with no mesh or light components" });
       else failed.push({ package: result.entry.package, reason: result.reason ?? "Blueprint prefab conversion failed." });
     }
     warnings.push(`Decoded ${modernPrefabPackages.length} serialized Blueprint prefab${modernPrefabPackages.length === 1 ? "" : "s"} without executing Unreal bytecode.`);
@@ -3321,7 +3329,12 @@ export async function importUnrealDirectory(
       }
     }
 
-    const sceneEntries = [...mapPackages, ...modernMapPackages, ...modernPrefabPackages];
+    // A modern level or prefab whose conversion did not produce a scene source was already reported
+    // above; reconstructing it again would only add a second, misleading ENOENT failure.
+    const sceneEntries = [
+      ...mapPackages,
+      ...[...modernMapPackages, ...modernPrefabPackages].filter((entry) => sceneSourcePaths.has(entry.file)),
+    ];
     const sceneBasenameCounts = new Map<string, number>();
     for (const entry of sceneEntries) {
       const key = basename(entry.package, extname(entry.package)).toLowerCase();
