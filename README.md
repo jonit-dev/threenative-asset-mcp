@@ -122,7 +122,9 @@ Restart the MCP host after changing its configuration.
 Fab:
 
 - `fab_search_assets` — searches public listings. `priceMode` defaults to
-  `free`; use `any` or `range` explicitly for paid results.
+  `free`; use `any` or `range` explicitly for paid results. Search payloads
+  carry no file formats, so there is no format filter; `fab_get_asset` reports
+  a listing's formats.
 - `fab_get_asset` — returns normalized public listing details and per-license
   effective prices.
 - `fab_list_filters` — returns known public filter labels and slugs, including

@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { access, stat } from "node:fs/promises";
-import { constants } from "node:fs";
+import { constants, existsSync } from "node:fs";
 import { delimiter, isAbsolute, join } from "node:path";
 
 /**
@@ -170,6 +170,16 @@ export function childEnvironment(
   for (const key of FORWARDED_ENVIRONMENT) {
     const value = source[key];
     if (value !== undefined) forwarded[key] = value;
+  }
+  // An MCP host (Codex, a GUI client) can start this server with no session bus of its own, and
+  // FabCLI's child then cannot reach the keyring the very same desktop has open. The runtime
+  // directory still advertises that bus, so name it rather than reporting an absent session. Codex
+  // strips XDG_RUNTIME_DIR too, so fall back to the systemd-logind default for this user.
+  const runtime =
+    forwarded.XDG_RUNTIME_DIR ?? (process.platform === "linux" ? `/run/user/${process.getuid?.()}` : undefined);
+  if (!forwarded.DBUS_SESSION_BUS_ADDRESS && runtime) {
+    const bus = join(runtime, "bus");
+    if (existsSync(bus)) forwarded.DBUS_SESSION_BUS_ADDRESS = `unix:path=${bus}`;
   }
   return forwarded;
 }

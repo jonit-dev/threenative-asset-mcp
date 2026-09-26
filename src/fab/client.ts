@@ -43,7 +43,6 @@ const TAXONOMY_CAPTURED_AT = "2026-07-28T00:00:00.000Z";
 const FILTER_KINDS: FilterKind[] = [
   "channels",
   "listing_types",
-  "formats",
   "categories",
   "licenses",
 ];
@@ -60,10 +59,6 @@ const FALLBACK_FILTERS: FilterGroups = {
     { label: "Unity", slug: "unity" },
   ],
   listing_types: [{ label: "3D Model", slug: "3d-model" }],
-  formats: [
-    { label: "FBX", slug: "fbx" },
-    { label: "glTF", slug: "gltf" },
-  ],
   categories: [{ label: "Environments", slug: "environments" }],
   licenses: [
     { label: "Personal", slug: "personal" },
@@ -264,9 +259,6 @@ function normalizeTaxonomy(value: unknown): FilterGroups {
     listing_types: normalizeFilterGroup(
       root.listing_types ?? root.listingTypes,
     ),
-    formats: normalizeFilterGroup(
-      root.formats ?? root.asset_formats ?? root.assetFormats,
-    ),
     categories: normalizeFilterGroup(root.categories),
     licenses: normalizeFilterGroup(root.licenses),
   };
@@ -336,9 +328,11 @@ function priceFrom(value: unknown):
   };
 }
 
-function normalizeFormats(record: Record<string, unknown>): string[] {
+/** The formats a search payload carries, or undefined when it carries none: Fab's search results
+ * have no format field, and an empty array there reads as "this asset has no formats". */
+function normalizeFormats(record: Record<string, unknown>): string[] | undefined {
   const raw = record.assetFormats ?? record.asset_formats ?? record.formats;
-  if (!Array.isArray(raw)) return [];
+  if (!Array.isArray(raw)) return undefined;
   const values = raw.flatMap((entry) => {
     if (typeof entry === "string") return [entry.slice(0, 100)];
     const item = asRecord(entry);
@@ -427,6 +421,7 @@ function normalizeSearchItem(
   const licenseAmounts = licenses
     .map(licenseEffectiveAmount)
     .filter((amount): amount is number => amount !== undefined);
+  const formats = normalizeFormats(record);
   const isFree =
     licenseAmounts.length > 0
       ? licenseAmounts.some((amount) => amount === 0)
@@ -467,7 +462,7 @@ function normalizeSearchItem(
           },
         }
       : {}),
-    formats: normalizeFormats(record),
+    ...(formats ? { formats } : {}),
     tags: normalizeTags(record),
     ...(safeHttpsUrl(
       record.thumbnailUrl ?? thumbnailRecord?.url ?? record.thumbnail,
@@ -534,7 +529,6 @@ export function buildSearchUrl(input: SearchInput): URL {
     ["channels", input.channels],
     ["listing_types", input.listingTypes],
     ["categories", input.categories],
-    ["asset_formats", input.formats],
     ["tags", input.tags],
     ["licenses", input.licenses],
   ];
@@ -704,7 +698,6 @@ export class FabClient {
           channels: input.channels ?? [],
           listingTypes: input.listingTypes ?? [],
           categories: input.categories ?? [],
-          formats: input.formats ?? [],
           tags: input.tags ?? [],
           licenses: input.licenses ?? [],
           sort: input.sort,

@@ -23,6 +23,12 @@ export const DownloadFreeAssetInputSchema = z.object({
   ),
 });
 
+const SizeMetersSchema = z.object({
+  x: z.number().nonnegative(),
+  y: z.number().nonnegative(),
+  z: z.number().nonnegative(),
+});
+
 export const DownloadFreeAssetOutputSchema = z.object({
   listingId: z.string().max(100),
   format: DownloadFreeAssetInputSchema.shape.format,
@@ -32,6 +38,7 @@ export const DownloadFreeAssetOutputSchema = z.object({
   sha256: z.string().regex(/^[0-9a-f]{64}$/),
   alreadyExisted: z.boolean(),
   authentication: z.literal("not-required"),
+  sizeMeters: SizeMetersSchema.optional(),
 });
 
 export type DownloadFreeAssetInput = z.output<

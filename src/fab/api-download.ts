@@ -202,9 +202,13 @@ export async function downloadFreeAssetViaApi(
     available.includes(candidate),
   );
   if (!code) {
+    // An Unreal-only pack is still reachable: fab_import_asset converts it to GLB.
+    const unreal = available.includes("unreal-engine")
+      ? " It ships as an Unreal pack: call fab_import_asset with this listing to convert it to GLB."
+      : "";
     throw new FabClientError(
       "FAB_FORMAT_UNAVAILABLE",
-      `Fab does not expose the requested ${format.toUpperCase()} file for this listing.`,
+      `Fab does not expose the requested ${format.toUpperCase()} file for this listing (it offers: ${available.join(", ") || "none"}).${unreal}`,
     );
   }
 

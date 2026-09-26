@@ -16,7 +16,7 @@ import {
   type TextureTransform,
   resolveMaterial,
 } from "./materials.js";
-import { readPackageCooking } from "./cooking.js";
+import { readPackageCooking, readPackageObjectNames } from "./cooking.js";
 import { extractUnrealFonts } from "./fonts.js";
 import { parseOfflineFontDescriptor, writeOfflineFont } from "./bitmap-fonts.js";
 import {
@@ -45,7 +45,7 @@ import { type ExternalTool, ToolchainError, assertSupportedHost, runBounded } fr
 const statfsAsync = promisify(statfs);
 
 /** Bumped whenever the conversion contract changes; it participates in the reuse cache key. */
-export const IMPORTER_VERSION = 45;
+export const IMPORTER_VERSION = 46;
 
 /** First and last UE4 object versions whose uncooked StaticMesh source models are FMeshDescription
  * bulk data (UE4.25–4.27), which only the engine-free converter reads. Below that window UE Viewer
@@ -347,6 +347,8 @@ export interface ImportUnrealRequest {
   readonly concurrency?: number;
   readonly keepStaging?: boolean;
   readonly environment?: NodeJS.ProcessEnv;
+  /** Free bytes reported for every volume the pre-flight measures. Injected by tests. */
+  readonly freeSpaceBytes?: number | undefined;
   readonly log?: (message: string) => void;
   readonly umodel?: ExternalTool;
   /** Injected by tests or advanced installations; production provisions the pinned converter. */
@@ -1329,13 +1331,90 @@ export function inspectWebAudio(data: Buffer): AudioInspection | undefined {
   return undefined;
 }
 
-async function freeBytes(path: string): Promise<number> {
+async function freeBytes(path: string, override?: number): Promise<number> {
+  if (override !== undefined) return override;
   try {
     const info = await statfsAsync(path);
     return Number(info.bavail) * Number(info.bsize);
   } catch {
     return Number.POSITIVE_INFINITY;
   }
+}
+
+/** `Foo.uasset` is accompanied by `Foo.uexp`, `Foo.ubulk`, and `Foo.uptnl`; a partial import
+ * reads every file of the stem it converts, and only files of that stem. */
+function packageStem(file: string): string {
+  return join(dirname(file), basename(file, extname(file)));
+}
+
+/** Source bytes a filtered import will actually read: the requested packages, their sidecars, and
+ * the packages they name in their import tables — a mesh's materials and textures are separate
+ * packages and hold most of a pack's bytes. Counting the whole tree instead refuses every
+ * partial import on a full volume, and counting only the requested `.uasset` would let an import
+ * start that cannot finish. */
+async function importedPackageBytes(
+  files: readonly { readonly path: string; readonly size: number }[],
+  wanted: ReadonlySet<string>,
+): Promise<number> {
+  const groups = new Map<string, { primary: string; bytes: number }>();
+  for (const file of files) {
+    const stem = packageStem(file.path);
+    const group = groups.get(stem) ?? { primary: file.path, bytes: 0 };
+    group.bytes += file.size;
+    if ([".uasset", ".umap"].includes(extname(file.path).toLowerCase())) group.primary = file.path;
+    groups.set(stem, group);
+  }
+  const stemsByName = new Map<string, string[]>();
+  for (const stem of groups.keys()) {
+    const name = basename(stem);
+    stemsByName.set(name, [...(stemsByName.get(name) ?? []), stem]);
+  }
+  let total = 0;
+  const counted = new Set<string>();
+  let frontier = [...groups.keys()].filter((stem) => wanted.has(basename(stem)));
+  while (frontier.length > 0) {
+    const next: string[] = [];
+    for (const stem of frontier) {
+      counted.add(stem);
+      total += groups.get(stem)!.bytes;
+      // ponytail: a bounded byte scan for names, not a parsed import table. A name that merely
+      // shares a string with the package counts its bytes; a name in another encoding does not.
+      for (const name of await readPackageObjectNames(groups.get(stem)!.primary)) {
+        for (const referenced of stemsByName.get(name) ?? []) {
+          if (counted.has(referenced)) continue;
+          next.push(referenced);
+        }
+      }
+    }
+    frontier = next;
+  }
+  return total;
+}
+
+/**
+ * Why the modern converter produced nothing, in the terms that decide the next move: what it
+ * printed (its last lines, not only the one it exits on), which engine wrote the package, and
+ * whether the mesh is Nanite — the commonest reason a UE5 editor mesh has no render data.
+ */
+function describeModernFailure(
+  stderr: string,
+  packages: readonly {
+    readonly entry: PackageClassification;
+    readonly legacyFileVersion: number | undefined;
+    readonly fileVersionUE4: number | undefined;
+    readonly fileVersionUE5: number | undefined;
+    readonly naniteHint: boolean;
+  }[],
+): string {
+  const lines = stderr.trim().split(/\r?\n/).filter((line) => line.trim()).slice(-20);
+  const versions = packages.map(
+    ({ entry, legacyFileVersion, fileVersionUE4, fileVersionUE5, naniteHint }) =>
+      `${entry.package} is ${legacyFileVersion !== undefined && legacyFileVersion <= -8 ? "UE5" : "UE4"} (legacy file version ${legacyFileVersion ?? "unknown"}), UE4 object version ${fileVersionUE4 ?? "unknown"}, UE5 object version ${fileVersionUE5 ?? "unknown"}; Nanite: ${naniteHint ? "likely (NaniteSettings present)" : "not detected"}`,
+  );
+  return [
+    ...versions,
+    ...(lines.length > 0 ? [`Converter output (last ${lines.length} lines):`, ...lines.map((line) => `  ${line.trim()}`)] : []),
+  ].join(" ");
 }
 
 /**
@@ -1376,6 +1455,12 @@ export async function importUnrealDirectory(
     );
   }
   const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
+  // Only a single-package request is actually filtered: both converters take `--filter` for one
+  // package alone and convert the whole tree otherwise, so two or more still need the whole tree.
+  const neededBytes =
+    request.onlyPackages?.length === 1 && request.onlyPackages[0]
+      ? await importedPackageBytes(files, new Set(request.onlyPackages))
+      : totalBytes;
   const sourceHash = await hashSourceTree(sourceDir, files);
 
   const umodel = request.umodel ?? (await ensureUmodel(environment, log));
@@ -1433,15 +1518,15 @@ export async function importUnrealDirectory(
   // Unbounded scene assembly can temporarily hold model GLBs plus a source-sized aggregate GLB.
   // Staging and output may be different volumes, so checking only the cache volume is insufficient.
   const minimum = 2 * 1024 ** 3;
-  const stagingRequired = totalBytes;
-  const outputRequired = totalBytes * (request.maxTextureSize === undefined ? 2 : 1);
+  const stagingRequired = neededBytes;
+  const outputRequired = neededBytes * (request.maxTextureSize === undefined ? 2 : 1);
   const stagingDevice = (await stat(staging)).dev;
   const outputDevice = (await stat(promotionParent)).dev;
   const required = Math.max(
     stagingDevice === outputDevice ? stagingRequired + outputRequired : outputRequired,
     minimum,
   );
-  const available = await freeBytes(promotionParent);
+  const available = await freeBytes(promotionParent, request.freeSpaceBytes);
   if (available < required) {
     throw new ImportError(
       "UNREAL_DISK_SPACE",
@@ -1449,7 +1534,7 @@ export async function importUnrealDirectory(
     );
   }
   if (stagingDevice !== outputDevice) {
-    const stagingAvailable = await freeBytes(staging);
+    const stagingAvailable = await freeBytes(staging, request.freeSpaceBytes);
     const separateStagingRequired = Math.max(stagingRequired, minimum);
     if (stagingAvailable < separateStagingRequired) {
       throw new ImportError(
@@ -1742,52 +1827,36 @@ export async function importUnrealDirectory(
     );
   }
 
+  /** UE Viewer's mesh export, in one place: the primary route for a mesh package, and the retry
+   * for one the modern converter could not read. Returns the reason it failed, or undefined. */
+  const exportMeshWithUmodel = async (
+    entry: PackageClassification,
+    out: string,
+  ): Promise<string | undefined> => {
+    const run = () =>
+      runBounded(
+        umodel.path,
+        [`-path=${sourceDir}`, "-export", "-gltf", "-png", "-nooverwrite", `-out=${out}`, entry.selector],
+        { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
+      );
+    try {
+      // UE Viewer occasionally exits non-zero for one package under filesystem pressure even
+      // though the same read-only export succeeds immediately afterward. One bounded retry keeps
+      // a transient process failure from silently removing a mesh from an otherwise valid pack.
+      let outcome = await run();
+      if (outcome.code !== 0) outcome = await run();
+      return outcome.code === 0 ? undefined : `UE Viewer export exited ${outcome.code}.`;
+    } catch (error) {
+      return error instanceof ToolchainError ? error.message : "UE Viewer export failed.";
+    }
+  };
+
   // Packages share textures, so two exporters can write the same PNG at once and `-nooverwrite`
   // would see a half-written file as done. Listing is read-only and parallel; exporting is not.
   log(`Exporting ${exportableMeshPackages.length} static/skeletal mesh packages with UE Viewer…`);
   const exportFailures = await mapWithConcurrency(exportableMeshPackages, 1, async (entry) => {
-    try {
-      let run = await runBounded(
-        umodel.path,
-        [
-          `-path=${sourceDir}`,
-          "-export",
-          "-gltf",
-          "-png",
-          "-nooverwrite",
-          `-out=${raw}`,
-          entry.selector,
-        ],
-        { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
-      );
-      // UE Viewer occasionally exits non-zero for one package under filesystem pressure even
-      // though the same read-only export succeeds immediately afterward. One bounded retry keeps
-      // a transient process failure from silently removing a mesh from an otherwise valid pack.
-      if (run.code !== 0) {
-        run = await runBounded(
-          umodel.path,
-          [
-            `-path=${sourceDir}`,
-            "-export",
-            "-gltf",
-            "-png",
-            "-nooverwrite",
-            `-out=${raw}`,
-            entry.selector,
-          ],
-          { timeoutMs: 1_800_000, maxOutputBytes: 32 * 1024 * 1024 },
-        );
-      }
-      if (run.code !== 0) {
-        return { package: entry.package, reason: `UE Viewer export exited ${run.code}.` };
-      }
-      return undefined;
-    } catch (error) {
-      return {
-        package: entry.package,
-        reason: error instanceof ToolchainError ? error.message : "UE Viewer export failed.",
-      };
-    }
+    const reason = await exportMeshWithUmodel(entry, raw);
+    return reason ? { package: entry.package, reason } : undefined;
   });
   for (const failure of exportFailures) if (failure) failed.push(failure);
 
@@ -2020,6 +2089,8 @@ export async function importUnrealDirectory(
   let uncookedGlbs = new Map<string, string>();
   let modernConverter: ExternalTool | undefined;
   let modernGlbs = new Map<string, string>();
+  /** Meshes UE Viewer exported after the modern converter failed on them. */
+  const recoveredByUmodel = new Set<string>();
   const modernSceneModelSources: {
     readonly entry: PackageClassification;
     readonly name: string;
@@ -2085,30 +2156,48 @@ export async function importUnrealDirectory(
       maxOutputBytes: 64 * 1024 * 1024,
     });
     if (converted.code !== 0) {
-      const diagnosticLines = converted.stderr.trim().split(/\r?\n/);
-      const diagnostic =
-        diagnosticLines.find((line) => line.includes(".usmap")) ??
-        diagnosticLines.find((line) => /exception:/i.test(line)) ??
-        diagnosticLines.at(-1);
-      throw new ToolchainError(
-        "UNREAL_TOOL_FAILED",
-        `The modern UE5 asset converter exited ${converted.code}; no partial output was promoted.${diagnostic ? ` ${diagnostic.trim()}` : ""}`,
+      // A static mesh old enough for UE Viewer never needed the modern converter, so one
+      // converter crash must not take a mesh UE Viewer can read down with it. That fallback is only
+      // honest when it covers everything: recovering part of the request would drop the rest
+      // silently, so anything UE Viewer cannot supply reports the converter's own diagnostic.
+      const retryable = modernPackages.filter(
+        ({ entry, fileVersionUE4 }) =>
+          entry.meshKind === "static" && uncookedMeshRoute("static", fileVersionUE4) === "umodel",
+      );
+      const retried = await mapWithConcurrency(retryable, 1, async ({ entry }) => ({
+        entry,
+        reason: await exportMeshWithUmodel(entry, raw),
+      }));
+      const incomplete = retried.find((result) => result.reason !== undefined);
+      if (retryable.length !== modernPackages.length || incomplete) {
+        throw new ToolchainError(
+          "UNREAL_TOOL_FAILED",
+          `The modern UE5 asset converter exited ${converted.code}; no partial output was promoted. ${describeModernFailure(converted.stderr, modernPackages)}`,
+        );
+      }
+      for (const result of retried) {
+        recoveredByUmodel.add(basename(result.entry.package, extname(result.entry.package)));
+      }
+      assets = mergeExported(assets, await indexExported(raw));
+      warnings.push(
+        `The modern UE5 asset converter exited ${converted.code}; UE Viewer decoded ${recoveredByUmodel.size} static mesh package${recoveredByUmodel.size === 1 ? "" : "s"} it could read itself.`,
+      );
+    } else {
+      modernGlbs = await indexGlbs(modernRaw);
+      assets = mergeExported(assets, await indexExported(modernRaw));
+      for (const entry of modernTexturePackages) {
+        const name = basename(entry.package, extname(entry.package));
+        const source = assets.png.get(name);
+        if (source) textureSources.set(entry.file, source);
+        else failed.push({
+          package: entry.package,
+          reason: "The modern UE5 texture converter produced no PNG for this package.",
+        });
+      }
+      warnings.push(
+        `Decoded ${modernAssetCount} requested modern UE5 asset package${modernAssetCount === 1 ? "" : "s"} without Unreal Engine.`,
       );
     }
-    modernGlbs = await indexGlbs(modernRaw);
-    assets = mergeExported(assets, await indexExported(modernRaw));
-    for (const entry of modernTexturePackages) {
-      const name = basename(entry.package, extname(entry.package));
-      const source = assets.png.get(name);
-      if (source) textureSources.set(entry.file, source);
-      else failed.push({
-        package: entry.package,
-        reason: "The modern UE5 texture converter produced no PNG for this package.",
-      });
-    }
-    warnings.push(
-      `Decoded ${modernAssetCount} requested modern UE5 asset package${modernAssetCount === 1 ? "" : "s"} without Unreal Engine.`,
-    );
   }
   if (modernMapPackages.length > 0) {
     modernConverter ??= request.modernConverter ?? (await ensureModernConverter(environment, log));
@@ -2428,7 +2517,9 @@ export async function importUnrealDirectory(
     warnings.push(`Decoded ${paperPackages.length} requested Paper2D package${paperPackages.length === 1 ? "" : "s"} without Unreal Engine.`);
   }
   const modernNames = new Set(
-    modernPackages.map(({ entry }) => basename(entry.package, extname(entry.package))),
+    modernPackages
+      .map(({ entry }) => basename(entry.package, extname(entry.package)))
+      .filter((name) => !recoveredByUmodel.has(name)),
   );
 
   const promotion = await mkdtemp(join(promotionParent, ".threenative-import-"));

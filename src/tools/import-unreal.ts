@@ -12,6 +12,12 @@ import { ImportError, type ImportReport, importUnrealDirectory } from "../unreal
 import { ToolchainError } from "../unreal/toolchain.js";
 import { parseListingId } from "./get-asset.js";
 
+const SizeMetersSchema = z.object({
+  x: z.number().nonnegative(),
+  y: z.number().nonnegative(),
+  z: z.number().nonnegative(),
+});
+
 const SummarySchema = z.object({
   outputDir: z.string().max(4_096),
   reportPath: z.string().max(4_096),
@@ -59,6 +65,7 @@ const SummarySchema = z.object({
       skins: z.number().int().nonnegative(),
       animations: z.number().int().nonnegative(),
       textured: z.boolean(),
+      sizeMeters: SizeMetersSchema,
     }),
   ),
   textures: z.array(
@@ -172,6 +179,7 @@ const SummarySchema = z.object({
     z.object({
       name: z.string().max(200),
       glb: z.string().max(1_024),
+      sizeMeters: SizeMetersSchema.optional(),
       manifest: z.string().max(1_024),
       actors: z.number().int().nonnegative(),
       resolvedActors: z.number().int().nonnegative(),
@@ -280,6 +288,11 @@ export function summarize(report: ImportReport, outputDir: string): ImportSummar
       skins: model.skins,
       animations: model.animations,
       textured: model.materials.some((section) => section.textured),
+      sizeMeters: {
+        x: model.boundsMetres[0],
+        y: model.boundsMetres[1],
+        z: model.boundsMetres[2],
+      },
     })),
     textures: report.textures.map((texture) => ({
       name: texture.name,
@@ -371,6 +384,7 @@ export function summarize(report: ImportReport, outputDir: string): ImportSummar
     scenes: report.scenes.map((scene) => ({
       name: scene.name,
       glb: scene.glb,
+      ...(scene.sizeMeters ? { sizeMeters: scene.sizeMeters } : {}),
       manifest: scene.manifest,
       actors: scene.actors,
       resolvedActors: scene.resolvedActors,

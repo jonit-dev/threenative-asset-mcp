@@ -20,6 +20,7 @@ export type FabCliErrorCode =
   | "FABCLI_UNAVAILABLE"
   | "FABCLI_INCOMPATIBLE"
   | "FABCLI_UNAUTHENTICATED"
+  | "FABCLI_KEYSTORE_UNREACHABLE"
   | "FABCLI_SESSION_EXPIRED"
   | "FABCLI_NOT_OWNED"
   | "FABCLI_ENGINE_AMBIGUOUS"
@@ -37,6 +38,16 @@ export class FabCliError extends Error {
     super(message);
     this.name = "FabCliError";
   }
+}
+
+/** FabCLI keeps its session in the OS keystore, which on Linux is the Secret Service over DBus. An
+ * MCP host started without a session bus cannot give it one, so re-authenticating cannot help: every
+ * subcommand that reports this needs the same answer. */
+function keystoreUnreachable(detail: string): FabCliError {
+  return new FabCliError(
+    "FABCLI_KEYSTORE_UNREACHABLE",
+    `FabCLI could not read its session from the OS keystore (${detail}). The MCP host started this server without a session bus, so DBUS_SESSION_BUS_ADDRESS is missing or wrong for FabCLI; logging in again will not help. Restart the MCP host from a desktop session, or export DBUS_SESSION_BUS_ADDRESS yourself.`,
+  );
 }
 
 const AuthStatusSchema = z.object({
@@ -232,12 +243,7 @@ export class FabCli {
     if (failure) {
       const kind = failure.kind ?? "unknown";
       const detail = failure.message ?? "no detail";
-      if (/keystore|secure storage|DBus/i.test(detail)) {
-        throw new FabCliError(
-          "FABCLI_UNAUTHENTICATED",
-          `FabCLI could not read its session from the OS keystore (${detail}). Run the import from a desktop session where the keyring is unlocked, or export DBUS_SESSION_BUS_ADDRESS before starting the MCP server.`,
-        );
-      }
+      if (/keystore|secure storage|DBus/i.test(detail)) throw keystoreUnreachable(detail);
       throw new FabCliError(
         kind === "auth_required" ? "FABCLI_UNAUTHENTICATED" : "FABCLI_DOWNLOAD_FAILED",
         `fabcli reported ${kind}: ${detail}`,
@@ -403,6 +409,10 @@ export class FabCli {
           .find((line) => line.length > 0)
           ?.slice(0, 300);
       const kind = /"kind"\s*:\s*"([a-z_]{0,60})"/.exec(output)?.[1];
+      // A download fails the same way every other subcommand does when the session bus is gone.
+      if (kind === "auth_required" && detail && /keystore|secure storage|DBus/i.test(detail)) {
+        throw keystoreUnreachable(detail);
+      }
       throw new FabCliError(
         kind === "auth_required"
           ? "FABCLI_UNAUTHENTICATED"

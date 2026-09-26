@@ -33,6 +33,10 @@ export interface PackageCooking {
   readonly legacyFileVersion: number | undefined;
   /** UE4 package object version from the file header; undefined for non-packages/truncated input. */
   readonly fileVersionUE4: number | undefined;
+  /** UE5 package object version, which is the only version UE5-only packages can have. */
+  readonly fileVersionUE5: number | undefined;
+  /** Whether the name table names NaniteSettings, the marker of a Nanite mesh. */
+  readonly naniteHint: boolean;
   /** The editor-only names actually found, so a caller can report evidence rather than a verdict. */
   readonly markers: readonly string[];
   /** High-confidence mesh class hint used only when UE Viewer cannot parse a newer header. */
@@ -57,6 +61,59 @@ export interface PackageCooking {
   readonly blueprintPrefabHint: boolean;
 }
 
+/** What a file that is not a readable package reports: no signal, never a negative one. */
+const UNKNOWN: PackageCooking = Object.freeze({
+  state: "unknown",
+  markers: [],
+  legacyFileVersion: undefined,
+  fileVersionUE4: undefined,
+  fileVersionUE5: undefined,
+  naniteHint: false,
+  meshKindHint: undefined,
+  textureHint: false,
+  cubemapHint: false,
+  soundHint: false,
+  dataClassHint: undefined,
+  textureStackClassHint: undefined,
+  fontHint: false,
+  materialHint: false,
+  levelHint: false,
+  blueprintPrefabHint: false,
+});
+
+/** Reads the bounded prefix of one package, or undefined when it cannot be read. */
+async function readHead(file: string): Promise<Buffer | undefined> {
+  let handle;
+  try {
+    handle = await open(file, "r");
+  } catch {
+    return undefined;
+  }
+  try {
+    const buffer = Buffer.alloc(PREFIX_BYTES);
+    const { bytesRead } = await handle.read(buffer, 0, PREFIX_BYTES, 0);
+    return bytesRead >= 16 ? buffer.subarray(0, bytesRead) : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    await handle.close();
+  }
+}
+
+/** Object names a package names in the name and import tables at its head: the packages it
+ * references, such as a static mesh's materials and textures. Those are separate files on disk. */
+export async function readPackageObjectNames(file: string): Promise<Set<string>> {
+  const head = await readHead(file);
+  const names = new Set<string>();
+  if (!head) return names;
+  for (const match of head.toString("latin1").matchAll(/[\x20-\x7e]{4,}/g)) {
+    for (const token of match[0].split(/[^\w]+/)) {
+      if (token.length >= 4 && token.length <= 200) names.add(token);
+    }
+  }
+  return names;
+}
+
 /** Reads a bounded prefix of one Unreal package and reports whether it is uncooked editor source.
  *
  * This exists because the failure it detects is otherwise invisible until far too late: `umodel
@@ -64,72 +121,59 @@ export interface PackageCooking {
  * the export produces nothing — after the whole pack has been downloaded and every package walked.
  * A Fab marketplace pack is Unreal *source*, so this is the common case, not the exotic one. */
 export async function readPackageCooking(file: string): Promise<PackageCooking> {
-  let handle;
-  try {
-    handle = await open(file, "r");
-  } catch {
-    return { state: "unknown", markers: [], legacyFileVersion: undefined, fileVersionUE4: undefined, meshKindHint: undefined, textureHint: false, cubemapHint: false, soundHint: false, dataClassHint: undefined, textureStackClassHint: undefined, fontHint: false, materialHint: false, levelHint: false, blueprintPrefabHint: false };
-  }
-  try {
-    const buffer = Buffer.alloc(PREFIX_BYTES);
-    const { bytesRead } = await handle.read(buffer, 0, PREFIX_BYTES, 0);
-    if (bytesRead < 16) return { state: "unknown", markers: [], legacyFileVersion: undefined, fileVersionUE4: undefined, meshKindHint: undefined, textureHint: false, cubemapHint: false, soundHint: false, dataClassHint: undefined, textureStackClassHint: undefined, fontHint: false, materialHint: false, levelHint: false, blueprintPrefabHint: false };
-    const head = buffer.subarray(0, bytesRead);
-    if (head.readUInt32LE(0) !== PACKAGE_MAGIC) {
-      return { state: "unknown", markers: [], legacyFileVersion: undefined, fileVersionUE4: undefined, meshKindHint: undefined, textureHint: false, cubemapHint: false, soundHint: false, dataClassHint: undefined, textureStackClassHint: undefined, fontHint: false, materialHint: false, levelHint: false, blueprintPrefabHint: false };
-    }
-    // Names are stored as length-prefixed ASCII, so a byte search finds them without walking the
-    // name table — whose layout varies by engine version in ways this check must not depend on.
-    const markers = EDITOR_ONLY_MARKERS.filter((marker) => head.includes(marker, 0, "latin1"));
-    const legacyFileVersion = head.readInt32LE(4);
-    const hasSkeletalClass = head.includes("SkeletalMesh", 0, "latin1");
-    const hasSkeletalEditorData =
-      head.includes("SkeletalMeshEditorData", 0, "latin1") ||
-      head.includes("MeshEditorDataObject", 0, "latin1");
-    const hasStaticClass = head.includes("StaticMesh", 0, "latin1");
-    const hasDefaultSkeletalClass = head.includes("Default__SkeletalMesh", 0, "latin1");
-    const hasDefaultStaticClass = head.includes("Default__StaticMesh", 0, "latin1");
-    const hasTextureClass = head.includes("Texture2D", 0, "latin1");
-    const hasCubemapClass = head.includes("TextureCube", 0, "latin1");
-    const hasSoundClass = head.includes("SoundWave", 0, "latin1");
-    const dataClassHint = ["DataTable", "CurveTable", "StringTable", "CurveFloat", "CurveVector", "CurveLinearColor"]
-      .find((className) => head.includes(`Default__${className}`, 0, "latin1"));
-    const textureStackClassHint = ["Texture2DArray", "TextureCubeArray", "VolumeTexture"]
-      .find((className) => head.includes(`Default__${className}`, 0, "latin1"));
-    const fontHint = head.includes("Default__FontFace", 0, "latin1") ||
-      (head.includes("FontBulkData", 0, "latin1") && head.includes("CompositeFont", 0, "latin1"));
-    const materialHint = head.includes("MaterialEditorOnlyData", 0, "latin1") ||
-      (head.includes("MaterialInstanceBasePropertyOverrides", 0, "latin1") && head.includes("MaterialInstanceConstant", 0, "latin1"));
-    const levelHint = file.toLowerCase().endsWith(".umap") &&
-      head.includes("PersistentLevel", 0, "latin1") && head.includes("WorldSettings", 0, "latin1");
-    const blueprintPrefabHint = file.toLowerCase().endsWith(".uasset") &&
-      head.includes("BlueprintGeneratedClass", 0, "latin1") && head.includes("SimpleConstructionScript", 0, "latin1");
-    return {
-      state: markers.length > 0 ? "uncooked" : "unknown",
-      markers,
-      legacyFileVersion,
-      fileVersionUE4: head.readInt32LE(12),
-      meshKindHint:
-        hasSkeletalClass && (hasSkeletalEditorData || (legacyFileVersion <= -8 && hasDefaultSkeletalClass))
-          ? "skeletal"
-          : hasStaticClass &&
-              (markers.some((marker) => marker === "SourceModels" || marker === "MeshDescriptionBulkData") ||
-                (legacyFileVersion <= -8 && hasDefaultStaticClass))
-            ? "static"
-            : undefined,
-      textureHint: hasTextureClass && markers.includes("AssetImportData"),
-      cubemapHint: hasCubemapClass && markers.includes("AssetImportData"),
-      soundHint: hasSoundClass && markers.includes("AssetImportData"),
-      dataClassHint,
-      textureStackClassHint,
-      fontHint,
-      materialHint,
-      levelHint,
-      blueprintPrefabHint,
-    };
-  } catch {
-    return { state: "unknown", markers: [], legacyFileVersion: undefined, fileVersionUE4: undefined, meshKindHint: undefined, textureHint: false, cubemapHint: false, soundHint: false, dataClassHint: undefined, textureStackClassHint: undefined, fontHint: false, materialHint: false, levelHint: false, blueprintPrefabHint: false };
-  } finally {
-    await handle.close();
-  }
+  const head = await readHead(file);
+  if (!head || head.readUInt32LE(0) !== PACKAGE_MAGIC) return UNKNOWN;
+  // Names are stored as length-prefixed ASCII, so a byte search finds them without walking the
+  // name table — whose layout varies by engine version in ways this check must not depend on.
+  const markers = EDITOR_ONLY_MARKERS.filter((marker) => head.includes(marker, 0, "latin1"));
+  const legacyFileVersion = head.readInt32LE(4);
+  const hasSkeletalClass = head.includes("SkeletalMesh", 0, "latin1");
+  const hasSkeletalEditorData =
+    head.includes("SkeletalMeshEditorData", 0, "latin1") ||
+    head.includes("MeshEditorDataObject", 0, "latin1");
+  const hasStaticClass = head.includes("StaticMesh", 0, "latin1");
+  const hasDefaultSkeletalClass = head.includes("Default__SkeletalMesh", 0, "latin1");
+  const hasDefaultStaticClass = head.includes("Default__StaticMesh", 0, "latin1");
+  const hasTextureClass = head.includes("Texture2D", 0, "latin1");
+  const hasCubemapClass = head.includes("TextureCube", 0, "latin1");
+  const hasSoundClass = head.includes("SoundWave", 0, "latin1");
+  const dataClassHint = ["DataTable", "CurveTable", "StringTable", "CurveFloat", "CurveVector", "CurveLinearColor"]
+    .find((className) => head.includes(`Default__${className}`, 0, "latin1"));
+  const textureStackClassHint = ["Texture2DArray", "TextureCubeArray", "VolumeTexture"]
+    .find((className) => head.includes(`Default__${className}`, 0, "latin1"));
+  const fontHint = head.includes("Default__FontFace", 0, "latin1") ||
+    (head.includes("FontBulkData", 0, "latin1") && head.includes("CompositeFont", 0, "latin1"));
+  const materialHint = head.includes("MaterialEditorOnlyData", 0, "latin1") ||
+    (head.includes("MaterialInstanceBasePropertyOverrides", 0, "latin1") && head.includes("MaterialInstanceConstant", 0, "latin1"));
+  const levelHint = file.toLowerCase().endsWith(".umap") &&
+    head.includes("PersistentLevel", 0, "latin1") && head.includes("WorldSettings", 0, "latin1");
+  const blueprintPrefabHint = file.toLowerCase().endsWith(".uasset") &&
+    head.includes("BlueprintGeneratedClass", 0, "latin1") && head.includes("SimpleConstructionScript", 0, "latin1");
+  return {
+    state: markers.length > 0 ? "uncooked" : "unknown",
+    markers,
+    legacyFileVersion,
+    fileVersionUE4: head.readInt32LE(12),
+    // A UE4 header carries no UE5 version at this offset: it holds FileVersionLicenseeUE4, which is
+    // a licensee build number. Only a negative legacy version marks the UE5 header layout.
+    fileVersionUE5: legacyFileVersion <= -8 ? head.readInt32LE(16) : undefined,
+    naniteHint: head.includes("NaniteSettings", 0, "latin1"),
+    meshKindHint:
+      hasSkeletalClass && (hasSkeletalEditorData || (legacyFileVersion <= -8 && hasDefaultSkeletalClass))
+        ? "skeletal"
+        : hasStaticClass &&
+            (markers.some((marker) => marker === "SourceModels" || marker === "MeshDescriptionBulkData") ||
+              (legacyFileVersion <= -8 && hasDefaultStaticClass))
+          ? "static"
+          : undefined,
+    textureHint: hasTextureClass && markers.includes("AssetImportData"),
+    cubemapHint: hasCubemapClass && markers.includes("AssetImportData"),
+    soundHint: hasSoundClass && markers.includes("AssetImportData"),
+    dataClassHint,
+    textureStackClassHint,
+    fontHint,
+    materialHint,
+    levelHint,
+    blueprintPrefabHint,
+  };
 }

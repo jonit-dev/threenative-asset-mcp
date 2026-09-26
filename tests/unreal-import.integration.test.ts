@@ -1,4 +1,5 @@
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, truncate, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -194,6 +195,27 @@ async function unrealWorkspace(options: {
       THREENATIVE_TOOLCHAIN_AUTOINSTALL: "0",
     },
   };
+}
+
+/** A modern UE5 converter that fails the way a real one does: several stderr lines, then exit 1. */
+async function writeFailingModernConverter(workspace: { sourceDir: string }): Promise<string> {
+  const converter = join(workspace.sourceDir, "..", "failing-modern-converter");
+  await writeFile(
+    converter,
+    `#!/usr/bin/env node
+process.stderr.write([
+  "ThreeNativeConverter 0.2.1",
+  "loading /Content/Game/SM_Rock.uasset",
+  "warning: FStaticMeshRenderData is absent from the package",
+  "loaded export types: UBodySetup, UObject, UStaticMesh",
+  "fatal: no geometry to write",
+  "",
+].join("\\n"));
+process.exit(1);
+`,
+  );
+  await chmod(converter, 0o755);
+  return converter;
 }
 
 describe("UE Viewer material metadata", () => {
@@ -645,6 +667,38 @@ describe("path and toolchain guards", () => {
     });
   });
 
+  it("points a session-bus-less host at the bus its runtime directory advertises", async () => {
+    // Codex and other MCP hosts start this server with no DBUS_SESSION_BUS_ADDRESS of their own, so
+    // FabCLI's keystore read failed with a raw "DBus error" and a user who was very much logged in.
+    const runtime = await temporaryDirectory();
+    await writeFile(join(runtime, "bus"), "");
+    const forwarded = childEnvironment({ PATH: "/usr/bin", XDG_RUNTIME_DIR: runtime });
+    expect(forwarded.DBUS_SESSION_BUS_ADDRESS).toBe(`unix:path=${join(runtime, "bus")}`);
+  });
+
+  it("finds this user's logind bus when the host strips XDG_RUNTIME_DIR as well", () => {
+    // The 2026-09-24 Codex host had neither variable; libdbus then tried X11 autolaunch and failed.
+    const bus = `/run/user/${process.getuid?.()}/bus`;
+    const forwarded = childEnvironment({ PATH: "/usr/bin" });
+    const expected = process.platform === "linux" && existsSync(bus) ? `unix:path=${bus}` : undefined;
+    expect(forwarded.DBUS_SESSION_BUS_ADDRESS).toBe(expected);
+  });
+
+  it("keeps an explicitly configured bus address", async () => {
+    const runtime = await temporaryDirectory();
+    await writeFile(join(runtime, "bus"), "");
+    const forwarded = childEnvironment({
+      XDG_RUNTIME_DIR: runtime,
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/somewhere/else",
+    });
+    expect(forwarded.DBUS_SESSION_BUS_ADDRESS).toBe("unix:path=/somewhere/else");
+  });
+
+  it("invents no bus address when the runtime directory has no bus in it", async () => {
+    const forwarded = childEnvironment({ XDG_RUNTIME_DIR: await temporaryDirectory() });
+    expect(forwarded).not.toHaveProperty("DBUS_SESSION_BUS_ADDRESS");
+  });
+
   it("refuses a relative executable override rather than searching for it", async () => {
     await expect(
       resolveExecutable("umodel", { THREENATIVE_UMODEL_PATH: "./umodel" }),
@@ -858,6 +912,8 @@ fs.copyFileSync(${JSON.stringify(converterFixture)}, path.join(out, "Meshes", "S
     const header = Buffer.alloc(32);
     header.writeUInt32LE(0x9e2a83c1, 0);
     header.writeInt32LE(-8, 4);
+    // A UE5-era object version, so this mesh is the modern converter's to lose.
+    header.writeUInt32LE(1009, 12);
     await writeFile(
       sourceMesh,
       Buffer.concat([header, Buffer.from("StaticMesh\0Default__StaticMesh\0")]),
@@ -2046,6 +2102,153 @@ process.exit(1);
         umodel: { name: "umodel", path: workspace.umodel, version: "Test" },
       }),
     ).rejects.toThrow(/not a readable directory/);
+  });
+
+  it("sizes only the requested packages in the disk pre-flight", async () => {
+    const workspace = await unrealWorkspace();
+    // Sparse sidecars: 800 MiB of unrequested bulk data, so the whole tree needs more than the
+    // free space below while the one requested mesh fits.
+    for (const [name, bytes] of [["SM_Colossus_A", 400], ["SM_Colossus_B", 400]] as const) {
+      const sidecar = join(workspace.sourceDir, "Content", "Game", `${name}.uexp`);
+      await writeFile(sidecar, "x");
+      await truncate(sidecar, bytes * 1024 * 1024);
+    }
+    const freeSpaceBytes = Math.round(2.25 * 1024 ** 3);
+
+    const report = await importUnrealDirectory({
+      sourceDir: workspace.sourceDir,
+      outputDir: workspace.outputDir,
+      environment: workspace.environment,
+      umodel: { name: "umodel", path: workspace.umodel, version: "Test" },
+      onlyPackages: ["SM_Rock"],
+      freeSpaceBytes,
+    });
+    expect(report.counts).toMatchObject({ exported: 1, failed: 0 });
+
+    await expect(
+      importUnrealDirectory({
+        sourceDir: workspace.sourceDir,
+        outputDir: join(workspace.outputDir, "whole-tree"),
+        environment: workspace.environment,
+        umodel: { name: "umodel", path: workspace.umodel, version: "Test" },
+        freeSpaceBytes,
+      }),
+    ).rejects.toMatchObject({ code: "UNREAL_DISK_SPACE" });
+
+    // The converters only take a filter for a single package, so two requested packages convert the
+    // whole source tree: sizing only those two would under-count what the import actually reads.
+    await expect(
+      importUnrealDirectory({
+        sourceDir: workspace.sourceDir,
+        outputDir: join(workspace.outputDir, "two-packages"),
+        environment: workspace.environment,
+        umodel: { name: "umodel", path: workspace.umodel, version: "Test" },
+        onlyPackages: ["SM_Rock", "BP_Spawner"],
+        freeSpaceBytes,
+      }),
+    ).rejects.toMatchObject({ code: "UNREAL_DISK_SPACE" });
+  }, 60_000);
+
+  it("says why the modern converter produced nothing for a static mesh", async () => {
+    const workspace = await unrealWorkspace({ classes: {}, listExitCode: 1 });
+    const header = Buffer.alloc(32);
+    header.writeUInt32LE(0x9e2a83c1, 0);
+    header.writeInt32LE(-8, 4);
+    header.writeUInt32LE(1009, 12);
+    header.writeUInt32LE(1008, 16);
+    await writeFile(
+      join(workspace.sourceDir, "Content", "Game", "SM_Rock.uasset"),
+      Buffer.concat([header, Buffer.from("StaticMesh\0Default__StaticMesh\0")]),
+    );
+    const converter = await writeFailingModernConverter(workspace);
+
+    const error = await importUnrealDirectory({
+      sourceDir: workspace.sourceDir,
+      outputDir: workspace.outputDir,
+      environment: workspace.environment,
+      umodel: { name: "umodel", path: workspace.umodel, version: "Test" },
+      modernConverter: { name: "modern", path: converter, version: "Test failing" },
+      onlyPackages: ["SM_Rock"],
+    }).then(
+      () => undefined,
+      (reason: unknown) => reason as ToolchainError,
+    );
+
+    expect(error?.code).toBe("UNREAL_TOOL_FAILED");
+    expect(error?.message).toContain("ThreeNativeConverter 0.2.1");
+    // The earlier lines carry the reason; the last line alone only says it stopped.
+    expect(error?.message).toContain("warning: FStaticMeshRenderData is absent from the package");
+    expect(error?.message).toContain("UE4 object version 1009");
+    expect(error?.message).toContain("UE5 object version 1008");
+    expect(error?.message).toContain("Nanite: not detected");
+  });
+
+  it("retries a static mesh the modern converter cannot read through UE Viewer", async () => {
+    const workspace = await unrealWorkspace({ classes: {}, listExitCode: 1 });
+    const header = Buffer.alloc(32);
+    header.writeUInt32LE(0x9e2a83c1, 0);
+    header.writeInt32LE(-8, 4);
+    // Below UE4.25, so UE Viewer reads this mesh itself and the modern converter was never needed.
+    header.writeUInt32LE(500, 12);
+    await writeFile(
+      join(workspace.sourceDir, "Content", "Game", "SM_Rock.uasset"),
+      Buffer.concat([header, Buffer.from("StaticMesh\0Default__StaticMesh\0NaniteSettings\0")]),
+    );
+    const converter = await writeFailingModernConverter(workspace);
+
+    const report = await importUnrealDirectory({
+      sourceDir: workspace.sourceDir,
+      outputDir: workspace.outputDir,
+      environment: workspace.environment,
+      umodel: { name: "umodel", path: workspace.umodel, version: "Test" },
+      modernConverter: { name: "modern", path: converter, version: "Test failing" },
+      onlyPackages: ["SM_Rock"],
+    });
+
+    expect(report.failed).toEqual([]);
+    expect(report.counts).toMatchObject({ exported: 1, failed: 0 });
+    expect(report.models[0]).toMatchObject({ name: "SM_Rock", kind: "static" });
+  });
+
+  it("promotes nothing when only some modern packages can fall back to UE Viewer", async () => {
+    const workspace = await unrealWorkspace({ classes: {}, listExitCode: 1 });
+    const readable = Buffer.alloc(32);
+    readable.writeUInt32LE(0x9e2a83c1, 0);
+    readable.writeInt32LE(-8, 4);
+    // Below UE4.25, so UE Viewer reads this mesh itself and the modern converter was never needed.
+    readable.writeInt32LE(500, 12);
+    await writeFile(
+      join(workspace.sourceDir, "Content", "Game", "SM_Rock.uasset"),
+      Buffer.concat([readable, Buffer.from("StaticMesh\0Default__StaticMesh\0NaniteSettings\0")]),
+    );
+    // A UE5-era static mesh that UE Viewer can no longer read: recovering the other one silently
+    // would drop this package, so the converter's own diagnostic is the honest answer.
+    const unreadable = Buffer.alloc(32);
+    unreadable.writeUInt32LE(0x9e2a83c1, 0);
+    unreadable.writeInt32LE(-8, 4);
+    unreadable.writeInt32LE(1009, 12);
+    await writeFile(
+      join(workspace.sourceDir, "Content", "Game", "SM_Tree.uasset"),
+      Buffer.concat([unreadable, Buffer.from("StaticMesh\0Default__StaticMesh\0")]),
+    );
+    const converter = await writeFailingModernConverter(workspace);
+
+    const error = await importUnrealDirectory({
+      sourceDir: workspace.sourceDir,
+      outputDir: workspace.outputDir,
+      environment: workspace.environment,
+      umodel: { name: "umodel", path: workspace.umodel, version: "Test" },
+      modernConverter: { name: "modern", path: converter, version: "Test failing" },
+      onlyPackages: ["SM_Rock", "SM_Tree"],
+    }).then(
+      () => undefined,
+      (reason: unknown) => reason as ToolchainError,
+    );
+
+    expect(error?.code).toBe("UNREAL_TOOL_FAILED");
+    expect(error?.message).toContain("SM_Tree.uasset is UE5 (legacy file version -8), UE4 object version 1009");
+    expect(error?.message).toContain("fatal: no geometry to write");
+    await expect(stat(workspace.outputDir)).rejects.toThrow();
   });
 });
 

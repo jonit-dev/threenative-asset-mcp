@@ -49,11 +49,20 @@ class PromotionBrowserTransport implements FabTransport {
 
 describe("Fab discovery tools", () => {
   it("should return stable filter objects", async () => {
+    const all = await createListFiltersHandler(
+      new FabClient(new DiscoveryTransport()),
+    )({});
+    expect("structuredContent" in all).toBe(true);
+    if (!("structuredContent" in all)) return;
+    // Search results carry no format data, so advertising a formats filter would promise a
+    // filter nothing can honour.
+    expect(all.structuredContent.filters).not.toHaveProperty("formats");
+
     const handler = createListFiltersHandler(
       new FabClient(new DiscoveryTransport()),
     );
     const result = await handler({
-      kinds: ["channels", "listing_types", "formats", "categories", "licenses"],
+      kinds: ["channels", "listing_types", "categories", "licenses"],
     });
 
     expect("structuredContent" in result).toBe(true);

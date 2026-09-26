@@ -48,9 +48,12 @@ Confirmed public route parameters:
 | `cursor` | opaque continuation value |
 
 Multi-value filters are serialized as repeated keys. The current UI contract
-also names `channels`, `listing_types`, `categories`, `asset_formats`, `tags`,
-`licenses`, `seller`, `average_rating`, `published_since`,
-`is_ai_generated`, and `is_ai_forbidden`.
+also names `channels`, `listing_types`, `categories`, `tags`, `licenses`,
+`seller`, `average_rating`, `published_since`, `is_ai_generated`, and
+`is_ai_forbidden`. It also names `asset_formats`, but the search payload returns no
+formats, so this server does not offer that filter: filtering on it cannot narrow
+anything, and every result item would read as format-less. `fab_get_asset` reads
+formats from the listing detail payload, where they are real.
 
 Observed response envelope:
 

@@ -3,7 +3,7 @@ import { basename, dirname, isAbsolute, join } from "node:path";
 
 import { Document, MathUtils, NodeIO, VertexLayout, type mat4, type Mesh, type Node, type vec3, type vec4 } from "@gltf-transform/core";
 import { EXTMeshGPUInstancing, KHRLightsPunctual, KHRMaterialsUnlit, type Light } from "@gltf-transform/extensions";
-import { copyToDocument, dedup, unpartition } from "@gltf-transform/functions";
+import { copyToDocument, dedup, getBounds, unpartition } from "@gltf-transform/functions";
 
 export interface UnrealVector {
   readonly x: number;
@@ -116,6 +116,9 @@ export interface ImportedScene {
   readonly name: string;
   readonly package: string;
   readonly glb: string;
+  /** Bounding-box size of the assembled level in metres, so a game can place it unopened. Absent
+   * when the level reconstructs no geometry to measure. */
+  readonly sizeMeters: { readonly x: number; readonly y: number; readonly z: number } | undefined;
   readonly manifest: string;
   readonly bytes: number;
   readonly sha256: string;
@@ -864,11 +867,23 @@ export async function assembleSceneGlb(request: AssembleSceneRequest): Promise<I
       generatedEnginePrimitives: [...generatedEnginePrimitives].sort(),
     }, null, 2)}\n`,
   );
+  const bounds = getBounds(scene);
+  const measured = {
+    x: bounds.max[0] - bounds.min[0],
+    y: bounds.max[1] - bounds.min[1],
+    z: bounds.max[2] - bounds.min[2],
+  };
+  // A level that reconstructs no mesh at all bounds to -Infinity, which is not a size: report
+  // nothing rather than a number the game's own validation would have to reject.
+  const sizeMeters = [measured.x, measured.y, measured.z].every(Number.isFinite)
+    ? measured
+    : undefined;
   return {
     name: request.source.mapName,
     package: request.package,
     glb: glbRelative,
     manifest: manifestRelative,
+    sizeMeters,
     bytes: validated.bytes,
     sha256: validated.sha256,
     actors: request.source.actors.length + sourceTexts.length,

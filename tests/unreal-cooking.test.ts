@@ -202,6 +202,18 @@ describe("readPackageCooking", () => {
     });
   });
 
+  it("reports no UE5 object version on a UE4 header, where that offset holds something else", async () => {
+    const head = packageHead(["StaticMesh", "Default__StaticMesh"]);
+    head.writeInt32LE(518, 4); // LegacyFileVersion 518 is UE 4.26
+    head.writeInt32LE(1008, 16); // FileVersionLicenseeUE4, which the diagnostic must not quote
+    const file = await write("SM_UE426.uasset", head);
+    await expect(readPackageCooking(file)).resolves.toMatchObject({
+      legacyFileVersion: 518,
+      fileVersionUE4: 522,
+      fileVersionUE5: undefined,
+    });
+  });
+
   it("stays unknown for a package with no editor-only names, never claiming cooked", async () => {
     const file = await write(
       "SM_Cooked.uasset",

@@ -31,6 +31,13 @@ export const DirectAssetDownloadOutputSchema = z.object({
   alreadyExisted: z.boolean(),
   sourceUrl: z.url().max(4_096),
   licenseAcknowledged: z.literal(true),
+  sizeMeters: z
+    .object({
+      x: z.number().nonnegative(),
+      y: z.number().nonnegative(),
+      z: z.number().nonnegative(),
+    })
+    .optional(),
 });
 
 function errorResult(error: unknown) {

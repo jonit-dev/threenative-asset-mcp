@@ -13,6 +13,8 @@ import {
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 
+import { sizeMeters, type SizeMeters } from "../gltf-size.js";
+
 export type DirectAssetProvider =
   | "polyhaven"
   | "ambientcg"
@@ -47,6 +49,8 @@ export interface DirectAssetDownloadResult {
   alreadyExisted: boolean;
   sourceUrl: string;
   licenseAcknowledged: true;
+  /** Bounding-box size in metres, for a `.glb`/`.gltf` download the reader could open. */
+  sizeMeters?: SizeMeters;
 }
 
 export interface DirectAssetDownloaderOptions {
@@ -369,7 +373,7 @@ export class DirectAssetDownloader {
     );
   }
 
-  private result(
+  private async result(
     provider: DirectAssetProvider,
     sourceUrl: string,
     fileName: string,
@@ -377,7 +381,8 @@ export class DirectAssetDownloader {
     sizeBytes: number,
     sha256: string,
     alreadyExisted: boolean,
-  ): DirectAssetDownloadResult {
+  ): Promise<DirectAssetDownloadResult> {
+    const size = await sizeMeters(path);
     return {
       provider,
       fileName,
@@ -387,6 +392,7 @@ export class DirectAssetDownloader {
       alreadyExisted,
       sourceUrl,
       licenseAcknowledged: true,
+      ...(size ? { sizeMeters: size } : {}),
     };
   }
 }

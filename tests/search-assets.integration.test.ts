@@ -12,7 +12,7 @@ import {
   type FabTransport,
 } from "../src/fab/client.js";
 import { createFabServer } from "../src/server.js";
-import { SearchInputSchema } from "../src/tools/search-assets.js";
+import { SearchInputSchema, SearchToolInputSchema } from "../src/tools/search-assets.js";
 import { searchFixture } from "./fixtures/fab-contracts.js";
 
 class FixtureTransport implements FabTransport {
@@ -90,14 +90,42 @@ describe("fab_search_assets", () => {
   it("appends repeated filter values", () => {
     const input = SearchInputSchema.parse({
       channels: ["unity", "unreal-engine"],
-      formats: ["fbx", "gltf"],
+      tags: ["nature"],
     });
     const url = buildSearchUrl(input);
     expect(url.searchParams.getAll("channels")).toEqual([
       "unity",
       "unreal-engine",
     ]);
-    expect(url.searchParams.getAll("asset_formats")).toEqual(["fbx", "gltf"]);
+    expect(url.searchParams.getAll("tags")).toEqual(["nature"]);
+  });
+
+  it("offers no formats filter, because search results carry no format data", () => {
+    expect(Object.keys(SearchToolInputSchema.shape)).not.toContain("formats");
+    const input = SearchInputSchema.parse({ formats: ["fbx"] });
+    expect(buildSearchUrl(input).searchParams.has("asset_formats")).toBe(false);
+  });
+
+  it("omits formats from an item whose payload carries none", async () => {
+    const { response } = await callSearch(
+      {},
+      new FixtureTransport({
+        results: [
+          {
+            uid: "22222222-3333-4444-8555-666666666666",
+            title: "Unlisted Formats",
+            startingPrice: { amount: 0, currency: "USD" },
+          },
+        ],
+        cursors: {},
+      }),
+    );
+    expect("result" in response).toBe(true);
+    if (!("result" in response)) return;
+    const result = response.result as {
+      structuredContent: { items: Array<Record<string, unknown>> };
+    };
+    expect(result.structuredContent.items[0]).not.toHaveProperty("formats");
   });
 
   it("round-trips cursor and returns structured plus text content", async () => {
