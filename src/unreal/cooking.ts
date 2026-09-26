@@ -59,7 +59,13 @@ export interface PackageCooking {
   readonly levelHint: boolean;
   /** Serialized BlueprintGeneratedClass/SCS prefab hint for newer headers UE Viewer rejects. */
   readonly blueprintPrefabHint: boolean;
+  /** An editor-only class with nothing to import, named when UE Viewer cannot list the package. */
+  readonly nonImportableClassHint: string | undefined;
 }
+
+/** Editor-only asset classes a UE5 pack ships beside its meshes. UE Viewer cannot list them, so
+ * without this they read as failed packages rather than as content with nothing to import. */
+const NON_IMPORTABLE_CLASSES = ["FoliageType_InstancedStaticMesh", "MaterialFunction", "MaterialParameterCollection"];
 
 /** What a file that is not a readable package reports: no signal, never a negative one. */
 const UNKNOWN: PackageCooking = Object.freeze({
@@ -79,6 +85,7 @@ const UNKNOWN: PackageCooking = Object.freeze({
   materialHint: false,
   levelHint: false,
   blueprintPrefabHint: false,
+  nonImportableClassHint: undefined,
 });
 
 /** Reads the bounded prefix of one package, or undefined when it cannot be read. */
@@ -147,6 +154,9 @@ export async function readPackageCooking(file: string): Promise<PackageCooking> 
     (head.includes("MaterialInstanceBasePropertyOverrides", 0, "latin1") && head.includes("MaterialInstanceConstant", 0, "latin1"));
   const levelHint = file.toLowerCase().endsWith(".umap") &&
     head.includes("PersistentLevel", 0, "latin1") && head.includes("WorldSettings", 0, "latin1");
+  // A whole name-table entry: the length prefix's high byte and the NUL terminator bracket it,
+  // so "MaterialFunction" does not match inside "MaterialFunctionInstance".
+  const nonImportableClassHint = NON_IMPORTABLE_CLASSES.find((className) => head.includes(`\0${className}\0`, 0, "latin1"));
   const blueprintPrefabHint = file.toLowerCase().endsWith(".uasset") &&
     head.includes("BlueprintGeneratedClass", 0, "latin1") && head.includes("SimpleConstructionScript", 0, "latin1");
   return {
@@ -175,5 +185,6 @@ export async function readPackageCooking(file: string): Promise<PackageCooking> 
     materialHint,
     levelHint,
     blueprintPrefabHint,
+    nonImportableClassHint,
   };
 }
