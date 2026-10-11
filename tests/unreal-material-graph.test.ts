@@ -3756,3 +3756,172 @@ describe("proveEmissionZero", () => {
     expect(proveEmissionZero(emission([], {}, { outputConstants: { emissive: [0, 0, 1] } }), params({}))).toMatchObject({ zero: false });
   });
 });
+
+// UMaterialExpressionIf, from UE 4.19.2 `UMaterialExpressionIf::Compile` and `FHLSLMaterialTranslator::If`. A and B are
+// compiled as scalars here (a vector one is refused by name). A >= B picks AGreaterThanB, else ALessThanB. A wired AEqualsB
+// replaces the pick when `abs(A - B) > EqualsThreshold` is false (so a NaN difference takes it); an unwired AEqualsB ignores
+// it (and the threshold). B unwired is ConstB. A, AGreaterThanB and ALessThanB are required. The branches may be vectors;
+// the result takes their arithmetic type (`GetArithmeticResultType`): a scalar branch broadcasts, two nonscalar branches
+// must share a width.
+describe("MaterialExpressionIf", () => {
+  const bakeGraphOf = (graph: MaterialGraph) =>
+    bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader({}).loadTexture, size: 2 });
+  const bake = (nodes: Raw[]) => bakeGraphOf(makeGraph(nodes, pin("i", 0, RGB_MASK)));
+  const rgb = async (nodes: Raw[]) => (await pixelsOf(await bake(nodes)))(0, 0);
+  const scalar = (id: string, value: number): Raw => node(id, "Constant", { constants: { R: value } });
+  const ifNode = (inputs: Raw, constants: Raw = {}): Raw => node("i", "If", { inputs, constants });
+  const red = (id: string) => constant3(id, [1, 0, 0]);
+  const green = (id: string) => constant3(id, [0, 1, 0]);
+  const blue = (id: string) => constant3(id, [0, 0, 1]);
+  const branches = { AGreaterThanB: pin("g", 0, RGB_MASK), ALessThanB: pin("l", 0, RGB_MASK) };
+  const vector2 = (id: string, r: number, g: number): Raw => node(id, "Constant2Vector", { constants: { R: r, G: g } });
+  // A non-finite constant the C# dumper never writes (it maps one to 0), so this sets it on the parsed graph in memory.
+  const withConstant = (nodes: Raw[], id: string, constants: Record<string, number>): MaterialGraph => {
+    const graph = makeGraph(nodes, pin("i", 0, RGB_MASK));
+    Object.assign(graph.nodes.find((entry) => entry.id === id)!.constants, constants);
+    return graph;
+  };
+
+  it("registers the If node class", () => {
+    expect(supportedNodeClasses()).toContain("If");
+  });
+
+  it("picks AGreaterThanB when A >= B and ALessThanB otherwise", async () => {
+    expect(await rgb([ifNode({ A: pin("a"), B: pin("b"), ...branches }), scalar("a", 0.75), scalar("b", 0.5), red("g"), green("l")])).toEqual([255, 0, 0]);
+    expect(await rgb([ifNode({ A: pin("a"), B: pin("b"), ...branches }), scalar("a", 0.25), scalar("b", 0.5), red("g"), green("l")])).toEqual([0, 255, 0]);
+  });
+
+  it("uses a wired AEqualsB when |A - B| is within EqualsThreshold", async () => {
+    const nodes = (a: number, b: number) => [ifNode({ A: pin("a"), B: pin("b"), AEqualsB: pin("e", 0, RGB_MASK), ...branches }), scalar("a", a), scalar("b", b), red("g"), green("l"), blue("e")];
+    expect(await rgb(nodes(0.5, 0.5))).toEqual([0, 0, 255]);
+    // A difference above the default 0.00001 falls back to the comparison (here A < B, so the less branch).
+    expect(await rgb(nodes(0.5, 0.25))).toEqual([255, 0, 0]);
+    expect(await rgb(nodes(0.25, 0.5))).toEqual([0, 255, 0]);
+  });
+
+  it("ignores AEqualsB and EqualsThreshold when AEqualsB is unwired", async () => {
+    // A == B, yet with no equality branch the comparison still selects the greater branch and the huge threshold does nothing.
+    expect(await rgb([ifNode({ A: pin("a"), B: pin("b"), ...branches }, { EqualsThreshold: 100 }), scalar("a", 0.5), scalar("b", 0.5), red("g"), green("l")])).toEqual([255, 0, 0]);
+  });
+
+  it("honours a nonzero EqualsThreshold", async () => {
+    const nodes = (threshold: number) => [ifNode({ A: pin("a"), B: pin("b"), AEqualsB: pin("e", 0, RGB_MASK), ...branches }, { EqualsThreshold: threshold }), scalar("a", 0.5), scalar("b", 0.500005), red("g"), green("l"), blue("e")];
+    expect(await rgb(nodes(0.01))).toEqual([0, 0, 255]);
+    expect(await rgb(nodes(0.000001))).toEqual([0, 255, 0]);
+  });
+
+  it("uses ConstB, default 0, for an unwired B", async () => {
+    expect(await rgb([ifNode({ A: pin("a"), ...branches }), scalar("a", 0.5), red("g"), green("l")])).toEqual([255, 0, 0]);
+    expect(await rgb([ifNode({ A: pin("a"), ...branches }, { ConstB: 1 }), scalar("a", 0.5), red("g"), green("l")])).toEqual([0, 255, 0]);
+  });
+
+  it("takes the branches' dimensionality, so a vector branch stays a vector and a scalar branch broadcasts", async () => {
+    expect(await rgb([ifNode({ A: pin("a"), B: pin("b"), ...branches }), scalar("a", 1), scalar("b", 0), constant3("g", [0.25, 0.5, 0.75]), constant3("l", [1, 1, 1])])).toEqual([encode(0.25), encode(0.5), encode(0.75)]);
+    const scalarBranch = [ifNode({ A: pin("a"), B: pin("b"), AGreaterThanB: pin("g"), ALessThanB: pin("l") }), scalar("a", 1), scalar("b", 0), scalar("g", 0.25), scalar("l", 0.75)];
+    expect(await rgb(scalarBranch)).toEqual([encode(0.25), encode(0.25), encode(0.25)]);
+  });
+
+  it("refuses a required input that is missing", async () => {
+    expect(await bake([ifNode({ AGreaterThanB: pin("g"), ALessThanB: pin("l") }), red("g"), green("l")])).toMatchObject({ status: "unavailable", reason: expect.stringContaining("has no A input") });
+    expect(await bake([ifNode({ A: pin("a"), ALessThanB: pin("l") }), scalar("a", 0.5), green("l")])).toMatchObject({ status: "unavailable", reason: expect.stringContaining("has no AGreaterThanB input") });
+    expect(await bake([ifNode({ A: pin("a"), AGreaterThanB: pin("g") }), scalar("a", 0.5), red("g")])).toMatchObject({ status: "unavailable", reason: expect.stringContaining("has no ALessThanB input") });
+  });
+
+  it("refuses a vector A or B by name rather than taking its first channel", async () => {
+    const vectorA = [ifNode({ A: pin("a", 0, RGB_MASK), B: pin("b"), ...branches }), constant3("a", [0.5, 0.5, 0.5]), scalar("b", 0), red("g"), green("l")];
+    expect(await bake(vectorA)).toMatchObject({ status: "unsupported", unsupported: ["If.A(vector)"] });
+    const vectorB = [ifNode({ A: pin("a"), B: pin("b", 0, RGB_MASK), ...branches }), scalar("a", 0.5), constant3("b", [0, 0, 0]), red("g"), green("l")];
+    expect(await bake(vectorB)).toMatchObject({ status: "unsupported", unsupported: ["If.B(vector)"] });
+  });
+
+  it("broadcasts a scalar branch beside a vector branch", async () => {
+    // The scalar is a masked channel: a constant scalar is replicated across all lanes, so it would pass without broadcasting.
+    const nodes = (a: number, b: number) => [ifNode({ A: pin("a"), B: pin("b"), AGreaterThanB: pin("g"), ALessThanB: pin("l", 0, [1, 0, 0, 0]) }), scalar("a", a), scalar("b", b), constant3("g", [0.25, 0.5, 0.75]), constant3("l", [0.9, 0.2, 0.3])];
+    // A >= B: the vector greater branch keeps its three channels.
+    expect(await rgb(nodes(1, 0))).toEqual([encode(0.25), encode(0.5), encode(0.75)]);
+    // A < B: the scalar less branch (its R channel alone) broadcasts across the vector result.
+    expect(await rgb(nodes(0, 1))).toEqual([encode(0.9), encode(0.9), encode(0.9)]);
+  });
+
+  it("refuses nonscalar branches whose vector widths differ", async () => {
+    // GetArithmeticResultType errors on float2 next to float3; a named refusal beats reading past the shorter branch.
+    const nodes = [ifNode({ A: pin("a"), B: pin("b"), AGreaterThanB: pin("g"), ALessThanB: pin("l") }), scalar("a", 1), scalar("b", 0), vector2("g", 1, 0), constant3("l", [0, 1, 0])];
+    expect(await bake(nodes)).toMatchObject({ status: "unsupported", unsupported: ["If.AGreaterThanB/ALessThanB(vector width mismatch)"] });
+  });
+
+  it("refuses an AEqualsB branch whose width is incompatible with the comparison", async () => {
+    const nodes = [ifNode({ A: pin("a"), B: pin("b"), AEqualsB: pin("e"), AGreaterThanB: pin("g"), ALessThanB: pin("l") }), scalar("a", 1), scalar("b", 0), constant3("g", [1, 0, 0]), constant3("l", [0, 1, 0]), vector2("e", 0, 0)];
+    expect(await bake(nodes)).toMatchObject({ status: "unsupported", unsupported: ["If.AEqualsB/ALessThanB(vector width mismatch)"] });
+  });
+
+  it("selects per texel from a varying masked-U TextureCoordinate condition", async () => {
+    // Output pixel x samples u = (x + 0.5) / 4: 0.125, 0.375, 0.625, 0.875. Against B = 0.375 the condition spans
+    // less, equality (the default threshold catches the exact hit) and greater across one row.
+    const graph = makeGraph(
+      [ifNode({ A: pin("uv", 0, [1, 0, 0, 0]), B: pin("b"), AEqualsB: pin("e", 0, RGB_MASK), ...branches }), textureCoordinate("uv"), scalar("b", 0.375), red("g"), green("l"), blue("e")],
+      pin("i", 0, RGB_MASK),
+    );
+    const result = await bakeGraph({ graph, output: "baseColor", parameters: NO_PARAMETERS, loadTexture: makeLoader({}).loadTexture, size: 4 });
+    const pixel = await pixelsOf(result);
+    expect([0, 1, 2, 3].map((x) => pixel(x, 0))).toEqual([[0, 255, 0], [0, 0, 255], [255, 0, 0], [255, 0, 0]]);
+  });
+
+  it("uses the default EqualsThreshold near its inside and outside boundary", async () => {
+    const nodes = (b: number) => [ifNode({ A: pin("a"), B: pin("b"), AEqualsB: pin("e", 0, RGB_MASK), ...branches }), scalar("a", 0.5), scalar("b", b), red("g"), green("l"), blue("e")];
+    // |A - B| just inside the default 0.00001: the equality branch. Just outside: the comparison decides.
+    expect(await rgb(nodes(0.500005))).toEqual([0, 0, 255]);
+    expect(await rgb(nodes(0.50002))).toEqual([0, 255, 0]);
+    expect(await rgb(nodes(0.499995))).toEqual([0, 0, 255]);
+    expect(await rgb(nodes(0.49998))).toEqual([255, 0, 0]);
+  });
+
+  it("never takes the equality branch under a negative threshold", async () => {
+    // |A - B| = 0, yet `abs(A - B) > -1` is true, so the comparison (A >= B) picks the greater branch.
+    const nodes = [ifNode({ A: pin("a"), B: pin("b"), AEqualsB: pin("e", 0, RGB_MASK), ...branches }, { EqualsThreshold: -1 }), scalar("a", 0.5), scalar("b", 0.5), red("g"), green("l"), blue("e")];
+    expect(await rgb(nodes)).toEqual([255, 0, 0]);
+  });
+
+  it("takes the equality branch when the difference is NaN", async () => {
+    // A = B = +inf, so abs(A - B) is NaN and `abs(A - B) > T` is false, selecting AEqualsB; a `<=` predicate would
+    // instead pick the comparison. The C# dumper never writes Infinity (it maps one to 0), so this sets it in memory.
+    const nodes = [ifNode({ A: pin("a"), B: pin("b"), AEqualsB: pin("e", 0, RGB_MASK), ...branches }), scalar("a", 0), scalar("b", 0), red("g"), green("l"), blue("e")];
+    const graph = makeGraph(nodes, pin("i", 0, RGB_MASK));
+    for (const id of ["a", "b"]) Object.assign(graph.nodes.find((entry) => entry.id === id)!.constants, { R: Number.POSITIVE_INFINITY });
+    expect((await pixelsOf(await bakeGraphOf(graph)))(0, 0)).toEqual([0, 0, 255]);
+  });
+
+  it("refuses a non-finite ConstB rather than using it as a constant", async () => {
+    const nodes = [ifNode({ A: pin("a"), ...branches }), scalar("a", 0.5), red("g"), green("l")];
+    expect(await bakeGraphOf(withConstant(nodes, "i", { ConstB: Number.POSITIVE_INFINITY }))).toMatchObject({ status: "unsupported", unsupported: ["If.ConstB(non-finite)"] });
+  });
+
+  it("refuses a non-finite EqualsThreshold rather than using it as a constant", async () => {
+    const nodes = [ifNode({ A: pin("a"), B: pin("b"), AEqualsB: pin("e", 0, RGB_MASK), ...branches }), scalar("a", 0.5), scalar("b", 0.5), red("g"), green("l"), blue("e")];
+    expect(await bakeGraphOf(withConstant(nodes, "i", { EqualsThreshold: Number.NaN }))).toMatchObject({ status: "unsupported", unsupported: ["If.EqualsThreshold(non-finite)"] });
+  });
+
+  it("refuses a stored constant that is present but not a finite number, rather than falling back to its default", async () => {
+    // The dumper omits an absent constant and writes only finite numbers, so a string or null here is a malformed graph.
+    const unwiredB = makeGraph([ifNode({ A: pin("a"), ...branches }), scalar("a", 0.5), red("g"), green("l")], pin("i", 0, RGB_MASK));
+    Object.assign(unwiredB.nodes.find((entry) => entry.id === "i")!.constants, { ConstB: "0.25" });
+    expect(await bakeGraphOf(unwiredB)).toMatchObject({ status: "unsupported", unsupported: ["If.ConstB(non-finite)"] });
+    const wiredEquals = makeGraph([ifNode({ A: pin("a"), B: pin("b"), AEqualsB: pin("e", 0, RGB_MASK), ...branches }), scalar("a", 0.5), scalar("b", 0.5), red("g"), green("l"), blue("e")], pin("i", 0, RGB_MASK));
+    Object.assign(wiredEquals.nodes.find((entry) => entry.id === "i")!.constants, { EqualsThreshold: null });
+    expect(await bakeGraphOf(wiredEquals)).toMatchObject({ status: "unsupported", unsupported: ["If.EqualsThreshold(non-finite)"] });
+  });
+
+  it("propagates a wired B or AEqualsB that cannot compile, rather than using ConstB or the default threshold", async () => {
+    expect(await bake([ifNode({ A: pin("a"), B: pin("missing"), ...branches }, { ConstB: 0.25 }), scalar("a", 0.5), red("g"), green("l")])).toMatchObject({ status: "unavailable", reason: expect.stringContaining("missing node missing") });
+    const nodes = [ifNode({ A: pin("a"), B: pin("b"), AEqualsB: pin("missing"), ...branches }), scalar("a", 0.5), scalar("b", 0.5), red("g"), green("l")];
+    expect(await bake(nodes)).toMatchObject({ status: "unavailable", reason: expect.stringContaining("missing node missing") });
+  });
+
+  it("broadcasts a scalar greater branch and a scalar AEqualsB across a vector less branch", async () => {
+    // Masked scalars (R channel alone), for the same reason as the case above.
+    const nodes = (a: number, b: number) => [ifNode({ A: pin("a"), B: pin("b"), AEqualsB: pin("e", 0, [1, 0, 0, 0]), AGreaterThanB: pin("g", 0, [1, 0, 0, 0]), ALessThanB: pin("l") }), scalar("a", a), scalar("b", b), constant3("g", [0.9, 0.2, 0.3]), constant3("l", [0.25, 0.5, 0.75]), constant3("e", [0.1, 0.2, 0.3])];
+    // Equal: the scalar AEqualsB fills all three channels. A > B: the scalar greater branch does. A < B: the vector keeps its channels.
+    expect(await rgb(nodes(0.5, 0.5))).toEqual([encode(0.1), encode(0.1), encode(0.1)]);
+    expect(await rgb(nodes(1, 0))).toEqual([encode(0.9), encode(0.9), encode(0.9)]);
+    expect(await rgb(nodes(0, 1))).toEqual([encode(0.25), encode(0.5), encode(0.75)]);
+  });
+});

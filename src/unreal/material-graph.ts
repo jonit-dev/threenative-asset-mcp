@@ -191,6 +191,7 @@ const SUPPORTED_NODE_CLASSES = [
   "HairColor",
   "SquareRoot",
   "CrossProduct",
+  "If",
 ] as const;
 
 /** Engine content functions that the pack does not carry, matched by lower-cased function name. */
@@ -1144,6 +1145,8 @@ class Compiler {
         const high = this.operand(node, "Max", "MaxDefault", 1);
         return this.binary(this.binary(input, low, (x, y) => (x < y ? y : x)), high, (x, y) => (x > y ? y : x));
       }
+      case "If":
+        return this.ifExpression(node);
       case "ComponentMask": {
         const input = this.vec(node.inputs.Input, "ComponentMask.Input");
         if (!input) return this.markUnavailable(`ComponentMask ${node.id} has no input`);
@@ -1388,6 +1391,73 @@ class Compiler {
       default:
         return this.unsupportedNode(node);
     }
+  }
+
+  /**
+   * `FHLSLMaterialTranslator::GetArithmeticResultType` over branch widths: equal widths keep the width, a scalar (1)
+   * takes the other, and two nonscalar widths that differ are undefined (the translator errors on them).
+   */
+  private arithmeticWidth(a: number, b: number): number | undefined {
+    if (a === b) return a;
+    if (a === 1) return b;
+    if (b === 1) return a;
+    return undefined;
+  }
+
+  /**
+   * MaterialExpressionIf follows UE 4.19.2 UMaterialExpressionIf::Compile and FHLSLMaterialTranslator::If.
+   * That compiler requires scalar A/B (MCT_Float); its constructor verifies ConstB = 0 and EqualsThreshold = 0.00001.
+   * UE 5.8.3 also accepts vector conditions; this evaluator supports the scalar subset for that version.
+   * A >= B picks AGreaterThanB, otherwise ALessThanB. Wired AEqualsB wins when !(abs(A-B) > EqualsThreshold);
+   * unwired equality ignores the threshold. A, AGreaterThanB and ALessThanB must be wired; unwired B uses ConstB.
+   * Branch arithmetic permits scalar broadcast and requires matching nonscalar widths.
+   */
+  private ifExpression(node: GraphNode): Val {
+    if (!node.inputs.A) return this.markUnavailable(`If ${node.id} has no A input`);
+    if (!node.inputs.AGreaterThanB) return this.markUnavailable(`If ${node.id} has no AGreaterThanB input`);
+    if (!node.inputs.ALessThanB) return this.markUnavailable(`If ${node.id} has no ALessThanB input`);
+
+    const a = this.vec(node.inputs.A, `If ${node.id} A`);
+    const b = node.inputs.B ? this.vec(node.inputs.B, `If ${node.id} B`) : undefined;
+    const greater = this.vec(node.inputs.AGreaterThanB, `If ${node.id} AGreaterThanB`);
+    const less = this.vec(node.inputs.ALessThanB, `If ${node.id} ALessThanB`);
+    const equals = node.inputs.AEqualsB ? this.vec(node.inputs.AEqualsB, `If ${node.id} AEqualsB`) : undefined;
+    if (!a || !greater || !less) return this.constant([0, 0, 0], 3);
+    // Refuse vector comparisons: UE 4.19 requires scalars; UE 5.8 vector conditions are not modeled here.
+    if (a.n !== 1) return this.markUnsupported("If.A(vector)");
+    if (b && b.n !== 1) return this.markUnsupported("If.B(vector)");
+
+    // An absent constant takes its default. One present but not a finite number is malformed (the C# dumper never writes
+    // one), so it is refused by name rather than silently computed with the default. ConstB matters only for an unwired B,
+    // and the threshold only for a wired AEqualsB.
+    const storedNumber = (value: unknown, fallback: number): number | undefined =>
+      value === undefined ? fallback : typeof value === "number" && Number.isFinite(value) ? value : undefined;
+    const constB = b ? 0 : storedNumber(node.constants.ConstB, 0);
+    if (constB === undefined) return this.markUnsupported("If.ConstB(non-finite)");
+    const bValue: Val = b ?? { ...this.constant([constB], 1), literal: true };
+    const threshold = equals ? storedNumber(node.constants.EqualsThreshold, 0.00001) : 0;
+    if (threshold === undefined) return this.markUnsupported("If.EqualsThreshold(non-finite)");
+
+    // Unreal's result type: arith(AGreaterThanB, arith(AEqualsB, ALessThanB)) when equality is wired, else
+    // arith(AGreaterThanB, ALessThanB).
+    const inner = equals ? this.arithmeticWidth(equals.n, less.n) : less.n;
+    if (inner === undefined) return this.markUnsupported("If.AEqualsB/ALessThanB(vector width mismatch)");
+    const n = this.arithmeticWidth(greater.n, inner);
+    if (n === undefined) return this.markUnsupported(equals ? "If.AGreaterThanB/AEqualsB(vector width mismatch)" : "If.AGreaterThanB/ALessThanB(vector width mismatch)");
+
+    const inputs = equals ? [a, bValue, greater, equals, less] : [a, bValue, greater, less];
+    const sg = greater.n === 1 ? 0 : 1;
+    const sl = less.n === 1 ? 0 : 1;
+    const se = equals && equals.n !== 1 ? 1 : 0;
+    return this.emit(inputs, n, (o) => (r) => {
+      const av = r[a.reg]!;
+      const bv = r[bValue.reg]!;
+      const equal = !(Math.abs(av - bv) > threshold);
+      for (let index = 0; index < 4; index++) {
+        const pick = av >= bv ? r[greater.reg + index * sg]! : r[less.reg + index * sl]!;
+        r[o + index] = equal && equals ? r[equals.reg + index * se]! : pick;
+      }
+    });
   }
 
   /**
